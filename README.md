@@ -30,6 +30,8 @@ A modular Python CLI and terminal application for **Android (Termux & Debian/Ubu
 
 ## Installation & Upgrade
 
+**Requirements:** Python **3.11+** (verified on Python `3.11`, `3.12`, and `3.13` across Ubuntu 24.04 CI and Debian Trixie ARM64 PRoot).
+
 ### Fresh Clone (Target `feature/termux-modular-app` Until Merged)
 
 Note: `main` currently holds only the initial placeholder README. Clone the active feature branch:

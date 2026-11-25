@@ -11,7 +11,7 @@ setup(
     author_email="jtmeaker@gmail.com",
     url="https://github.com/jtmeaker-hash/Music-Organiser-Google-Drive-",
     packages=find_packages(),
-    python_requires=">=3.9",
+    python_requires=">=3.11",
     install_requires=[
         "mutagen>=1.47.0",
         "requests>=2.28.0",
@@ -27,6 +27,10 @@ setup(
     },
     classifiers=[
         "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3 :: Only",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "Operating System :: POSIX :: Linux",
         "Operating System :: Android",
         "Topic :: Multimedia :: Sound/Audio :: Analysis",

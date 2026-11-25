@@ -171,7 +171,7 @@ elif [ "$SELECTED_ENV" = "native_termux" ]; then
     run_cmd pkg update -y
     run_cmd pkg install -y python python-pip python-cryptography libjpeg-turbo ffmpeg termux-api tmux
 else
-    echo "[!] No managed OS package step for '$SELECTED_ENV'; relying on existing Python 3.9+ environment."
+    echo "[!] No managed OS package step for '$SELECTED_ENV'; relying on existing Python 3.11+ environment."
 fi
 
 # 2. Install Python Package (idempotent)
@@ -220,6 +220,9 @@ echo "[+] Verifying required Python runtime imports..."
 if [ "$DRY_RUN_INSTALL" -eq 0 ]; then
     if ! "$TARGET_PY" -c "
 import sys
+if sys.version_info < (3, 11):
+    sys.stderr.write(f'[✗] Unsupported Python {sys.version.split()[0]}; Python 3.11+ is required.\n')
+    sys.exit(1)
 missing = []
 for mod in ('mutagen', 'requests', 'googleapiclient', 'google.auth', 'google_auth_oauthlib', 'google_auth_httplib2', 'musicvault'):
     try:
@@ -239,6 +242,9 @@ else
     echo "[DRY-RUN] Skipping live import check; verifying target interpreter ($TARGET_PY)..."
     "$TARGET_PY" -c "
 import sys
+if sys.version_info < (3, 11):
+    sys.stderr.write(f'[✗] Unsupported Python {sys.version.split()[0]}; Python 3.11+ is required.\n')
+    sys.exit(1)
 for mod in ('mutagen', 'requests', 'googleapiclient', 'google.auth', 'google_auth_oauthlib', 'google_auth_httplib2'):
     __import__(mod)
 "

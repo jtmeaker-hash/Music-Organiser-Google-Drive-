@@ -24,7 +24,7 @@ def _make_executable(path: Path, body: str) -> None:
 
 def test_version_bumped_to_2_0_1():
     assert musicvault.__version__ == "2.0.1"
-    assert sys.version_info >= (3, 9)
+    assert sys.version_info >= (3, 11)
 
 
 def test_installer_selects_apt_in_debian_proot_even_when_pkg_present(tmp_path: Path):
