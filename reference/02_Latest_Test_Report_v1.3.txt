@@ -1,0 +1,57 @@
+PUBLIC RESEARCH: enabled tracks: 3 requests: 6 errors: ['www.reddit.com: HTTP 403; skipped', 'www.reddit.com: HTTP 403; skipped', 'www.reddit.com: HTTP 403; skipped']
+
+ Believe - Jesse Bloch, Coby Watts.wav
+ {
+  "id": "1heVoqsB5HpgGHCNAU0liJDrhrIFCWytX",
+  "track": "Believe - Jesse Bloch, Coby Watts.wav",
+  "hits": [],
+  "genre_hints": [],
+  "status": "REVIEW_ONLY — snippets/titles not independently verified"
+}
+
+ Act of Rage - Living Fast.flac
+ {
+  "id": "1v3jdlhhx3hqfY6ivYBut3DcJxKsu6gSL",
+  "track": "Act of Rage - Living Fast.flac",
+  "hits": [],
+  "genre_hints": [],
+  "status": "REVIEW_ONLY — snippets/titles not independently verified"
+}
+
+ Big City Life - Luude, Mattafix.wav
+ {
+  "id": "1NJxM8N3WyJMS7-KEhDriERqlJYwk8YLf",
+  "track": "Big City Life - Luude, Mattafix.wav",
+  "hits": [],
+  "genre_hints": [],
+  "status": "REVIEW_ONLY — snippets/titles not independently verified"
+}
+SELF TEST PASS: medium/high/conflict/missing, existing preservation, stars, user locks
+=== COPY THIS REPORT — v1.3-provisional-routing-10 ===
+row	track	BPM	Key	Genre	Subgenre	star	would_fill
+2	Believe - Jesse Bloch, Coby Watts.wav	EXISTING_UNVERIFIED	TERMS_HOLD	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	★	
+2169	Atmozfears & David Spekter - Release (10 Year Anniversary Remix).aiff	REVIEW	REVIEW	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	★	
+7	Act of Rage - Living Fast.flac	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	★	
+23	Big City Life - Luude, Mattafix.wav	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	★	
+159	Amen - Dexperia.flac	EXISTING_UNVERIFIED	TERMS_HOLD	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	★	
+355	Another High - Wasted Penguinz.wav	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	★	
+1914	The Loudest City (Decibel outdoor 2026 Anthem) - Rebellion.flac	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	★	
+1040	Young, Wild & Free (feat. Bruno Mars) - Snoop Dogg, Wiz Khalifa, Bruno Mars.wav	REVIEW	REVIEW	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	★	
+2181	Hard Driver - You're Not Alone.flac	TERMS_HOLD	TERMS_HOLD	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	★	
+1204	YoU'rE nOt OriGiNaL - Adjuzt.flac	TERMS_HOLD	TERMS_HOLD	EXISTING_UNVERIFIED	EXISTING_UNVERIFIED	★	
+Dry-run: True Provider terms cleared: False Proposed row updates: 10
+No audio modifications are supported by this notebook.
+=== MOVE PREVIEW — v1.3 ===
+row	file_id	track	destination	reason	routing_confidence	eligible	move_authorized
+2	1heVoqsB5HpgGHCNAU0liJDrhrIFCWytX	Believe - Jesse Bloch, Coby Watts.wav		UNKNOWN_OR_UNSUPPORTED_GENRE	HOLD	False	False
+2169	1ehnUyjzwrwjeEeUv1nLymSk5LXUUDYmW	Atmozfears & David Spekter - Release (10 Year Anniversary Remix).aiff	Hardstyle	PROVISIONAL_EXISTING_GENRE	PROVISIONAL_REVIEW	True	False
+7	1v3jdlhhx3hqfY6ivYBut3DcJxKsu6gSL	Act of Rage - Living Fast.flac	Hardstyle	PROVISIONAL_EXISTING_GENRE	PROVISIONAL_REVIEW	True	False
+23	1NJxM8N3WyJMS7-KEhDriERqlJYwk8YLf	Big City Life - Luude, Mattafix.wav	Drum & Bass	PROVISIONAL_EXISTING_GENRE	PROVISIONAL_REVIEW	True	False
+159	1N74Lus5IHsDXslNA3iB3eC9EbuoDt-zB	Amen - Dexperia.flac	Drum & Bass	PROVISIONAL_EXISTING_GENRE	PROVISIONAL_REVIEW	True	False
+355	1E50C7UI78bE6hwRpIDOuHciWqP-fYBiK	Another High - Wasted Penguinz.wav	Hardstyle	PROVISIONAL_EXISTING_GENRE	PROVISIONAL_REVIEW	True	False
+1914	1VpA4yDXwkykR7YzN9hWFZZS-TMK3ps18	The Loudest City (Decibel outdoor 2026 Anthem) - Rebellion.flac	Hardstyle	PROVISIONAL_EXISTING_GENRE	PROVISIONAL_REVIEW	True	False
+1040	1IikiHEWOKy_Su_9NHSx5EKdKQyoTOrt-	Young, Wild & Free (feat. Bruno Mars) - Snoop Dogg, Wiz Khalifa, Bruno Mars.wav		UNKNOWN_OR_UNSUPPORTED_GENRE	HOLD	False	False
+2181	1QuI-Y-pNGDxob7Ez_q4mN6aNtDCPOiks	Hard Driver - You're Not Alone.flac	Hardstyle	PROVISIONAL_EXISTING_GENRE	PROVISIONAL_REVIEW	True	False
+1204	1GSmBaNJj9SR80Kw_9XtByPKyUKUg5F1C	YoU'rE nOt OriGiNaL - Adjuzt.flac	Hardstyle	PROVISIONAL_EXISTING_GENRE	PROVISIONAL_REVIEW	True	False
+Eligible: 8 of 10 | move-authorized: 0 | MOVE_APPROVED: False
+ROUTING SELF TEST PASS: verified broad/nested, provisional broad, conflict, unknown, hierarchy

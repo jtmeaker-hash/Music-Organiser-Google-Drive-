@@ -1,0 +1,70 @@
+Act as a senior Python developer, audio metadata specialist and software architect.
+
+Analyse the attached Music Vault Manager v1.3 Google Colab notebook in its entirety. Use it as the foundation for a standalone, modular Python application designed to run natively in Termux on Android. Also inspect the newer v1.4 Parent Genre Beta included as an untested reference; the supplied benchmark is from v1.3, not v1.4.
+
+Do not simply convert the notebook into a Python script. Critically evaluate its architecture, identify flaws, investigate better alternatives and improve its reliability while preserving existing working functionality.
+
+Primary objectives
+- Native Termux compatibility without requiring Google Colab.
+- Interactive terminal interface with selectable processing modules.
+- Google Drive and Google Sheets integration.
+- Reliable parent genre classification.
+- BPM and Camelot key identification.
+- Intelligent online metadata research.
+- Filename cleanup.
+- Safe automated library organisation.
+
+Existing spreadsheet
+- Import and re-evaluate all existing spreadsheet data.
+- Reference previous classifications without blindly trusting them.
+- Preserve manually verified values and existing research.
+- Independently assess each metadata field.
+- Save reliable fields even when other fields remain unresolved.
+- Mark uncertain classifications with a review star.
+- Maintain one master spreadsheet rather than creating multiple review copies.
+
+Genre classification
+Prioritise accurate parent genre classification. Temporarily disable subgenre classification while preserving existing subgenre data and making future implementation straightforward.
+Do not restrict classification to a predefined list of folders. If a reliable genre is identified and no corresponding folder exists, propose creating one.
+Normalise genre aliases and prevent duplicate folders.
+Cross-check existing classifications against new evidence. Flag meaningful conflicts rather than blindly trusting existing spreadsheet values.
+
+Metadata research
+Investigate and test reliable metadata sources, including music catalogues, official release pages, record labels and search-grounded AI research.
+Prioritise accurate track and release matching. Account for remixes, extended mixes, edits, incorrect artist spellings and duration differences.
+The existing notebook's public research system has returned empty results and Reddit HTTP 403 errors. Investigate legitimate alternatives rather than repeatedly requesting blocked endpoints.
+Prioritise reliable online BPM and key metadata, with local audio analysis as a fallback.
+Respect provider terms, rate limits and data persistence restrictions.
+
+Termux requirements
+- Automated dependency installation script.
+- ARM64 and Android compatibility.
+- Minimal unnecessary dependencies.
+- Persistent SQLite database.
+- Request caching where permitted.
+- Automatic checkpoints and resumable processing.
+- Support for tmux and termux-wake-lock.
+- Efficient memory, storage, battery and network usage.
+- Secure authentication and credential storage.
+- No dependency on a continuously running desktop computer.
+
+Safety requirements
+- Dry-run mode enabled by default.
+- Preview all proposed spreadsheet changes, file renames, folder creations and file moves.
+- Require explicit approval before modifying anything.
+- Maintain backups, transaction logs and rollback manifests.
+- Prevent duplicate files and accidental overwrites.
+- Never delete or modify original audio content.
+
+Testing and development
+Preserve the original notebook as a reference and backup.
+Inspect the existing repository before making changes: https://github.com/jtmeaker-hash/Music-Organiser-Google-Drive-. Develop on a separate branch.
+Create a development plan, then implement and test each component progressively.
+Use the existing ten-track benchmark for regression testing, followed by 50-track and 200-track tests before full-library processing.
+Investigate failures, implement fixes and repeat tests rather than simply reporting errors.
+Do not fabricate successful test results. Clearly distinguish simulated tests from live integration tests and real Android compatibility tests.
+The final deliverable should be a fully functional, maintainable Termux application with installation instructions, a comprehensive README and a simple launch command.
+Prioritise functionality, accuracy and reliability over cosmetic features. Make informed architectural decisions independently, but request approval before destructive operations, major scope changes or introducing paid services.
+
+
+MANDATORY: Read and implement 03_API_Secrets_and_Authentication.txt alongside this prompt.

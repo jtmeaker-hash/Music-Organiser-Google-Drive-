@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Environments & secrets
+.env
+*.env
+*.env.local
+.venv/
+venv/
+ENV/
+env/
+
+# Google OAuth tokens & secrets
+token.json
+client_secrets.json
+credentials.json
+oauth_*.json
+
+# SQLite Databases & logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Backups & Rollback manifests
+backups/
+manifests/
+*_backup.json
+*_rollback.json
+checkpoint.json
+v*_local_checkpoint.json
+
+# Test & coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
