@@ -1,0 +1,45 @@
+name: Music Vault Manager CI
+
+on:
+  push:
+    branches:
+      - feature/termux-modular-app
+      - "fix/**"
+  pull_request:
+    branches:
+      - feature/termux-modular-app
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies and editable package
+        run: |
+          python -m pip install --upgrade pip setuptools wheel pytest
+          python -m pip install -e .
+
+      - name: Compile all Python modules
+        run: python -m compileall -q musicvault tests
+
+      - name: Verify installer distro detection tests and full pytest suite (isolated HOME, zero cloud keys)
+        run: |
+          TMP_CI_HOME="$(mktemp -d)"
+          HOME="$TMP_CI_HOME" MUSICVAULT_CONFIG_DIR="$TMP_CI_HOME/.config/musicvault" pytest -v tests/
+          HOME="$TMP_CI_HOME" MUSICVAULT_CONFIG_DIR="$TMP_CI_HOME/.config/musicvault" musicvault --help
+          HOME="$TMP_CI_HOME" MUSICVAULT_CONFIG_DIR="$TMP_CI_HOME/.config/musicvault" musicvault status

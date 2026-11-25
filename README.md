@@ -1,261 +1,206 @@
-# Music Vault Manager
+# Music Vault Manager (`v2.0.1` — Corrective Development Candidate)
 
-A standalone, modular Python application designed to run natively in **Termux on Android** for managing, researching, verifying, and organizing large personal DJ music libraries stored on Google Drive and indexed via Google Sheets.
+A modular Python CLI and terminal application for **Android (Termux & Debian/Ubuntu PRoot)** and Linux to inventory, hydrate audio tags, research recording metadata, and preview parent-genre organisation for DJ libraries stored on **Google Drive** and indexed in **Google Sheets**.
 
-Originally conceived as a Google Colab notebook (`v1.3` and `v1.4 Beta`), this architecture has been completely redesigned into a robust, decoupled, and production-ready terminal tool.
-
----
-
-## 🌟 Key Features
-
-- **Native Termux & Android ARM64 Compatibility**:
-  - Requires no desktop computer or Google Colab session.
-  - Native integration with Android wake-locks (`termux-wake-lock`) to keep background batch processes running even with the screen off.
-  - Zero heavy or non-portable binary compilation dependencies.
-- **Interactive Terminal Interface**:
-  - Full-featured, responsive TUI menu for scanning, researching, reviewing, and organizing.
-  - Simple CLI entrypoint: `musicvault`.
-- **Persistent SQLite Database**:
-  - Replaces fragile JSON checkpoints with an ACID-compliant SQLite store (`~/.config/musicvault/musicvault.db`).
-  - Resumable processing: automatic per-track checkpoints protect against battery failure, network disconnection, or process termination.
-  - TTL-based API response caching respecting provider terms and rate limits.
-- **Intelligent Parent Genre Classification**:
-  - Prioritizes accurate **parent genre** routing (`Hardstyle`, `Drum & Bass`, `Techno`, `Hip-Hop`, `Trance`, `House`, etc.).
-  - Preserves existing subgenre data while temporarily disabling uncertain subgenre branching.
-  - Detects novel genres (with 2+ provider agreement) and proposes new directory creation rather than forcing tracks into rigid predefined buckets.
-  - Cross-checks existing sheet classifications against fresh catalogue evidence, flagging conflicts (`CONFLICT`, `INFERENCE_CONFLICT_REVIEW`).
-- **Resilient Online Metadata Research**:
-  - Resolves previous notebook failures (such as Reddit `HTTP 403 Forbidden` and brittle HTML scrapers).
-  - Integrates legitimate open music knowledge graphs: **MusicBrainz**, **Wikidata Music Ontology**, **Discogs**, **SonoVault**, and **AudioMeta**.
-  - Rate-limited and respectful HTTP clients with exponential backoff and `Retry-After` adherence.
-- **BPM & Camelot Key Identification**:
-  - Identifies musical tempos and harmonic keys formatted in standard Camelot alphanumeric notation (e.g. `8A`, `11B`, `5A`).
-  - Detects half-time / double-time tempo hints for Hard dance genres.
-- **Safe Automated Library Organization**:
-  - **Dry-run mode enabled by default**.
-  - All Google Drive moves are performed purely via metadata parent updates (`addParents` / `removeParents`), preserving original file IDs, metadata tags, and audio content without downloading, re-encoding, or transcoding.
-  - Pre-flight checks ensure files are not trashed, are not folders, and have exactly one parent before moving.
-  - Generates JSON rollback manifests and database transaction logs prior to executing any move.
-- **Master Spreadsheet Preservation**:
-  - Updates only empty fields and dedicated review columns `Q:AA` in the master `Tracks` tab.
-  - Never overwrites existing user values or fields flagged `HIGH_LOCKED` / `USER_LOCKED`.
-  - Automatically flags uncertain classifications with review stars (`★`) in the same master sheet.
-  - Pre-flight concurrent edit detection aborts writes if another client modified rows during review.
-  - Local JSON row backups created before every write.
-- **First-Run Credential Wizard**:
-  - Replaces Colab `userdata` secrets with a secure local wizard.
-  - Stores credentials in `~/.config/musicvault/.env` with strict `0600` (user read/write only) file permissions.
-  - Masks credential entry in the terminal and never prints secrets in logs or reports.
+> **Safety Notice (`v2.0.1` Read-Only Corrective Build):**
+> `v2.0.1` is strictly **read-only against Google Drive and Google Sheets**. It never moves Drive files, creates Drive folders, renames files, modifies/transcodes audio, edits embedded tags, or writes to Google Sheets. `preview` forces `DRY_RUN=True`, `move_authorized=False`, and `executable=False` unconditionally regardless of `.env` flags.
 
 ---
 
-## 📐 Architecture Overview
+## What Changed in `v2.0.1`
 
-```
-Music-Organiser-Google-Drive-/
-├── musicvault/                        # Core application package
-│   ├── __init__.py
-│   ├── __main__.py                    # CLI entrypoint (musicvault)
-│   ├── config.py                      # Secure .env loader (0600) & settings
-│   ├── auth.py                        # Google OAuth2 manager & persistent tokens
-│   ├── db.py                          # SQLite database, caching & checkpoints
-│   ├── models.py                      # Data models (Track, Candidate, Decisions)
-│   ├── termux.py                      # Android wake-lock integration
-│   ├── core/                          # Domain logic
-│   │   ├── matcher.py                 # Normalization, Camelot key & candidate verification
-│   │   ├── audio.py                   # Mutagen audio tag extraction
-│   │   ├── genre.py                   # Parent genre taxonomy & alias normalization
-│   │   ├── rules.py                   # Field-level decision engine (HIGH/MEDIUM/LOW/LOCK)
-│   │   └── organizer.py               # Drive routing, preview, rollback manifest
-│   ├── providers/                     # Metadata API providers
-│   │   ├── base.py                    # Rate-limiting, retry backoff & cache
-│   │   ├── sonovault.py               # SonoVault API client
-│   │   ├── audiometa.py               # AudioMeta API client
-│   │   ├── discogs.py                 # Discogs API client
-│   │   ├── musicbrainz.py             # MusicBrainz Web Service client
-│   │   └── research.py                # Wikidata & knowledge graph research
-│   ├── services/                      # Google Cloud API services
-│   │   ├── drive.py                   # Google Drive v3 client
-│   │   └── sheets.py                  # Google Sheets v4 client
-│   └── cli/                           # Terminal UI
-│       ├── menu.py                    # Interactive control panel
-│       ├── wizard.py                  # Credential setup wizard
-│       └── commands.py                # Command implementations
-├── tests/                             # Comprehensive test suite (14 unit tests)
-│   ├── test_decision_engine.py       # Replicates v1.3 self_test()
-│   ├── test_routing_engine.py        # Replicates v1.3 routing_self_test()
-│   ├── test_genre_classifier.py      # Replicates v1.4 parent routing self_test()
-│   ├── test_matcher.py               # Camelot, aliases, and audio verification tests
-│   ├── test_db_persistence.py        # SQLite persistence and cache tests
-│   └── test_benchmark_10.py          # 10-track control benchmark test
-├── reference/                         # Preserved original notebooks and test reports
-│   ├── 01_Antigravity_Prompt.txt
-│   ├── 02_Latest_Test_Report_v1.3.txt
-│   ├── 03_API_Secrets_and_Authentication.txt
-│   ├── Music_Vault_Manager_v1.3_Provisional_Routing_Beta.ipynb
-│   └── Music_Vault_Manager_v1.4_Parent_Genre_Beta.ipynb
-├── install.sh                         # Automated dependency installer for Android/Termux
-├── setup.py                           # Package configuration
-├── requirements.txt                   # Dependency manifest
-└── .env.example                       # Configuration template
-```
+1. **Installer Distro Detection (`install.sh`)**:
+   - Inspects `/etc/os-release` and effective UID first rather than assuming `command -v pkg` means native Termux (fixing `Cannot run pkg command as root` inside Debian Trixie PRoot where Termux `pkg` is inherited in `$PATH`).
+   - Installs `python3-setuptools`, `python3-wheel`, and required packages via `apt-get` on Debian/Ubuntu, preserves existing `~/.config/musicvault/.env`, and verifies required Python imports before succeeding.
+2. **Database Migration, Online Backups & Inventory Integrity (`musicvault/db.py`)**:
+   - Automatically creates a **verified timestamped SQLite online backup** (`sqlite3.Connection.backup()` + `PRAGMA integrity_check`) before migrating `v2.0.0` databases to Schema `v2`—never overwriting `musicvault.db.bak` or prior backups, and never requiring credential or DB resets.
+   - Separates confirmed live source inventory (`is_live_source=1`) from legacy benchmark/checkpoint imports (`quarantined=1`), reconciles by exact Google Drive `file_id`, repairs unchanged incomplete rows without needing Drive edits, archives stale evidence on content checksum changes, and never marks unseen files absent if a scan is interrupted.
+3. **Bandwidth-Aware Ranged Audio Hydration (`musicvault hydrate`)**:
+   - Uses bounded HTTP `Range` (`206 Partial Content`) reads via `DriveRangeReader` to seek directly to container headers and trailing chunks (skipping multi-megabyte PCM audio payloads and aborting immediately if a server returns `HTTP 200`).
+   - Extracts both raw and easy Mutagen tags across **WAV (`ID3` + RIFF `LIST/INFO`), AIFF (`ID3`), FLAC/Vorbis, MP4/M4A, Ogg/Opus, and MP3**, preserving raw strings alongside normalized Camelot keys (`A minor` -> `8A`) and BPMs.
+   - Safe filename parser strips track numbers without misassigning remixers (`01 Beneath The Lights - Darren Styles Remix.wav`) or title-only tracks (`01 Clarity.wav`) as verified primary artists.
+4. **Resumable Research & Honest Provider Verification (`musicvault research`)**:
+   - `--limit N` caps **actual attempted tracks** with known `artist + title`, advancing across batches rather than restarting alphabetically on missing-identity rows.
+   - Setup wizard and providers inspect real HTTP status and response schemas (`401/403` auth errors, `429` `Retry-After` integer/HTTP-date, quota, `404`, malformed JSON, timeouts) and enforce UTC cache TTLs and `PROVIDER_TERMS_CLEARED=False` persistence rules.
+5. **Real Read-Only Sheets/Drive Preview & Honest Benchmarks (`musicvault preview`, `musicvault benchmark`)**:
+   - Menu option `5` and `musicvault preview` join live source tracks by exact Drive `file_id` against verified `Tracks!A1:AA` headers and rows (read-only), enforcing parent-genre-only routing, failing closed on malformed lock JSON or duplicate IDs, and never fabricating `row 999`.
+   - `benchmark` runs inside an isolated temporary database without mutating `musicvault.db`, preserving the exact 10-track `v1.3` control regression (`8 eligible, 2 held, 0 authorized`) and reporting `INCOMPLETE_BENCHMARK` when expected rows are absent on 50-track checkpoints.
 
 ---
 
-## 🚀 Installation on Termux / Android
+## Installation & Upgrade
 
-### 1. Automated Installation
-Run the automated installation script:
+### Fresh Clone (Target `feature/termux-modular-app` Until Merged)
+
+Note: `main` currently holds only the initial placeholder README. Clone the active feature branch:
+
 ```bash
-git clone https://github.com/jtmeaker-hash/Music-Organiser-Google-Drive-.git
+git clone -b feature/termux-modular-app https://github.com/jtmeaker-hash/Music-Organiser-Google-Drive-.git
 cd Music-Organiser-Google-Drive-
 chmod +x install.sh
-./install.sh
 ```
 
-### 2. Manual Installation
-If installing packages manually on Debian/PRoot or native Termux:
+- **Debian / Ubuntu PRoot on Termux (isolated `.venv` using apt prebuilt packages)**:
+  ```bash
+  ./install.sh --venv
+  source .venv/bin/activate
+  musicvault status
+  ```
+- **Debian / Ubuntu PRoot (system editable install matching `v2.0.0` layout)**:
+  ```bash
+  ./install.sh --system-editable
+  # Runs apt-get (never pkg) + python3 -m pip install --no-deps --no-build-isolation --break-system-packages -e .
+  musicvault status
+  ```
+- **Native Termux (non-root Android shell, outside PRoot)**:
+  ```bash
+  ./install.sh
+  .venv/bin/musicvault status
+  ```
+
+### Upgrading an Existing `v2.0.0` Debian PRoot Checkout (Preserving Credentials & DB)
+
+Do **not** delete `~/.config/musicvault/` or re-run `git clone`. From your existing repository directory:
+
 ```bash
-# Debian / PRoot:
-apt-get update
-apt-get install -y python3 python3-pip python3-mutagen python3-requests \
-    python3-cryptography python3-googleapi python3-google-auth \
-    python3-google-auth-oauthlib python3-google-auth-httplib2 python3-pytest
-
-# Native Termux:
-pkg update
-pkg install -y python python-pip python-cryptography termux-api
-
-# Install musicvault package
-pip3 install --no-deps --break-system-packages -e .
+cd ~/Music-Organiser-Google-Drive-
+git status -u
+git fetch origin
+git switch fix/v2.0.1   # or feature/termux-modular-app once PR is merged
+python3 -m pip install --no-deps --no-build-isolation --break-system-packages -e .
+musicvault --version
+musicvault status
 ```
 
 ---
 
-## 🔑 Configuration & First-Run Wizard
+## CLI Reference
 
-Run the interactive setup wizard:
 ```bash
+# Local read-only diagnostic summary (zero network calls)
+musicvault status [--verbose] [--export-json status.json] [--export-csv status.csv]
+
+# Create an explicit verified timestamped SQLite online backup
+musicvault backup [--label manual]
+
+# Lightweight metadata-only Google Drive source inventory scan (0 audio bytes downloaded)
+musicvault scan
+# Optional scan followed by bounded hydration:
+musicvault scan --hydrate --limit 10 --max-mib 32
+
+# Bandwidth-bounded ranged audio tag & duration hydration (conservative defaults: 10 tracks, 32 MiB, no full downloads)
+musicvault hydrate --limit 10 --max-mib 32 [--use-sheet] [--allow-full-download] [--export-csv hydrated.csv]
+
+# Resumable online metadata research (--limit caps actual attempted tracks)
+musicvault research --limit 10 [--force-refresh] [--include-title-only] [--export-json research.json]
+
+# Real read-only Google Sheets + Drive parent-genre organisation preview
+musicvault preview --limit 25 [--wide] [--verbose] [--export-csv preview.csv] [--export-json preview.json]
+
+# Isolated offline fixture benchmarks (never imports into or mutates musicvault.db)
+musicvault benchmark --size 10
+musicvault benchmark --size 50 [--checkpoint /path/to/v06_local_checkpoint.json]
+
+# Credential & Google OAuth setup wizard (reuses existing valid token.json)
 musicvault setup
 ```
-The wizard prompts for:
-1. `SONOVAULT_API_KEY`: SonoVault API key for BPM, Key, and Genre.
-2. `AUDIOMETA_API_KEY`: AudioMeta API key for acoustic features and Camelot key analysis.
-3. `DISCOGS_TOKEN`: Discogs personal access token for release metadata and label profiles.
-4. **Google Drive & Sheets OAuth**: Interactive authentication that saves the persistent OAuth token to `~/.config/musicvault/token.json` (`0600`).
 
-All secrets are saved in `~/.config/musicvault/.env` with strict `0600` permissions. You can also edit this file directly or set standard environment variables.
+### Interactive Menu (`musicvault`)
 
----
+Options `1–6` retain their `v2.0.0` positions (`5` now runs real live read-only preview instead of the 10-track mock benchmark); unsafe write toggles (`7/8` in `v2.0.0`) are replaced by bounded read-only tools:
 
-## 💻 Usage
-
-### 1. Interactive Terminal Menu
-Simply run:
-```bash
-musicvault
-```
-This opens the control panel:
-```
-=================================================================
-          MUSIC VAULT MANAGER — TERMINAL CONTROL PANEL          
-=================================================================
-  Environment: Detected (Wake-lock ready) Database: 50 tracks cached
-  SonoVault:   ✓ Configured           AudioMeta: ✓ Configured
-  Discogs:     ✓ Configured           Dry-Run:   Enabled
------------------------------------------------------------------
-  1. Run 10-Track Benchmark Regression Test
-  2. Run 50-Track Benchmark Test
-  3. Scan Google Drive Inventory & Checkpoints
-  4. Run Online Metadata Research & Genre Classification
-  5. View Move & Organization Preview
-  6. Setup Credentials & Google Authentication Wizard
-  7. Toggle Dry-Run Mode (Currently: ON)
-  8. Toggle Provisional Moves (Currently: HELD)
-  0. Exit
-=================================================================
-```
-
-### 2. Command Line Interface
-
-```bash
-# Run 10-track control benchmark test
-musicvault benchmark --size 10
-
-# Run 50-track test with specific checkpoint
-musicvault benchmark --size 50 --checkpoint /mnt/sdcard/Download/v06_local_checkpoint.json
-
-# Scan Google Drive incoming source folder
-musicvault scan
-
-# Run metadata research for up to 20 tracks
-musicvault research --limit 20
-```
+- `1`: Run 10-Track Control Benchmark (Isolated Fixture)
+- `2`: Run 50-Track Benchmark Check (Isolated Fixture)
+- `3`: Scan Google Drive Source Inventory (Read-Only)
+- `4`: Run Resumable Online Metadata Research (Limit 10)
+- `5`: View Live Sheets & Drive Organisation Preview (Read-Only)
+- `6`: Setup Credentials & Google Authentication Wizard
+- `7` (`h`): Hydrate Audio Metadata Tags (Bounded 10 / 32 MiB)
+- `8` (`s`): View Local Status & Diagnostics (No Network)
+- `9` (`b`): Create Verified SQLite Database Backup
+- `0` (`q`): Exit
 
 ---
 
-## 🧪 Benchmark Regression Testing
+## Android Background Execution, `tmux`, Wake-Locks & Troubleshooting
 
-The 10-track benchmark reproduces the exact decision rules, star indicators, and provisional move routing established in `v1.3`:
-
-```
-=== MOVE PREVIEW — v1.3 ===
-row    file_id                             track                               destination     reason                    routing_confidence   eligible   move_authorized
----------------------------------------------------------------------------------------------------------------------------------------------------------------------
-2      1heVoqsB5HpgGHCNAU0liJDrhrIFCWytX   Believe - Jesse Bloch, Coby Watts                   UNKNOWN_OR_UNSUPPORTED_GENRE HOLD                 False      False
-2169   1ehnUyjzwrwjeEeUv1nLymSk5LXUUDYmW   Atmozfears & David Spekter - Rele   Hardstyle       PROVISIONAL_EXISTING_GENRE PROVISIONAL_REVIEW   True       False
-7      1v3jdlhhx3hqfY6ivYBut3DcJxKsu6gSL   Act of Rage - Living Fast           Hardstyle       PROVISIONAL_EXISTING_GENRE PROVISIONAL_REVIEW   True       False
-23     1NJxM8N3WyJMS7-KEhDriERqlJYwk8YLf   Big City Life - Luude, Mattafix     Drum & Bass     PROVISIONAL_EXISTING_GENRE PROVISIONAL_REVIEW   True       False
-159    1N74Lus5IHsDXslNA3iB3eC9EbuoDt-zB   Dexperia - Amen                     Drum & Bass     PROVISIONAL_EXISTING_GENRE PROVISIONAL_REVIEW   True       False
-355    1E50C7UI78bE6hwRpIDOuHciWqP-fYBiK   Another High - Wasted Penguinz      Hardstyle       PROVISIONAL_EXISTING_GENRE PROVISIONAL_REVIEW   True       False
-1914   1VpA4yDXwkykR7YzN9hWFZZS-TMK3ps18   Rebelion; Micah Martin - The Loud   Hardstyle       PROVISIONAL_EXISTING_GENRE PROVISIONAL_REVIEW   True       False
-1040   1IikiHEWOKy_Su_9NHSx5EKdKQyoTOrt-   Young, Wild & Free (feat. Bruno M                   UNKNOWN_OR_UNSUPPORTED_GENRE HOLD                 False      False
-2181   1QuI-Y-pNGDxob7Ez_q4mN6aNtDCPOiks   Hard Driver - You're Not Alone      Hardstyle       PROVISIONAL_EXISTING_GENRE PROVISIONAL_REVIEW   True       False
-1204   1GSmBaNJj9SR80Kw_9XtByPKyUKUg5F1C   Adjuzt - You're Not Original        Hardstyle       PROVISIONAL_EXISTING_GENRE PROVISIONAL_REVIEW   True       False
-Eligible: 8 of 10 | move-authorized: 0 | DRY_RUN: True
-```
-
-Run test suite via `pytest`:
-```bash
-pytest -v tests/
-```
-All 14 unit tests pass cleanly:
-- Decision rules (`HIGH`, `MEDIUM`, `LOW`, `LOCK`)
-- Preservation of existing spreadsheet cells
-- Parent genre classification & alias normalization
-- Camelot key calculation
-- Drive move routing logic & provisional gates
-- SQLite persistence & caching
+- **`tmux` vs Android OS Process Limits**:
+  Running inside `tmux new -s vault` keeps `musicvault` alive if you switch apps or detach your terminal, **but Android 12+ Phantom Process Killer / battery saver can still terminate background Termux/PRoot processes**. Every `hydrate` and `research` track commits its SQLite checkpoint immediately, and `Ctrl+C` exits cleanly so interrupted batches resume without repeating completed work.
+- **Wake-Lock Acquisition (Native Termux vs Debian PRoot)**:
+  `musicvault status` reports wake-lock binary **detection** separately from **successful acquisition**. Inside Debian PRoot, calling `/data/data/com.termux/files/usr/bin/termux-wake-lock` may fail if Termux IPC environment variables are absent. For long runs, acquire the wake-lock in **native Termux before entering PRoot**:
+  ```bash
+  # In native Termux (requires Termux:API app + package installed):
+  termux-wake-lock
+  proot-distro login debian
+  # ... run bounded musicvault batch ...
+  # Later in native Termux:
+  termux-wake-unlock
+  ```
+- **Google OAuth Token Reuse & 7-Day Testing Expiry**:
+  Existing `~/.config/musicvault/token.json` and `client_secrets.json` are reused automatically with unchanged scopes. If your Google Cloud OAuth consent screen is configured as **External — Testing**, Google expires refresh tokens after **7 days**; only run `musicvault setup` to re-authenticate when prompted by an expired-refresh-token message.
+- **Tagless or Ambiguous Audio Files**:
+  `v2.0.1` never invents metadata. Truly tagless files with title-only names (e.g. `01 Clarity.wav`) or remix-only suffixes (`01 Beneath The Lights - Darren Styles Remix.wav`) remain honestly marked `unresolved` (`title_only`) rather than fabricating an artist.
+- **Rollback Documentation**:
+  See [docs/MIGRATION_AND_ROLLBACK.md](docs/MIGRATION_AND_ROLLBACK.md) for pre-migration SQLite verification and forensic rollback steps.
 
 ---
 
-## 🛡️ Safety & Rollback Guarantees
+## User Device Acceptance Runbook (`v2.0.1`)
 
-1. **Dry-Run by Default**: No spreadsheet changes and no Drive moves are executed without explicit confirmation.
-2. **Audio Integrity**: Original audio files are never modified, re-encoded, tagged on disk, or deleted.
-3. **Drive File ID Preservation**: Organizing files on Google Drive updates folder parents; file IDs never change.
-4. **Pre-flight Checks**:
-   - Confirms each file exists, is not trashed, and has exactly one parent.
-   - Detects concurrent Google Sheets edits before applying cell updates.
-5. **Rollback Manifest**:
-   - Before executing moves, a rollback manifest (`music_vault_move_rollback.json` and SQLite record) is saved.
-   - Any move operation can be reversed to return files to their original parent folders.
-
----
-
-## 📱 Background Execution on Android
-
-To run long-running batch scans or research without interruption:
-1. **Tmux**:
+1. **Pre-Upgrade Verification & Manual SQLite Backup (in Debian PRoot with Music Vault closed)**:
    ```bash
-   tmux new -s vault
-   musicvault
-   # Detach using Ctrl+B then D
+   cd ~/Music-Organiser-Google-Drive-
+   git status -u
+   git branch --show-current
+
+   python3 -c '
+   import sqlite3
+   from datetime import datetime, timezone
+   from pathlib import Path
+   db = Path.home() / ".config/musicvault/musicvault.db"
+   ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+   bak = db.parent / f"musicvault.db.accept_pre_{ts}.sqlite"
+   assert not bak.exists()
+   with sqlite3.connect(str(db)) as src, sqlite3.connect(str(bak)) as dst:
+       assert src.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+       src.backup(dst)
+       assert dst.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+   bak.chmod(0o600)
+   print("Verified backup:", bak.name, "| historical rows:", sqlite3.connect(str(bak)).execute("SELECT COUNT(*) FROM tracks").fetchone()[0])
+   '
    ```
-2. **Wake-Lock**:
-   `musicvault` automatically invokes `termux-wake-lock` during processing tasks to prevent Android from putting the CPU to sleep.
+2. **Switch to Candidate Branch, Editable Install & Local Migration/Status Check**:
+   ```bash
+   git fetch origin
+   git switch fix/v2.0.1
+   python3 -m pip install --no-deps --no-build-isolation --break-system-packages -e .
+   musicvault --help
+   musicvault --version
+   pytest -p no:typeguard -v tests/
+   musicvault status
+   ```
+   Confirm `DRY_RUN=True (enforced)`, `Writes=DISABLED`, `DB Integrity: OK (schema v2)`, automatic `pre_v201_migration` backup file created, and all historical records preserved (`total_records` unchanged).
+3. **Bounded Read-Only Scan, 10-Track Hydration (`32 MiB` cap), and Two Research Batches**:
+   ```bash
+   # Reconcile live source inventory vs checkpoint-only records (0 audio bytes downloaded)
+   musicvault scan
+   musicvault status
 
----
+   # Hydrate at most 10 pending live tracks within 32 MiB ranged budget (no full downloads)
+   musicvault hydrate --limit 10 --max-mib 32 --export-json hydrate_batch1.json
 
-## 📄 License
-MIT License. Created by Jacob Tyler Meaker.
+   # Research batch 1 (at most 10 eligible live tracks with artist+title)
+   musicvault research --limit 10 --export-json research_batch1.json
+
+   # Research batch 2 (verify queue advances without repeating completed tracks from batch 1)
+   musicvault research --limit 10 --export-json research_batch2.json
+   ```
+4. **Bounded Read-Only Live Preview & Benchmark Verification**:
+   ```bash
+   musicvault preview --limit 25 --export-csv live_preview_sample.csv --export-json live_preview_sample.json
+   musicvault benchmark --size 10
+   musicvault benchmark --size 50
+   ```
+   Verify real `Tracks` sheet row numbers (never `999`), parent-only destinations, `Move-Authorized: 0`, `Executable: 0`, and zero Drive/Sheets modifications. If any critical discrepancy is observed, stop, keep dry-run active, and follow the forensic restore procedure in [docs/MIGRATION_AND_ROLLBACK.md](docs/MIGRATION_AND_ROLLBACK.md) without overwriting the active DB or deleting backups.
+5. **Post-Acceptance**:
+   Review exported summaries before running larger read-only hydration/research batches. Live Drive moves and Google Sheets writes remain out of scope for `v2.0.1` and require separate implementation review, rollback validation, and explicit user authorization in a future release.

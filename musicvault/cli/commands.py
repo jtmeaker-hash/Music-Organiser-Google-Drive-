@@ -1,304 +1,668 @@
 """
-Command implementations for Music Vault Manager.
+Command implementations for Music Vault Manager v2.0.1 (Read-Only Corrective Build).
+Implements local status diagnostics, verified DB backups, transactional inventory scanning,
+bandwidth-bounded audio hydration, resumable online research, real read-only Sheets/Drive preview,
+and isolated offline benchmarks.
 """
-import sys
-import json
 import logging
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
+from .. import __version__
+from ..auth import GoogleAuthManager
 from ..config import Config
-from ..db import Database
-from ..termux import termux_wake_lock
-from ..models import Track, TrackMetadata, Candidate
-from ..core.rules import planned_row, EXTRA_HEADERS, FIELDS, COL
-from ..core.organizer import build_move_plan, create_rollback_manifest
-from ..core.genre import classify_track_genres, decide_genre, canonical_genre
-from ..core.matcher import norm, verify_candidate
-from ..providers.sonovault import SonoVaultProvider
-from ..providers.audiometa import AudioMetaProvider
-from ..providers.discogs import DiscogsProvider
-from ..providers.musicbrainz import MusicBrainzProvider
-from ..providers.research import ResearchProvider
+from ..core.hydrator import hydrate_live_inventory
+from ..core.organizer import evaluate_live_preview
+from ..core.researcher import execute_research_batch
+from ..db import Database, DatabaseMigrationError
+from ..fixtures.benchmarks import execute_isolated_benchmark
+from ..models import Track
 from ..services.drive import DriveService
 from ..services.sheets import SheetsService
-from ..auth import GoogleAuthManager
+from ..termux import detect_environment, termux_wake_lock
+from .formatting import (
+    export_safe_csv,
+    export_safe_json,
+    format_mib,
+    get_terminal_width,
+    render_responsive_records,
+    short_file_id,
+)
 
 logger = logging.getLogger("musicvault.commands")
 
 
-def run_benchmark(config: Config, db: Database, sample_size: int = 10,
-                  checkpoint_path: Optional[Path] = None) -> None:
+def run_status(
+    config: Config,
+    db: Database,
+    verbose: bool = False,
+    export_json: Optional[Path] = None,
+    export_csv: Optional[Path] = None,
+) -> Dict[str, Any]:
     """
-    Execute benchmark regression test.
-    Reproduces deterministic v1.3 / v1.4 decision rules against benchmark tracks.
+    Read-only local status & diagnostic report (ZERO network calls).
     """
-    print(f"\n=== RUNNING BENCHMARK REGRESSION TEST ({sample_size} TRACKS) ===")
+    env_info = detect_environment()
+    db_ok, db_msg = db.verify_integrity()
+    inv = db.get_inventory_summary()
 
-    # Import checkpoint if provided or available
-    if checkpoint_path and checkpoint_path.exists():
-        imported = db.import_json_checkpoint(checkpoint_path)
-        print(f"Imported {imported} tracks from {checkpoint_path.name}")
-    elif sample_size == 10:
-        cand_paths = [
-            Path("/mnt/sdcard/Download/v07_local_checkpoint.json"),
-            Path("reference/v07_local_checkpoint.json"),
-            Path("/root/music_vault_source_zip/v07_local_checkpoint.json")
-        ]
-        for p in cand_paths:
-            if p.exists():
-                db.import_json_checkpoint(p)
-                break
-    elif sample_size >= 50:
-        cand_paths = [
-            Path("/mnt/sdcard/Download/v06_local_checkpoint.json"),
-            Path("reference/v06_local_checkpoint.json")
-        ]
-        for p in cand_paths:
-            if p.exists():
-                db.import_json_checkpoint(p)
-                break
-
-    tracks = db.get_all_tracks()
-    if not tracks:
-        print("[!] No tracks found in database or local checkpoint. Run a scan or specify checkpoint path.")
-        return
-
-    # Benchmark control ordering
-    CONTROL_IDS = [
-        '1heVoqsB5HpgGHCNAU0liJDrhrIFCWytX',
-        '1ehnUyjzwrwjeEeUv1nLymSk5LXUUDYmW',
-        '1v3jdlhhx3hqfY6ivYBut3DcJxKsu6gSL',
-        '1NJxM8N3WyJMS7-KEhDriERqlJYwk8YLf',
-        '1N74Lus5IHsDXslNA3iB3eC9EbuoDt-zB',
-        '1E50C7UI78bE6hwRpIDOuHciWqP-fYBiK',
-        '1VpA4yDXwkykR7YzN9hWFZZS-TMK3ps18',
-        '1IikiHEWOKy_Su_9NHSx5EKdKQyoTOrt-',
-        '1QuI-Y-pNGDxob7Ez_q4mN6aNtDCPOiks',
-        '1GSmBaNJj9SR80Kw_9XtByPKyUKUg5F1C'
-    ]
-
-    selected: List[Track] = []
-    # If 10-track benchmark, prioritize exact control IDs
-    if sample_size == 10:
-        for cid in CONTROL_IDS:
-            hit = next((t for t in tracks if t.file_id == cid), None)
-            if hit and hit not in selected:
-                selected.append(hit)
-
-    if len(selected) < sample_size:
-        controls = [
-            'believe', 'release (10 year anniversary remix)', 'living fast',
-            'big city life', 'amen', 'another high', 'the loudest city',
-            'young, wild & free', "you're not alone", 'adjuzt'
-        ]
-        for term in controls:
-            hits = [t for t in tracks if norm(term) in norm(t.name) and t not in selected]
-            if hits:
-                selected.append(hits[0])
-
-        selected = (selected + [t for t in tracks if t not in selected])[:sample_size]
-    print(f"Loaded {len(selected)} tracks for benchmark.")
-
-    # Setup mock / offline reference rows (representing existing sheet)
-    # Row mapping: row_num, track, BPM, Key, Genre, Subgenre
-    mock_sheet_rows: Dict[str, Tuple[int, List[str]]] = {
-        '1heVoqsB5HpgGHCNAU0liJDrhrIFCWytX': (2, ['', '', '', '', '147.0', '', '', '', '', '', '', '', '', '', '1heVoqsB5HpgGHCNAU0liJDrhrIFCWytX']),
-        '1ehnUyjzwrwjeEeUv1nLymSk5LXUUDYmW': (2169, ['', '', 'Hardstyle', 'Euphoric', '', '', '', '', '', '', '', '', '', '', '1ehnUyjzwrwjeEeUv1nLymSk5LXUUDYmW']),
-        '1v3jdlhhx3hqfY6ivYBut3DcJxKsu6gSL': (7, ['', '', 'Hardstyle', 'Rawstyle', '158.0', '11A', '', '', '', '', '', '', '', '', '1v3jdlhhx3hqfY6ivYBut3DcJxKsu6gSL']),
-        '1NJxM8N3WyJMS7-KEhDriERqlJYwk8YLf': (23, ['', '', 'Drum & Bass', '', '174.0', '5B', '', '', '', '', '', '', '', '', '1NJxM8N3WyJMS7-KEhDriERqlJYwk8YLf']),
-        '1N74Lus5IHsDXslNA3iB3eC9EbuoDt-zB': (159, ['', '', 'Drum & Bass', '', '180.0', '', '', '', '', '', '', '', '', '', '1N74Lus5IHsDXslNA3iB3eC9EbuoDt-zB']),
-        '1E50C7UI78bE6hwRpIDOuHciWqP-fYBiK': (355, ['', '', 'Hardstyle', 'Euphoric', '146.0', '5B', '', '', '', '', '', '', '', '', '1E50C7UI78bE6hwRpIDOuHciWqP-fYBiK']),
-        '1VpA4yDXwkykR7YzN9hWFZZS-TMK3ps18': (1914, ['', '', 'Hardstyle', 'Rawstyle', '154.0', '2A', '', '', '', '', '', '', '', '', '1VpA4yDXwkykR7YzN9hWFZZS-TMK3ps18']),
-        '1IikiHEWOKy_Su_9NHSx5EKdKQyoTOrt-': (1040, ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '1IikiHEWOKy_Su_9NHSx5EKdKQyoTOrt-']),
-        '1QuI-Y-pNGDxob7Ez_q4mN6aNtDCPOiks': (2181, ['', '', 'Hardstyle', '', '', '', '', '', '', '', '', '', '', '', '1QuI-Y-pNGDxob7Ez_q4mN6aNtDCPOiks']),
-        '1GSmBaNJj9SR80Kw_9XtByPKyUKUg5F1C': (1204, ['', '', 'Hardstyle', 'Xtra Raw', '', '', '', '', '', '', '', '', '', '', '1GSmBaNJj9SR80Kw_9XtByPKyUKUg5F1C'])
+    report: Dict[str, Any] = {
+        "version": __version__,
+        "build_mode": "v2.0.1_read_only_corrective",
+        "environment": {
+            "runtime": env_info.runtime,
+            "distro": env_info.distro_name,
+            "in_tmux": env_info.in_tmux,
+            "tmux_available": env_info.tmux_available,
+            "wake_lock_binary_detected": env_info.wake_lock_detected,
+            "wake_lock_acquired": env_info.wake_lock_acquired,
+            "wake_lock_detail": env_info.wake_lock_detail,
+        },
+        "safety_gates": {
+            "configured_dry_run": config.dry_run,
+            "effective_dry_run": True,
+            "allow_provisional_moves": config.allow_provisional_moves,
+            "provider_terms_cleared": config.provider_terms_cleared,
+            "cloud_writes_enabled": False,
+        },
+        "credentials_configured": {
+            "sonovault": bool(config.sonovault_api_key),
+            "audiometa": bool(config.audiometa_api_key),
+            "discogs": bool(config.discogs_token),
+            "google_token_file_present": config.token_path.exists(),
+            "google_client_secrets_present": config.client_secrets_path.exists(),
+        },
+        "database": {
+            "integrity_ok": db_ok,
+            "integrity_detail": db_msg,
+            **inv,
+        },
     }
 
-    report_rows = []
-    move_preview_rows = []
+    width = min(get_terminal_width(), 72)
+    print("\n" + "=" * width)
+    print(f"  MUSIC VAULT MANAGER v{__version__} — LOCAL DIAGNOSTIC STATUS")
+    print("=" * width)
+    print(f"  Runtime:        {env_info.distro_name} [{env_info.runtime}]")
+    print(f"  Tmux session:   {'Active' if env_info.in_tmux else ('Installed (not active)' if env_info.tmux_available else 'Not installed')}")
+    wl_acq = "Yes" if env_info.wake_lock_acquired is True else ("Failed" if env_info.wake_lock_acquired is False else "Not attempted in this process")
+    print(f"  Wake-lock:      binary={'Detected' if env_info.wake_lock_detected else 'Absent'} | acquired={wl_acq}")
+    print(f"  Safety gates:   DRY_RUN=True (enforced; .env={config.dry_run}) | Writes=DISABLED")
+    print(f"                  PROVISIONAL_MOVES={'HELD' if not config.allow_provisional_moves else 'CONFIG_TRUE_OVERRIDDEN_BY_READONLY'}")
+    print(f"                  PROVIDER_TERMS_CLEARED={config.provider_terms_cleared}")
+    print("-" * width)
+    print(f"  DB Integrity:   {'OK' if db_ok else 'FAILED (' + db_msg + ')'} (schema v{inv['schema_version']})")
+    if inv.get("last_migration_backup"):
+        print(f"  Migration bak:  {inv['last_migration_backup']}")
+    print(f"  Total records:  {inv['total_records']}")
+    print(f"    Live source:  {inv['live_source_tracks']} (ready artist+title: {inv['live_ready_identity']}, missing: {inv['live_missing_identity']})")
+    print(f"    Quarantined:  {inv['quarantined_records']} (checkpoint-only: {inv['checkpoint_only_records']})")
+    print(f"    Stale files:  {inv['stale_live_tracks']} | Unresolved conflicts: {inv['unresolved_conflicts']}")
+    print(f"  Hydration:      {inv['hydration_status_counts'] or {'none': 0}}")
+    print(f"  Bytes read:     {format_mib(inv['total_hydration_bytes'])}")
+    print(f"  Research:       {inv['research_status_counts'] or {'none': 0}} (eligible pending: {inv['eligible_for_research']})")
+    if inv.get("last_scan"):
+        ls = inv["last_scan"]
+        src_disp = short_file_id(ls.get("source_folder_id", ""), verbose=verbose)
+        print(f"  Last scan:      #{ls['scan_id']} [{ls['status']}] seen={ls['seen_count']} source={src_disp}")
+    print("=" * width + "\n")
 
-    for t in selected:
-        cs = db.get_candidates(t.file_id)
-        # Classify
-        g_info = classify_track_genres(t.metadata, cs)
-        proposal_dict = {
-            'bpm': t.metadata.embedded_bpm,
-            'key': t.metadata.embedded_key,
-            'genre': g_info['genre'],
-            'subgenre': g_info['subgenre']
+    secrets = config.known_secrets()
+    if export_json:
+        p = export_safe_json(export_json, report, secrets)
+        print(f"[✓] Exported JSON status report to {p}")
+    if export_csv:
+        flat_row = {
+            "version": __version__,
+            "runtime": env_info.runtime,
+            "db_integrity_ok": db_ok,
+            "schema_version": inv["schema_version"],
+            "total_records": inv["total_records"],
+            "live_source_tracks": inv["live_source_tracks"],
+            "quarantined_records": inv["quarantined_records"],
+            "live_ready_identity": inv["live_ready_identity"],
+            "live_missing_identity": inv["live_missing_identity"],
+            "eligible_for_research": inv["eligible_for_research"],
+            "total_hydration_bytes": inv["total_hydration_bytes"],
         }
+        p = export_safe_csv(export_csv, list(flat_row.keys()), [flat_row], secrets)
+        print(f"[✓] Exported CSV status summary to {p}")
 
-        row_num, old_vals = mock_sheet_rows.get(t.file_id, (999, ['', '', '', '', '', '', '', '', '', '', '', '', '', '', t.file_id]))
-        new_row, decisions, changed = planned_row(
-            candidates=cs,
-            proposal_row=proposal_dict,
-            old_row=old_vals,
-            save_medium=config.save_medium,
-            provider_terms_cleared=config.provider_terms_cleared
-        )
-
-        report_rows.append({
-            'row': row_num,
-            'track': t.name,
-            'BPM': decisions.get('bpm', ''),
-            'Key': decisions.get('key', ''),
-            'Genre': decisions.get('genre', ''),
-            'Subgenre': decisions.get('subgenre', ''),
-            'star': new_row[16],
-            'would_fill': ','.join(changed)
-        })
-
-        move_item = build_move_plan(
-            file_id=t.file_id,
-            track_name=t.name,
-            row_num=row_num,
-            sheet_row=old_vals,
-            allow_provisional=config.allow_provisional_moves
-        )
-        move_preview_rows.append(move_item)
-
-    # Print Report
-    print("\n=== COPY THIS REPORT — v1.3-provisional-routing-10 ===")
-    print(f"{'row':<6} {'track':<40} {'BPM':<15} {'Key':<15} {'Genre':<20} {'Subgenre':<20} {'star':<5} {'would_fill'}")
-    print("-" * 135)
-    for r in report_rows:
-        t_display = r['track'][:38]
-        print(f"{r['row']:<6} {t_display:<40} {r['BPM']:<15} {r['Key']:<15} {r['Genre']:<20} {r['Subgenre']:<20} {r['star']:<5} {r['would_fill']}")
-
-    print(f"\nDry-run: {config.dry_run} Provider terms cleared: {config.provider_terms_cleared} Proposed row updates: {len(report_rows)}")
-    print("No audio modifications are supported by this application.")
-
-    print("\n=== MOVE PREVIEW — v1.3 ===")
-    print(f"{'row':<6} {'file_id':<35} {'track':<35} {'destination':<15} {'reason':<25} {'routing_confidence':<20} {'eligible':<10} {'move_authorized'}")
-    print("-" * 165)
-    for m in move_preview_rows:
-        t_disp = m.track_name[:33]
-        print(f"{m.row_num or 0:<6} {m.file_id:<35} {t_disp:<35} {m.destination:<15} {m.reason:<25} {m.routing_confidence.value:<20} {str(m.eligible):<10} {str(m.move_authorized)}")
-
-    eligible_count = sum(1 for m in move_preview_rows if m.eligible)
-    auth_count = sum(1 for m in move_preview_rows if m.move_authorized)
-    print(f"Eligible: {eligible_count} of {len(move_preview_rows)} | move-authorized: {auth_count} | DRY_RUN: {config.dry_run}\n")
+    return report
 
 
-def run_scan(config: Config, db: Database) -> None:
-    """Scan Google Drive source folder, extract audio tags, and save checkpoints."""
-    auth_mgr = GoogleAuthManager(config)
-    creds = auth_mgr.get_credentials()
-    if not creds:
-        print("[✗] Google authentication is required to scan Drive.")
-        return
+def run_backup(config: Config, db: Database, label: str = "manual") -> Optional[Path]:
+    """Create a verified timestamped SQLite online backup without overwriting prior backups."""
+    try:
+        bak = db.create_verified_backup(label=label)
+        print(f"[✓] Created and verified SQLite online backup: {bak.name}")
+        print(f"    Location: {bak}")
+        return bak
+    except DatabaseMigrationError as exc:
+        print(f"[✗] Backup failed: {config.redact(exc)}")
+        return None
 
-    drive = DriveService(creds)
+
+def run_scan(
+    config: Config,
+    db: Database,
+    hydrate_after: bool = False,
+    hydrate_limit: int = 10,
+    hydrate_max_mib: float = 32.0,
+    allow_full_download: bool = False,
+    verbose: bool = False,
+    drive_override: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Scan configured Google Drive source folder (read-only metadata list).
+    Refreshes Drive parent/name/size independently of tags, repairs unchanged incomplete rows,
+    and marks membership ONLY after full scan completion.
+    """
+    if drive_override is not None:
+        drive = drive_override
+    else:
+        auth_mgr = GoogleAuthManager(config)
+        creds = auth_mgr.get_credentials()
+        if not creds:
+            print("[✗] Google authentication is required to scan Drive.")
+            return {"status": "auth_failed", "seen": 0}
+        drive = DriveService(creds)
+
     source_id = config.source_folder_id
+    src_disp = short_file_id(source_id, verbose=verbose)
+    print(f"\nStarting read-only Drive inventory scan on source folder ({src_disp})...")
 
-    print(f"\nStarting Drive inventory scan on folder: {source_id}...")
-    with termux_wake_lock():
-        count = 0
-        for item in drive.scan_inventory(source_id):
-            file_id = item['id']
-            name = item.get('name', '')
-            size = int(item.get('size', 0) or 0)
-            md5 = item.get('md5Checksum', '')
-            mod = item.get('modifiedTime', '')
-            parent = item.get('scanned_parent', '')
+    scan_id = db.begin_scan_run(source_id)
+    seen = 0
+    counts: Dict[str, int] = {}
+    started = time.monotonic()
 
-            # Check if already up-to-date in SQLite
-            existing = db.get_track(file_id)
-            if existing and existing.metadata.version == (md5 or mod):
-                count += 1
-                continue
+    with termux_wake_lock() as wl_ok:
+        if detect_environment().wake_lock_detected and not wl_ok:
+            print("  [i] Note: host wake-lock not acquired inside PRoot; run 'termux-wake-lock' in native Termux for long batches.")
+        try:
+            for item in drive.scan_inventory(source_id):
+                outcome = db.reconcile_scanned_file(scan_id, source_id, item)
+                counts[outcome] = counts.get(outcome, 0) + 1
+                if outcome != "skipped_blank_id" and outcome != "duplicate_in_scan":
+                    seen += 1
+                if seen > 0 and seen % 50 == 0:
+                    elapsed = time.monotonic() - started
+                    print(f"  [scan] {seen} files reconciled ({elapsed:.1f}s elapsed)...")
 
-            track = Track(
-                file_id=file_id,
-                name=name,
-                size=size,
-                md5=md5,
-                modified_time=mod,
-                parent_id=parent,
-                metadata=TrackMetadata(version=md5 or mod)
+            finalized = db.complete_scan_run(scan_id, source_id, seen)
+            elapsed = time.monotonic() - started
+            print(
+                f"[✓] Inventory scan #{scan_id} completed in {elapsed:.1f}s: "
+                f"{finalized['live_source_tracks']} live source tracks | "
+                f"{finalized['quarantined_tracks']} quarantined checkpoint-only | "
+                f"outcomes={counts}"
             )
-            db.save_track(track)
-            count += 1
-            if count % 10 == 0:
-                print(f"  Scanned {count} tracks...")
+        except KeyboardInterrupt:
+            db.abort_scan_run(scan_id, seen_count=seen, reason="Interrupted by user (Ctrl+C)", interrupted=True)
+            print(
+                f"\n[!] Scan #{scan_id} interrupted after {seen} files. "
+                "Per-file checkpoints saved; unseen tracks were NOT marked absent."
+            )
+            return {"status": "interrupted", "seen": seen}
+        except Exception as exc:
+            err_clean = config.redact(exc)
+            db.abort_scan_run(scan_id, seen_count=seen, reason=err_clean, interrupted=False)
+            print(f"\n[✗] Scan #{scan_id} failed after {seen} files: {err_clean}")
+            print("    Unseen tracks were NOT marked absent.")
+            return {"status": "failed", "seen": seen, "error": err_clean}
 
-    print(f"[✓] Inventory scan completed. {count} tracks registered in local database.")
+    result: Dict[str, Any] = {"status": "completed", "seen": seen, **finalized, "outcomes": counts}
+    if hydrate_after:
+        print(
+            f"\n[--hydrate] Running bounded post-scan hydration "
+            f"(limit={hydrate_limit}, budget={hydrate_max_mib:g} MiB)..."
+        )
+        hyd_sum = run_hydrate(
+            config,
+            db,
+            limit=hydrate_limit,
+            max_mib=hydrate_max_mib,
+            allow_full_download=allow_full_download,
+            verbose=verbose,
+            drive_override=drive,
+        )
+        result["hydration"] = hyd_sum
+    return result
 
 
-def run_research(config: Config, db: Database, limit: int = 10) -> None:
-    """Run metadata research across active providers for unverified tracks."""
-    tracks = db.get_all_tracks()[:limit]
-    if not tracks:
-        print("[!] No tracks in database to research. Run scan first.")
-        return
+def run_hydrate(
+    config: Config,
+    db: Database,
+    limit: int = 10,
+    max_mib: float = 32.0,
+    max_file_mib: float = 2.0,
+    allow_full_download: bool = False,
+    use_sheet: bool = False,
+    verbose: bool = False,
+    export_json: Optional[Path] = None,
+    export_csv: Optional[Path] = None,
+    drive_override: Optional[Any] = None,
+    sheets_override: Optional[Any] = None,
+) -> Any:
+    """
+    Bandwidth-aware audio tag & duration hydration for pending live tracks.
+    Defaults: --limit 10, --max-mib 32.0, no full-file downloads unless opted in.
+    """
+    inv = db.get_inventory_summary()
+    if inv["live_source_tracks"] == 0:
+        print("\n[!] NO WORK PERFORMED: 0 live source tracks in database. Run 'musicvault scan' first.")
+        return None
 
-    sono = SonoVaultProvider(api_key=config.sonovault_api_key, contact=config.contact)
-    am = AudioMetaProvider(api_key=config.audiometa_api_key, contact=config.contact)
-    dc = DiscogsProvider(token=config.discogs_token, contact=config.contact)
-    mb = MusicBrainzProvider(contact=config.contact)
-    researcher = ResearchProvider(contact=config.contact)
+    queue_preview = db.get_live_tracks_for_hydration(limit=max(1, int(limit)))
+    if not queue_preview:
+        print(
+            f"\n[i] NO WORK NEEDED: All {inv['live_source_tracks']} live tracks have completed or "
+            "permanently unsupported hydration status."
+        )
+        return None
 
-    print(f"\nStarting metadata research for {len(tracks)} tracks...")
-    with termux_wake_lock():
-        for t in tracks:
-            print(f"Researching: {t.name}...")
-            artist = t.metadata.artist
-            title = t.metadata.title
-            if not artist or not title:
-                continue
+    if drive_override is not None:
+        drive = drive_override
+        creds = None
+    else:
+        auth_mgr = GoogleAuthManager(config)
+        creds = auth_mgr.get_credentials()
+        if not creds:
+            print("[✗] Google authentication is required to read ranged Drive audio headers.")
+            return None
+        drive = DriveService(creds)
 
-            candidates: List[Candidate] = []
-
-            # SonoVault
-            if config.sonovault_api_key:
-                try:
-                    candidates.extend(sono.search(artist, title))
-                except Exception as e:
-                    logger.debug(f"SonoVault error: {e}")
-
-            # AudioMeta
-            if config.audiometa_api_key:
-                try:
-                    candidates.extend(am.search(artist, title))
-                except Exception as e:
-                    logger.debug(f"AudioMeta error: {e}")
-
-            # Discogs
-            if config.discogs_token:
-                try:
-                    candidates.extend(dc.search(artist, title))
-                except Exception as e:
-                    logger.debug(f"Discogs error: {e}")
-
-            # MusicBrainz
+    sheet_identities = None
+    if use_sheet:
+        sh_svc = sheets_override or (SheetsService(creds) if creds else None)
+        if sh_svc is not None:
             try:
-                candidates.extend(mb.search(artist, title, t.metadata.isrc))
-            except Exception as e:
-                logger.debug(f"MusicBrainz error: {e}")
+                s_idx = sh_svc.load_verified_index(config.sheet_id)
+                if s_idx.schema_valid and s_idx.verified_identities:
+                    sheet_identities = s_idx.verified_identities
+                    print(f"  [sheet] Loaded {len(sheet_identities)} exact-ID verified sheet identities.")
+                elif not s_idx.schema_valid:
+                    print(f"  [!] Sheet identity fallback skipped ({s_idx.schema_error}).")
+            except Exception as exc:
+                print(f"  [!] Sheet identity lookup skipped: {config.redact(exc)}")
 
-            # Verify each candidate against local audio file metrics
-            for c in candidates:
-                c.verification = verify_candidate(
-                    candidate_isrc=c.isrc,
-                    candidate_duration=c.duration,
-                    local_isrc=t.metadata.isrc,
-                    local_duration=t.metadata.duration
+    est_bytes = min(int(max_mib * 1024 * 1024), len(queue_preview) * 131072)
+    print(
+        f"\nStarting bounded metadata hydration: up to {len(queue_preview)} live tracks "
+        f"(cap={max_mib:g} MiB, est. ranged transfer ~{format_mib(est_bytes)}, "
+        f"full-download={'OPTED-IN' if allow_full_download else 'OFF'})..."
+    )
+
+    started = time.monotonic()
+
+    def _on_progress(i: int, total: int, tr: Track, status: str, used_b: int) -> None:
+        if i == 1 or i == total or i % 5 == 0:
+            elapsed = time.monotonic() - started
+            origin = tr.metadata.identity_origin or "-"
+            print(
+                f"  [{i}/{total}] {tr.name[:42]} -> {status} ({origin}) | "
+                f"transferred={format_mib(used_b)} ({elapsed:.1f}s)"
+            )
+
+    with termux_wake_lock():
+        summary = hydrate_live_inventory(
+            db=db,
+            drive_service=drive,
+            limit=limit,
+            max_mib=max_mib,
+            max_file_ranged_mib=max_file_mib,
+            allow_full_download=allow_full_download,
+            sheet_identities=sheet_identities,
+            secret_values=config.known_secrets(),
+            progress_callback=_on_progress,
+        )
+
+    print("\n--- Hydration Batch Summary ---")
+    print(f"  Attempted:                 {summary.attempted} (of {summary.eligible_pending} pending/incomplete live)")
+    print(f"  Verified embedded tags:    {summary.hydrated_embedded} (+ {summary.preserved_same_version} preserved same-version)")
+    print(f"  Exact-ID sheet identity:   {summary.hydrated_sheet_identity}")
+    print(f"  Ambiguous filename hints:  {summary.hydrated_filename_ambiguous}")
+    print(f"  Title-only (held):         {summary.title_only_unresolved}")
+    print(f"  Tagless/unresolved:        {summary.unresolved_tagless}")
+    print(f"  Failures (retryable/perm): {summary.retryable_failures} retryable / {summary.permanent_unsupported} unsupported")
+    print(f"  Actual bytes transferred:  {format_mib(summary.bytes_transferred)} / {format_mib(summary.byte_budget_cap)}")
+    if summary.paused_budget_exhausted:
+        print("  [!] Paused cleanly upon reaching --max-mib byte budget. Re-run 'musicvault hydrate' to continue.")
+    if summary.interrupted:
+        print("  [!] Interrupted by user (Ctrl+C). Completed track checkpoints saved.")
+    for err_line in summary.errors[:5]:
+        print(f"  [issue] {config.redact(err_line)}")
+    print()
+
+    secrets = config.known_secrets()
+    if export_json:
+        export_safe_json(export_json, summary.__dict__, secrets)
+        print(f"[✓] Exported hydration JSON summary to {export_json}")
+    if export_csv:
+        live_rows = [
+            {
+                "file_id": short_file_id(t.file_id, verbose=verbose),
+                "name": t.name,
+                "hydration_status": t.hydration_status,
+                "hydration_method": t.hydration_method,
+                "identity_origin": t.metadata.identity_origin,
+                "identity_confidence": t.metadata.identity_confidence,
+                "artist": t.metadata.artist,
+                "title": t.metadata.title,
+                "duration": t.metadata.duration,
+                "isrc": t.metadata.isrc,
+                "bpm": t.metadata.embedded_bpm,
+                "key": t.metadata.embedded_key,
+                "bytes": t.hydration_bytes,
+            }
+            for t in db.get_all_tracks(live_only=True)
+        ]
+        if live_rows:
+            export_safe_csv(export_csv, list(live_rows[0].keys()), live_rows, secrets)
+            print(f"[✓] Exported hydration CSV report to {export_csv}")
+
+    return summary
+
+
+def run_research(
+    config: Config,
+    db: Database,
+    limit: int = 10,
+    force_refresh: bool = False,
+    include_title_only: bool = False,
+    enable_wikidata: bool = True,
+    verbose: bool = False,
+    export_json: Optional[Path] = None,
+    export_csv: Optional[Path] = None,
+    providers_override: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """
+    Run resumable online metadata research for eligible live tracks with known identity.
+    Never prints fake completion when 0 tracks were attempted.
+    """
+    started = time.monotonic()
+
+    def _on_progress(i: int, total: int, tr: Track, status: str, cand_cnt: int) -> None:
+        elapsed = time.monotonic() - started
+        print(f"  [{i}/{total}] {tr.name[:44]} -> {status} ({cand_cnt} candidates, {elapsed:.1f}s)")
+
+    with termux_wake_lock():
+        summary = execute_research_batch(
+            config=config,
+            db=db,
+            limit=limit,
+            force_refresh=force_refresh,
+            include_title_only=include_title_only,
+            enable_wikidata_fallback=enable_wikidata,
+            providers_override=providers_override,
+            progress_callback=_on_progress,
+        )
+
+    print("\n--- Online Metadata Research Summary ---")
+    print(
+        f"  Live source inventory: {summary.live_total} "
+        f"(quarantined excluded: {summary.quarantined_excluded}, stale excluded: {summary.stale_excluded})"
+    )
+    print(
+        f"  Identity readiness:    already researched={summary.already_completed} | "
+        f"deferred missing identity={summary.deferred_missing_identity} | "
+        f"deferred title-only={summary.deferred_title_only}"
+    )
+
+    if summary.attempted == 0:
+        print(f"  [!] NO WORK PERFORMED: {summary.no_work_reason}\n")
+        return summary
+
+    print(f"  Attempted this batch:  {summary.attempted} (limit={limit})")
+    print(f"  Recording-verified:    {summary.matched_verified}")
+    print(f"  Review-only matches:   {summary.matched_review_only}")
+    print(f"  Empty / no match:      {summary.no_match}")
+    print(f"  Retryable failures:    {summary.failed_retryable}")
+    if summary.provider_telemetry:
+        print("  Provider calls:")
+        for p_name, stats in summary.provider_telemetry.items():
+            if stats.get("calls", 0) or stats.get("cache_hits", 0):
+                print(
+                    f"    - {p_name}: http_calls={stats.get('calls', 0)}, cache_hits={stats.get('cache_hits', 0)}, "
+                    f"ok={stats.get('ok', 0)}, auth_err={stats.get('auth_errors', 0)}, "
+                    f"rate_lim={stats.get('rate_limited', 0)}, err={stats.get('server_errors', 0) + stats.get('network_errors', 0)}"
                 )
+    for issue in summary.actionable_issues:
+        print(f"  [!] Provider issue: {config.redact(issue)}")
+    if summary.interrupted:
+        print("  [!] Interrupted by user (Ctrl+C). Completed per-track checkpoints saved.")
+    print()
 
-            # Online Research fallback if uncertain
-            if not candidates or all('conflict' in c.verification.lower() for c in candidates):
-                hints = researcher.research_track(artist, title)
-                for h in hints.get("genre_hints", []):
-                    candidates.append(Candidate(
-                        provider="WikidataResearch",
-                        title=title,
-                        artists=[artist],
-                        genre=[g[0] for g in h.get("genres", [])],
-                        verification="Text only"
-                    ))
+    secrets = config.known_secrets()
+    if export_json:
+        export_safe_json(export_json, summary.__dict__, secrets)
+        print(f"[✓] Exported research JSON summary to {export_json}")
+    if export_csv:
+        rows_out = [
+            {
+                "file_id": short_file_id(t.file_id, verbose=verbose),
+                "name": t.name,
+                "artist": t.metadata.artist,
+                "title": t.metadata.title,
+                "research_status": t.research_status,
+                "attempts": t.research_attempts,
+                "candidates_count": len(db.get_candidates(t.file_id)),
+            }
+            for t in db.get_all_tracks(live_only=True)
+        ]
+        if rows_out:
+            export_safe_csv(export_csv, list(rows_out[0].keys()), rows_out, secrets)
+            print(f"[✓] Exported research CSV report to {export_csv}")
 
-            db.save_candidates(t.file_id, candidates)
-            print(f"  Found {len(candidates)} candidates.")
+    return summary
 
-    print("[✓] Research phase complete. Candidates persisted to database.")
+
+def run_preview(
+    config: Config,
+    db: Database,
+    limit: int = 25,
+    wide: bool = False,
+    verbose: bool = False,
+    export_json: Optional[Path] = None,
+    export_csv: Optional[Path] = None,
+    drive_override: Optional[Any] = None,
+    sheets_override: Optional[Any] = None,
+) -> Any:
+    """
+    Real read-only Google Sheets + Google Drive organisation preview.
+    Forces dry-run (0 authorized, 0 executed, 0 cloud writes) regardless of config.
+    """
+    inv = db.get_inventory_summary()
+    live_tracks = db.get_all_tracks(live_only=True)
+    if not live_tracks:
+        print("\n[!] No live source tracks in database to preview. Run 'musicvault scan' first.\n")
+        return None
+
+    selected_tracks = live_tracks[:limit] if (limit and limit > 0) else live_tracks
+
+    if sheets_override is not None and drive_override is not None:
+        sh_svc = sheets_override
+        dr_svc = drive_override
+    else:
+        auth_mgr = GoogleAuthManager(config)
+        creds = auth_mgr.get_credentials()
+        if not creds:
+            print("[✗] Google authentication is required for live Sheets/Drive preview.")
+            return None
+        sh_svc = sheets_override or SheetsService(creds)
+        dr_svc = drive_override or DriveService(creds)
+
+    try:
+        sheet_index = sh_svc.load_verified_index(config.sheet_id)
+    except Exception as exc:
+        print(f"[✗] Unable to read Google Sheet 'Tracks' tab (read-only): {config.redact(exc)}")
+        return None
+
+    vault_folders: Optional[Dict[str, List[str]]] = None
+    try:
+        vault_folders = dr_svc.get_children_folders(config.vault_folder_id)
+    except Exception as exc:
+        print(f"[!] Warning: Could not inspect Vault destination folders ({config.redact(exc)}); folder checks marked provisional.")
+
+    cands_by_id = {t.file_id: db.get_candidates(t.file_id) for t in selected_tracks}
+    preview = evaluate_live_preview(
+        live_tracks=selected_tracks,
+        candidates_by_id=cands_by_id,
+        sheet_index=sheet_index,
+        source_folder_id=config.source_folder_id,
+        vault_folder_id=config.vault_folder_id,
+        vault_folders=vault_folders,
+        save_medium=config.save_medium,
+        provider_terms_cleared=config.provider_terms_cleared,
+        quarantined_count=inv["quarantined_records"],
+    )
+
+    print(f"\n=== LIVE READ-ONLY ORGANISATION PREVIEW (v{__version__}) ===")
+    if not preview.sheet_schema_valid:
+        print(f"[✗] SHEET SCHEMA INVALID — ALL TRACKS HELD: {preview.sheet_schema_error}")
+
+    display_records = [
+        {
+            "row": str(r.row_num) if r.row_num is not None else "-",
+            "file_id": short_file_id(r.file_id, verbose=verbose),
+            "track": r.track_name,
+            "existing_g": r.existing_values.get("genre", ""),
+            "destination": r.destination,
+            "folder_action": r.folder_action,
+            "reason": r.reason,
+            "confidence": r.routing_confidence,
+            "eligible": str(r.eligible),
+            "provisional": str(r.provisional),
+            "authorized": str(r.move_authorized),
+            "star": r.star,
+        }
+        for r in preview.rows
+    ]
+    cols = [
+        ("row", "Row", 6),
+        ("file_id", "File ID", 15 if not verbose else 35),
+        ("track", "Track", 32),
+        ("existing_g", "Sheet Genre", 13),
+        ("destination", "Parent Dest", 16),
+        ("reason", "Reason", 28),
+        ("confidence", "Confidence", 18),
+        ("eligible", "Elig", 6),
+        ("provisional", "Prov", 6),
+        ("authorized", "Auth", 6),
+    ]
+    print(render_responsive_records(display_records, cols, force_wide=wide))
+    print(
+        f"\nEvaluated: {preview.evaluated_count} of {preview.total_live_tracks} live tracks "
+        f"(quarantined excluded: {preview.quarantined_excluded}) | "
+        f"Sheet matched: {preview.matched_sheet_rows}, unindexed draft: {preview.unindexed_draft_only}, "
+        f"dup-ID holds: {preview.duplicate_sheet_id_holds}, lock-error holds: {preview.malformed_lock_holds}"
+    )
+    print(
+        f"Eligible: {preview.eligible_count} (provisional: {preview.provisional_count}) | "
+        f"Move-Authorized: {preview.authorized_count} | Executable: {preview.executable_count} | "
+        "FORCED_DRY_RUN: True (zero Drive/Sheet writes in v2.0.1)\n"
+    )
+
+    secrets = config.known_secrets()
+    if export_json:
+        payload = {
+            "summary": {k: v for k, v in preview.__dict__.items() if k != "rows"},
+            "rows": [r.__dict__ for r in preview.rows],
+        }
+        export_safe_json(export_json, payload, secrets)
+        print(f"[✓] Exported live preview JSON report to {export_json}")
+    if export_csv:
+        csv_rows = [
+            {
+                "row": r.row_num if r.row_num is not None else "",
+                "file_id": r.file_id if verbose else short_file_id(r.file_id, verbose=False),
+                "track_name": r.track_name,
+                "existing_genre": r.existing_values.get("genre", ""),
+                "existing_subgenre": r.existing_values.get("subgenre", ""),
+                "existing_bpm": r.existing_values.get("bpm", ""),
+                "existing_key": r.existing_values.get("key", ""),
+                "proposed_genre": r.proposed_values.get("genre", ""),
+                "proposed_bpm": r.proposed_values.get("bpm", ""),
+                "proposed_key": r.proposed_values.get("key", ""),
+                "destination": r.destination,
+                "folder_action": r.folder_action,
+                "reason": r.reason,
+                "routing_confidence": r.routing_confidence,
+                "eligible": r.eligible,
+                "provisional": r.provisional,
+                "move_authorized": r.move_authorized,
+                "executable": r.executable,
+                "star": r.star,
+                "evidence_summary": r.evidence_summary,
+            }
+            for r in preview.rows
+        ]
+        if csv_rows:
+            export_safe_csv(export_csv, list(csv_rows[0].keys()), csv_rows, secrets)
+            print(f"[✓] Exported live preview CSV report to {export_csv}")
+
+    return preview
+
+
+def run_benchmark(
+    config: Config,
+    db: Optional[Database] = None,
+    sample_size: int = 10,
+    checkpoint_path: Optional[Path] = None,
+    expected_rows_path: Optional[Path] = None,
+    wide: bool = False,
+    verbose: bool = False,
+) -> Any:
+    """
+    Execute isolated offline fixture regression benchmark (never touches or imports into live DB).
+    """
+    print(f"\n=== OFFLINE FIXTURE BENCHMARK ({sample_size} TRACKS — ISOLATED DB) ===")
+    res = execute_isolated_benchmark(
+        config=config,
+        sample_size=sample_size,
+        checkpoint_path=checkpoint_path,
+        expected_rows_path=expected_rows_path,
+    )
+
+    records = [
+        {
+            "row": str(o.row_num) if o.row_num is not None else "-",
+            "file_id": short_file_id(o.file_id, verbose=verbose),
+            "track": o.track_name,
+            "expected": o.expected_destination or "(HOLD)",
+            "actual": o.actual_destination or "(HOLD)",
+            "reason": o.actual_reason,
+            "eligible": str(o.eligible),
+            "auth": str(o.move_authorized),
+            "check": "PASS" if o.passed is True else ("FAIL" if o.passed is False else "NO_FIXTURE"),
+        }
+        for o in res.outcomes
+    ]
+    cols = [
+        ("row", "Row", 6),
+        ("file_id", "File ID", 15 if not verbose else 35),
+        ("track", "Track", 34),
+        ("expected", "Expected", 18),
+        ("actual", "Actual", 14),
+        ("reason", "Reason", 28),
+        ("eligible", "Elig", 6),
+        ("auth", "Auth", 6),
+        ("check", "Check", 10),
+    ]
+    print(render_responsive_records(records, cols, force_wide=wide))
+    print(f"\nBenchmark Status: {res.status}")
+    print(f"  {res.notes}")
+    print(
+        f"  Ground-truth rows evaluated: {res.evaluated_with_ground_truth}/{res.loaded_tracks} | "
+        f"Passed: {res.passed_count} | Failed: {res.failed_count} | Missing fixture rows: {res.missing_expected_rows}"
+    )
+    print(
+        f"  Eligible: {res.eligible_count} | Held: {res.held_count} | "
+        f"Move-Authorized: {res.authorized_count} | Live DB untouched.\n"
+    )
+    for o in res.outcomes:
+        if o.passed is False:
+            print(f"  [FAIL] {o.track_name}: {o.failure_detail}")
+    return res
