@@ -57,6 +57,11 @@ def isolated_musicvault_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(socket.socket, "connect", _blocked_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", _blocked_connect_ex)
+
+    # Prevent unit tests from invoking host Android /data/data/com.termux/files/usr/bin/termux-wake-lock
+    from musicvault import termux as _mv_termux
+    monkeypatch.setattr(_mv_termux, "find_wake_lock_binary", lambda *a, **kw: None)
+
     yield fake_config
 
 

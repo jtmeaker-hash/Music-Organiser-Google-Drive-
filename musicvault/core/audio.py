@@ -121,6 +121,8 @@ def _parse_riff_wav_info_chunks(stream: BinaryIO) -> Dict[str, str]:
             if step <= 0:
                 break
             offset += step
+    except HydrationTransportError:
+        raise
     except Exception:
         return info_tags
     return info_tags

@@ -42,10 +42,10 @@ def mask_secret(value: Optional[str]) -> str:
 
 
 _REDACTION_PATTERNS = [
-    (re.compile(r"(?i)(Authorization\s*:\s*Bearer\s+)[^\s\"',;]+"), r"\1<REDACTED>"),
-    (re.compile(r"(?i)(Authorization\s*:\s*Discogs\s+token=)[^\s\"',;]+"), r"\1<REDACTED>"),
-    (re.compile(r"(?i)(x-api-key\s*[:=]\s*)[^\s\"',;]+"), r"\1<REDACTED>"),
-    (re.compile(r"(?i)(\b(?:Bearer|Discogs\s+token=)\s*)[^\s\"',;]+"), r"\1<REDACTED>"),
+    (re.compile(r"(?i)(Authorization[\"']?\s*:\s*[\"']?Bearer\s+)[^\s\"',;}]+"), r"\1<REDACTED>"),
+    (re.compile(r"(?i)(Authorization[\"']?\s*:\s*[\"']?Discogs\s+token=)[^\s\"',;}]+"), r"\1<REDACTED>"),
+    (re.compile(r"(?i)([\"']?x-api-key[\"']?\s*[:=]\s*[\"']?)[^\"'\s,;}]+"), r"\1<REDACTED>"),
+    (re.compile(r"(?i)(\b(?:Bearer|Discogs\s+token=)\s*)[^\s\"',;}]+"), r"\1<REDACTED>"),
     (
         re.compile(
             r"(?i)([?&](?:api[_-]?key|key|token|access_token|refresh_token|client_secret)=)[^&\s\"']+"
@@ -54,7 +54,7 @@ _REDACTION_PATTERNS = [
     ),
     (
         re.compile(
-            r"(?i)(\b(?:SONOVAULT_API_KEY|AUDIOMETA_API_KEY|DISCOGS_TOKEN|client_secret|refresh_token|access_token)\s*[:=]\s*[\"']?)[^\"'\s,;]+"
+            r"(?i)([\"']?\b(?:SONOVAULT_API_KEY|AUDIOMETA_API_KEY|DISCOGS_TOKEN|api[_-]?key|client_secret|refresh_token|access_token|token|secret|password)\b[\"']?\s*[:=]\s*[\"']?)[^\"'\s,;}]+"
         ),
         r"\1<REDACTED>",
     ),
@@ -62,6 +62,7 @@ _REDACTION_PATTERNS = [
     (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}\b"), "<REDACTED_GOOGLE_KEY>"),
     (re.compile(r"\bamsk_[A-Za-z0-9_-]{8,}\b"), "<REDACTED_AUDIOMETA_KEY>"),
     (re.compile(r"\bya29\.[A-Za-z0-9._-]{12,}\b"), "<REDACTED_OAUTH_TOKEN>"),
+    (re.compile(r"\b1//[A-Za-z0-9._-]{16,}\b"), "<REDACTED_REFRESH_TOKEN>"),
 ]
 
 

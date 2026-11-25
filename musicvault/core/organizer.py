@@ -15,6 +15,49 @@ from .matcher import norm
 from .rules import build_track_proposal, load_existing_states, parse_lock_states, planned_row
 
 
+# Strict parent-only spelling aliases for Vault folder matching (never maps subgenres like Rawstyle/Jump Up!)
+_PARENT_FOLDER_SPELLING_ALIASES: Dict[str, str] = {
+    "hardstyle": "Hardstyle",
+    "hardcore": "Hardcore",
+    "techno": "Techno",
+    "trance": "Trance",
+    "drumandbass": "Drum & Bass",
+    "drumbass": "Drum & Bass",
+    "drumnbass": "Drum & Bass",
+    "dnb": "Drum & Bass",
+    "hiphop": "Hip-Hop",
+    "hiphoprap": "Hip-Hop",
+    "rap": "Hip-Hop",
+    "house": "House",
+    "ukgarage": "UK Garage",
+    "garage": "UK Garage",
+    "dubstep": "Dubstep",
+    "pop": "Pop",
+    "rock": "Rock",
+    "reggae": "Reggae",
+    "jungle": "Jungle",
+    "bassline": "Bassline",
+    "happyhardcore": "Happy Hardcore",
+    "ambient": "Ambient",
+    "disco": "Disco",
+    "funk": "Funk",
+    "soul": "Soul",
+    "jazz": "Jazz",
+    "classical": "Classical",
+    "breakbeat": "Breakbeat",
+    "electro": "Electro",
+    "trap": "Trap",
+    "rnb": "R&B",
+    "rhythmandblues": "R&B",
+}
+
+
+def _vault_parent_folder_key(folder_name: str) -> str:
+    """Normalize a Vault top-level folder name without collapsing subgenres onto parent genres."""
+    n = norm(folder_name)
+    return _PARENT_FOLDER_SPELLING_ALIASES.get(n, f"exact:{n}")
+
+
 def safe_segment(s: Any) -> Optional[str]:
     """Validate that folder path segment is safe for Drive and Android."""
     seg = str(s or "").strip()
@@ -173,7 +216,7 @@ def evaluate_live_preview(
     folder_lookup: Dict[str, List[Tuple[str, str]]] = {}
     if vault_folders:
         for fname, fids in vault_folders.items():
-            key = canonical_genre(fname) or norm(fname)
+            key = _vault_parent_folder_key(fname)
             for fid in fids:
                 folder_lookup.setdefault(key, []).append((fname, fid))
 
@@ -398,10 +441,10 @@ def evaluate_live_preview(
             )
             continue
 
-        # Validate destination against Vault folder listing when available
+        # Validate destination against Vault folder listing when available (parent-folder aliases only)
         folder_action = "REUSE_EXISTING"
         if vault_folders is not None:
-            matched_folders = folder_lookup.get(decided_parent, []) or folder_lookup.get(norm(decided_parent), [])
+            matched_folders = folder_lookup.get(_vault_parent_folder_key(decided_parent), [])
             if len(matched_folders) > 1:
                 summary.rows.append(
                     _make_hold_row(row_num, existing_vals, f_decisions, "AMBIGUOUS_DUPLICATE_VAULT_FOLDER")

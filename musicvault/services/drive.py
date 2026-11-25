@@ -149,11 +149,11 @@ class DriveService:
                         continue
                     c_len = len(chunk)
                     transferred += c_len
+                    budget.record(c_len)
                     if transferred > max_full_bytes:
                         raise HydrationTransportError(
                             f"Full download exceeded cap ({transferred} > {max_full_bytes} bytes)"
                         )
-                    budget.record(c_len)
                     fh.write(chunk)
             return transferred
         except BaseException:
@@ -193,10 +193,14 @@ class DriveService:
                 break
         return found
 
-    def ensure_folder(self, parent_id: str, folder_name: str) -> str:
+    def ensure_folder(self, parent_id: str, folder_name: str, allow_live_writes: bool = False) -> str:
         """
-        Ensure folder exists under parent (NOT wired into v2.0.1 read-only CLI/menu).
+        Ensure folder exists under parent (DISABLED in v2.0.1 read-only corrective build).
         """
+        if not allow_live_writes:
+            raise RuntimeError(
+                "Live Google Drive folder creation is disabled in Music Vault v2.0.1 (read-only corrective build)."
+            )
         folders = self.get_children_folders(parent_id)
         ids = folders.get(folder_name, [])
         if len(ids) > 1:
@@ -219,10 +223,16 @@ class DriveService:
             fields="id, name, parents, mimeType, trashed",
         ).execute()
 
-    def move_file(self, file_id: str, new_parent_id: str, old_parent_id: str) -> Dict[str, Any]:
+    def move_file(
+        self, file_id: str, new_parent_id: str, old_parent_id: str, allow_live_writes: bool = False
+    ) -> Dict[str, Any]:
         """
-        Move file on Google Drive by updating parents (NOT wired into v2.0.1 read-only CLI/menu).
+        Move file on Google Drive by updating parents (DISABLED in v2.0.1 read-only corrective build).
         """
+        if not allow_live_writes:
+            raise RuntimeError(
+                "Live Google Drive file moves are disabled in Music Vault v2.0.1 (read-only corrective build)."
+            )
         return self.service.files().update(
             fileId=file_id,
             addParents=new_parent_id,

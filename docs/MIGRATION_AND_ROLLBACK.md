@@ -6,7 +6,7 @@ Music Vault Manager `v2.0.1` upgrades existing `v2.0.0` SQLite databases (`~/.co
 
 - **Zero credential resets**: `~/.config/musicvault/.env`, `client_secrets.json`, and `token.json` are never deleted, overwritten, or regenerated.
 - **Verified pre-migration online backup**: Before applying any schema migration to an existing database, `Database` creates a **new, uniquely timestamped SQLite online backup** via Python's `sqlite3.Connection.backup()` API (capturing a consistent snapshot even if WAL/journal pages exist):
-  - Format: `musicvault.db.backup_YYYYMMDDTHHMMSS_ffffffZ.sqlite` (restricted `0600` permissions).
+  - Format: `musicvault.db.pre_v201_migration_YYYYMMDDTHHMMSS_ffffffZ.sqlite` (restricted `0600` permissions).
   - Never overwrites `musicvault.db.bak` or any prior backup file.
   - Runs `PRAGMA integrity_check` on **both** the original database and the new backup, and verifies table row counts match before starting migration.
   - If either integrity check fails or any migration SQL statement raises an error, the transaction rolls back immediately and the original database remains untouched.
@@ -83,7 +83,7 @@ If any unexpected discrepancy occurs after upgrading:
    ```
 3. **Verify your chosen backup before restoring a copy**:
    ```bash
-   BACKUP_FILE="musicvault.db.manual_<TIMESTAMP>.sqlite"   # or musicvault.db.backup_<TIMESTAMP>.sqlite
+   BACKUP_FILE="musicvault.db.manual_<TIMESTAMP>.sqlite"   # or musicvault.db.pre_v201_migration_<TIMESTAMP>.sqlite
    python3 -c "import sqlite3; c=sqlite3.connect('$BACKUP_FILE'); assert c.execute('PRAGMA integrity_check').fetchone()[0]=='ok'; print('Backup OK')"
    cp -p "$BACKUP_FILE" musicvault.db
    chmod 600 musicvault.db

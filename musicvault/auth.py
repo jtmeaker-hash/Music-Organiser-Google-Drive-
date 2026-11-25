@@ -43,7 +43,7 @@ class GoogleAuthManager:
             try:
                 creds = Credentials.from_authorized_user_file(str(self.token_file), SCOPES)
             except Exception as exc:
-                logger.warning("Failed to parse existing token file (%s)", redact_secrets(exc))
+                logger.warning("Failed to parse existing token file (%s)", redact_secrets(exc, self.config.known_secrets()))
                 creds = None
 
         if creds and creds.valid:
@@ -55,7 +55,7 @@ class GoogleAuthManager:
                 self._save_token(creds)
                 return creds
             except RefreshError as ref_exc:
-                msg = redact_secrets(ref_exc)
+                msg = redact_secrets(ref_exc, self.config.known_secrets())
                 logger.warning("OAuth token refresh rejected (%s)", msg)
                 print(
                     "\n[!] Stored Google OAuth refresh token expired or was revoked "
@@ -64,7 +64,7 @@ class GoogleAuthManager:
                 creds = None
             except Exception as exc:
                 # Transient network failure during refresh -> do NOT force interactive overwrite if non-interactive
-                logger.warning("Transient error refreshing Google OAuth token: %s", redact_secrets(exc))
+                logger.warning("Transient error refreshing Google OAuth token: %s", redact_secrets(exc, self.config.known_secrets()))
                 if not allow_interactive:
                     return None
                 creds = None

@@ -1053,6 +1053,7 @@ class Database:
                 return "version_changed_stale"
 
             # Same version: refresh inventory attributes independently of tags and repair incomplete rows
+            target_ver = new_ver or old_ver
             has_complete_embedded = bool(
                 str(existing["artist"] or "").strip()
                 and str(existing["title"] or "").strip()
@@ -1060,14 +1061,26 @@ class Database:
                 and (existing["identity_origin"] or "") == "embedded"
             )
             curr_hyd = existing["hydration_status"] or "pending"
+            curr_hyd_ver = existing["hydration_version"] or ""
+            curr_method = existing["hydration_method"] or ""
+            already_stream_inspected = (
+                (not target_ver or curr_hyd_ver == target_ver)
+                and curr_method.startswith(("embedded_ranged", "embedded_full", "full_download", "preserved_same_version"))
+            )
             if has_complete_embedded:
                 next_hyd = "success"
                 id_conf = existing["identity_confidence"] or "verified_embedded"
-            elif curr_hyd == "permanent_unsupported" and (existing["hydration_version"] or "") == (new_ver or old_ver):
+            elif curr_hyd == "permanent_unsupported" and (not target_ver or curr_hyd_ver == target_ver):
                 next_hyd = "permanent_unsupported"
                 id_conf = existing["identity_confidence"] or "unresolved"
+            elif curr_hyd in ("partial", "unresolved") and already_stream_inspected:
+                # Stream was already inspected at this exact version (e.g. tagless or filename-only WAV) -> do not reset!
+                next_hyd = curr_hyd
+                id_conf = existing["identity_confidence"] or (
+                    "filename_ambiguous" if (existing["artist"] and existing["title"]) else "unresolved"
+                )
             else:
-                # Schedule hydration repair for unchanged incomplete or fallback-only rows
+                # Schedule hydration repair for unchanged uninspected or legacy fallback-only rows
                 next_hyd = "pending" if curr_hyd in ("pending", "partial", "unresolved", "") else curr_hyd
                 id_conf = existing["identity_confidence"] or (
                     "filename_parsed" if (existing["artist"] and existing["title"]) else "unresolved"
@@ -1116,7 +1129,11 @@ class Database:
                     fid,
                 ),
             )
-            return "updated_preserved" if has_complete_embedded else "updated_needs_hydration"
+            return (
+                "updated_preserved"
+                if (has_complete_embedded or (curr_hyd in ("partial", "unresolved") and already_stream_inspected))
+                else "updated_needs_hydration"
+            )
 
     def complete_scan_run(
         self, scan_id: int, source_folder_id: str, seen_count: int
@@ -1415,38 +1432,78 @@ class Database:
             return [self._row_to_track(r) for r in rows]
 
     def get_live_tracks_for_hydration(
-        self, limit: int, include_retryable: bool = True, max_attempts: int = 4
+        self,
+        limit: int,
+        include_retryable: bool = True,
+        max_attempts: int = 4,
+        force_rehydrate: bool = False,
+        use_sheet_uninspected: bool = False,
     ) -> List[Track]:
-        """Select live source tracks needing metadata hydration or retry."""
+        """
+        Select live source tracks needing metadata hydration or retry.
+        Excludes tagless/partial tracks whose audio stream was already inspected at the current
+        file version unless force_rehydrate=True or sheet identity lookup is newly requested.
+        """
         now = _utc_iso()
-        statuses = ["pending", "partial", "unresolved"]
-        if include_retryable:
-            statuses.append("retryable_failure")
-        placeholders = ",".join("?" for _ in statuses)
         with self._get_connection() as conn:
+            if force_rehydrate:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM tracks
+                    WHERE is_live_source = 1
+                      AND quarantined = 0
+                      AND hydration_status != 'permanent_unsupported'
+                    ORDER BY content_stale DESC, hydration_attempts ASC, file_id ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+                return [self._row_to_track(r) for r in rows]
+
+            retry_clause = (
+                """
+                OR (
+                    hydration_status = 'retryable_failure'
+                    AND hydration_attempts < ?
+                    AND (next_hydrate_retry_utc = '' OR next_hydrate_retry_utc <= ?)
+                )
+                """
+                if include_retryable
+                else ""
+            )
+            params: List[Any] = []
+            if include_retryable:
+                params.extend([max_attempts, now])
+            params.extend([1 if use_sheet_uninspected else 0, limit])
+
             rows = conn.execute(
                 f"""
                 SELECT * FROM tracks
                 WHERE is_live_source = 1
                   AND quarantined = 0
-                  AND (
-                      content_stale = 1
-                      OR hydration_status IN ({placeholders})
-                      OR TRIM(COALESCE(artist, '')) = ''
-                      OR TRIM(COALESCE(title, '')) = ''
-                  )
                   AND hydration_status != 'permanent_unsupported'
                   AND (
-                      hydration_status != 'retryable_failure'
+                      content_stale = 1
+                      OR hydration_status = 'pending'
+                      {retry_clause}
                       OR (
-                          hydration_attempts < ?
-                          AND (next_hydrate_retry_utc = '' OR next_hydrate_retry_utc <= ?)
+                          hydration_status IN ('partial', 'unresolved')
+                          AND (
+                              (version != '' AND hydration_version != version)
+                              OR NOT (
+                                  hydration_method LIKE 'embedded_ranged%'
+                                  OR hydration_method LIKE 'embedded_full%'
+                                  OR hydration_method LIKE 'full_download%'
+                                  OR hydration_method = 'preserved_same_version'
+                              )
+                              OR (? = 1 AND TRIM(COALESCE(sheet_artist, '')) = '' AND TRIM(COALESCE(artist, '')) = '')
+                          )
                       )
                   )
                 ORDER BY content_stale DESC, hydration_attempts ASC, file_id ASC
                 LIMIT ?
                 """,
-                (*statuses, max_attempts, now, limit),
+                tuple(params),
             ).fetchall()
             return [self._row_to_track(r) for r in rows]
 
@@ -1789,12 +1846,39 @@ class Database:
             total_bytes = conn.execute(
                 "SELECT COALESCE(SUM(hydration_bytes), 0) FROM tracks"
             ).fetchone()[0]
+            eligible_hydration = conn.execute(
+                """
+                SELECT COUNT(*) FROM tracks
+                WHERE is_live_source = 1 AND quarantined = 0
+                  AND hydration_status != 'permanent_unsupported'
+                  AND (
+                      content_stale = 1
+                      OR hydration_status = 'pending'
+                      OR (hydration_status = 'retryable_failure' AND hydration_attempts < 4)
+                      OR (
+                          hydration_status IN ('partial', 'unresolved')
+                          AND (
+                              (version != '' AND hydration_version != version)
+                              OR NOT (
+                                  hydration_method LIKE 'embedded_ranged%'
+                                  OR hydration_method LIKE 'embedded_full%'
+                                  OR hydration_method LIKE 'full_download%'
+                                  OR hydration_method = 'preserved_same_version'
+                              )
+                          )
+                      )
+                  )
+                """
+            ).fetchone()[0]
             eligible_research = conn.execute(
                 """
                 SELECT COUNT(*) FROM tracks
                 WHERE is_live_source = 1 AND quarantined = 0 AND content_stale = 0
                   AND TRIM(COALESCE(artist, '')) != '' AND TRIM(COALESCE(title, '')) != ''
-                  AND research_status IN ('pending', 'retryable_failure')
+                  AND (
+                      research_status = 'pending'
+                      OR (research_status = 'retryable_failure' AND research_attempts < 3)
+                  )
                 """
             ).fetchone()[0]
             conflicts_cnt = conn.execute(
@@ -1820,6 +1904,7 @@ class Database:
                 "stale_live_tracks": int(stale),
                 "live_ready_identity": int(live_complete),
                 "live_missing_identity": int(live_incomplete),
+                "eligible_for_hydration": int(eligible_hydration),
                 "eligible_for_research": int(eligible_research),
                 "hydration_status_counts": hyd_counts,
                 "research_status_counts": res_counts,

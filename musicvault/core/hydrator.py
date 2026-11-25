@@ -108,6 +108,7 @@ def hydrate_live_inventory(
     allow_full_download: bool = False,
     max_full_download_mib: float = 50.0,
     sheet_identities: Optional[Dict[str, Tuple[str, str]]] = None,
+    force_rehydrate: bool = False,
     secret_values: Optional[List[str]] = None,
     progress_callback: Optional[Callable[[int, int, Track, str, int], None]] = None,
 ) -> HydrationSummary:
@@ -122,17 +123,21 @@ def hydrate_live_inventory(
     budget = ByteBudgetTracker(max_bytes=budget_bytes)
     summary = HydrationSummary(byte_budget_cap=budget_bytes)
     secrets = secret_values or []
+    use_sheet_flag = bool(sheet_identities)
 
-    # Count total live candidates needing hydration, then select up to `limit`
+    # Count total live candidates genuinely needing hydration, then select up to `limit`
     inv_stats = db.get_inventory_summary()
     summary.eligible_pending = (
-        inv_stats["hydration_status_counts"].get("pending", 0)
-        + inv_stats["hydration_status_counts"].get("partial", 0)
-        + inv_stats["hydration_status_counts"].get("unresolved", 0)
-        + inv_stats["hydration_status_counts"].get("retryable_failure", 0)
+        inv_stats["live_source_tracks"]
+        if force_rehydrate
+        else inv_stats.get("eligible_for_hydration", 0)
     )
 
-    queue = db.get_live_tracks_for_hydration(limit=max(1, int(limit)))
+    queue = db.get_live_tracks_for_hydration(
+        limit=max(1, int(limit)),
+        force_rehydrate=force_rehydrate,
+        use_sheet_uninspected=use_sheet_flag,
+    )
     if not queue:
         return summary
 
@@ -292,15 +297,14 @@ def hydrate_live_inventory(
                         summary.retryable_failures += 1
                         summary.errors.append(f"{track.name}: {err_clean}")
                 else:
-                    # Record safe sheet/filename fallback hints as partial/retryable without full download
+                    # Record safe sheet/filename fallback hints while keeping retryable_failure so backoff & max_attempts apply
                     fallback_meta, _, _ = apply_fallback_identity(
                         TrackMetadata(version=ver), track.name, sheet_pair
                     )
                     err_clean = redact_secrets(range_exc, secrets)
-                    status_out = "partial" if (fallback_meta.artist and fallback_meta.title) else "retryable_failure"
                     db.update_hydration_result(
                         track.file_id,
-                        status=status_out,
+                        status="retryable_failure",
                         version=ver,
                         method="range_capped_fallback",
                         bytes_read=spent,

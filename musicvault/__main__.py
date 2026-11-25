@@ -55,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     hy_p.add_argument("--max-file-mib", type=float, default=2.0, help="Maximum ranged MiB per track before fallback (default: 2)")
     hy_p.add_argument("--allow-full-download", action="store_true", help="Opt in to bounded temp full download if server ignores Range")
     hy_p.add_argument("--use-sheet", action="store_true", help="Also consult verified exact-ID Tracks sheet Artist/Title when tags absent")
+    hy_p.add_argument("--force-rehydrate", action="store_true", help="Re-inspect already-inspected tagless/partial tracks")
     hy_p.add_argument("--verbose", action="store_true", help="Include full Drive file IDs in exports")
     hy_p.add_argument("--export-json", type=str, default="", help="Export hydration summary to JSON")
     hy_p.add_argument("--export-csv", type=str, default="", help="Export live track hydration table to safe CSV")
@@ -141,6 +142,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 max_file_mib=args.max_file_mib,
                 allow_full_download=args.allow_full_download,
                 use_sheet=args.use_sheet,
+                force_rehydrate=args.force_rehydrate,
                 verbose=args.verbose,
                 export_json=Path(args.export_json) if args.export_json else None,
                 export_csv=Path(args.export_csv) if args.export_csv else None,

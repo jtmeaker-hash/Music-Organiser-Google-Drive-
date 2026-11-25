@@ -43,6 +43,7 @@ class ResearchRunSummary:
     no_match: int = 0
     failed_retryable: int = 0
     failed_permanent: int = 0
+    paused_provider_budget: bool = False
     interrupted: bool = False
     no_work_reason: str = ""
     provider_telemetry: Dict[str, Dict[str, int]] = field(default_factory=dict)
@@ -116,10 +117,12 @@ def execute_research_batch(
         mb = providers_override.get("mb")
         wiki = providers_override.get("wiki")
     else:
+        scaled_req_cap = min(250, max(30, int(limit) * 5))
         sono = (
             SonoVaultProvider(
                 api_key=config.sonovault_api_key,
                 contact=config.contact,
+                max_requests=min(200, max(25, int(limit) * 3)),
                 db=db,
                 provider_terms_cleared=terms_ok,
             )
@@ -130,6 +133,7 @@ def execute_research_batch(
             AudioMetaProvider(
                 api_key=config.audiometa_api_key,
                 contact=config.contact,
+                max_requests=scaled_req_cap,
                 db=db,
                 provider_terms_cleared=terms_ok,
             )
@@ -140,6 +144,7 @@ def execute_research_batch(
             DiscogsProvider(
                 token=config.discogs_token,
                 contact=config.contact,
+                max_requests=min(250, max(40, int(limit) * 4)),
                 db=db,
                 provider_terms_cleared=terms_ok,
             )
@@ -148,11 +153,13 @@ def execute_research_batch(
         )
         mb = MusicBrainzProvider(
             contact=config.contact,
+            max_requests=scaled_req_cap,
             db=db,
             provider_terms_cleared=terms_ok,
         )
         wiki = ResearchProvider(
             contact=config.contact,
+            max_requests=min(100, max(15, int(limit) * 2)),
             db=db,
             provider_terms_cleared=terms_ok,
         )
@@ -185,16 +192,18 @@ def execute_research_batch(
             alt_artist = parsed_fn.alt_artist if t.metadata.identity_confidence == "filename_ambiguous" else ""
             alt_title = parsed_fn.alt_title if t.metadata.identity_confidence == "filename_ambiguous" else ""
 
-            summary.attempted += 1
             track_candidates: List[Candidate] = []
             provider_audit: Dict[str, Any] = {}
             transient_failures = 0
             successful_or_empty_responses = 0
+            configured_providers = 0
+            budget_exhausted_without_call = 0
             max_retry_wait = 0.0
 
             if title_only_mode:
                 t_hint = t.metadata.filename_title_hint or title or parsed_fn.title_hint
                 if mb is not None and t_hint:
+                    configured_providers += 1
                     cands, out = mb.search_title_only(t_hint)
                     provider_audit["MusicBrainz"] = {
                         "status": out.status.value,
@@ -203,7 +212,9 @@ def execute_research_batch(
                         "request_made": out.request_made,
                     }
                     _record_issue(out)
-                    if out.status in (ProviderStatus.OK, ProviderStatus.EMPTY):
+                    if out.status == ProviderStatus.BUDGET_EXHAUSTED and not out.request_made and not out.from_cache:
+                        budget_exhausted_without_call += 1
+                    elif out.status in (ProviderStatus.OK, ProviderStatus.EMPTY):
                         successful_or_empty_responses += 1
                         track_candidates.extend(cands)
                     elif out.status in _TRANSIENT_FAILURE_STATUSES:
@@ -223,6 +234,7 @@ def execute_research_batch(
                         provider_audit[p_name] = {"status": "not_configured", "matches": 0, "request_made": False}
                         continue
 
+                    configured_providers += 1
                     cands, out = call_fn(p_inst, artist, title)
                     # If filename was ambiguous ('Title - Artist') and primary orientation found 0 matches, try swapped!
                     if (
@@ -245,12 +257,20 @@ def execute_research_batch(
                         "from_cache": out.from_cache,
                         "request_made": out.request_made,
                     }
-                    if out.status in (ProviderStatus.OK, ProviderStatus.EMPTY):
+                    if out.status == ProviderStatus.BUDGET_EXHAUSTED and not out.request_made and not out.from_cache:
+                        budget_exhausted_without_call += 1
+                    elif out.status in (ProviderStatus.OK, ProviderStatus.EMPTY):
                         successful_or_empty_responses += 1
                         track_candidates.extend(cands)
                     elif out.status in _TRANSIENT_FAILURE_STATUSES:
                         transient_failures += 1
                         max_retry_wait = max(max_retry_wait, out.retry_after_seconds or 120.0)
+
+                # If every configured provider exhausted its run budget before making any request for this track,
+                # stop cleanly without penalizing unqueried tracks or incrementing research_attempts!
+                if configured_providers > 0 and budget_exhausted_without_call == configured_providers:
+                    summary.paused_provider_budget = True
+                    break
 
                 # Verify each candidate recording identity + mix/version BEFORE ISRC/duration
                 verified_candidates: List[Candidate] = []
@@ -274,12 +294,19 @@ def execute_research_batch(
 
                 track_candidates = verified_candidates
 
-                # Wikidata inferred fallback ONLY when no recording-supported genre candidate exists
+                # Wikidata inferred fallback ONLY when at least one catalogue provider responded cleanly
+                # (never mask an all-provider transient outage with a Wikidata hint, which would wipe prior candidates!)
+                all_catalogue_failed_transiently = (transient_failures > 0 and successful_or_empty_responses == 0)
                 has_good_genre = any(
                     c.verification in ("ISRC supported", "Duration supported") and c.genre
                     for c in track_candidates
                 )
-                if enable_wikidata_fallback and wiki is not None and not has_good_genre:
+                if (
+                    enable_wikidata_fallback
+                    and wiki is not None
+                    and not has_good_genre
+                    and not all_catalogue_failed_transiently
+                ):
                     res_info = wiki.research_track(artist, title)
                     w_hints = res_info.get("genre_hints") or []
                     w_added = 0
@@ -307,6 +334,12 @@ def execute_research_batch(
                         "matches": w_added,
                         "evidence_type": "inferred",
                     }
+
+            if configured_providers > 0 and budget_exhausted_without_call == configured_providers:
+                summary.paused_provider_budget = True
+                break
+
+            summary.attempted += 1
 
             # Decide per-track research checkpoint status honestly
             has_recording_verified = any(

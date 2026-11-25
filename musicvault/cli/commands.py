@@ -240,6 +240,7 @@ def run_hydrate(
     max_file_mib: float = 2.0,
     allow_full_download: bool = False,
     use_sheet: bool = False,
+    force_rehydrate: bool = False,
     verbose: bool = False,
     export_json: Optional[Path] = None,
     export_csv: Optional[Path] = None,
@@ -255,7 +256,11 @@ def run_hydrate(
         print("\n[!] NO WORK PERFORMED: 0 live source tracks in database. Run 'musicvault scan' first.")
         return None
 
-    queue_preview = db.get_live_tracks_for_hydration(limit=max(1, int(limit)))
+    queue_preview = db.get_live_tracks_for_hydration(
+        limit=max(1, int(limit)),
+        force_rehydrate=force_rehydrate,
+        use_sheet_uninspected=use_sheet,
+    )
     if not queue_preview:
         print(
             f"\n[i] NO WORK NEEDED: All {inv['live_source_tracks']} live tracks have completed or "
@@ -315,6 +320,7 @@ def run_hydrate(
             max_file_ranged_mib=max_file_mib,
             allow_full_download=allow_full_download,
             sheet_identities=sheet_identities,
+            force_rehydrate=force_rehydrate,
             secret_values=config.known_secrets(),
             progress_callback=_on_progress,
         )
