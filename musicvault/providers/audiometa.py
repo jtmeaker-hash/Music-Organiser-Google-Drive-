@@ -1,71 +1,187 @@
 """
-AudioMeta provider client for acoustic features, BPM, and musical key.
+AudioMeta provider client for acoustic features, BPM, and musical key (https://api.audiometa.io/v1).
 """
-from typing import List, Optional
 import urllib.parse
+from typing import Any, Dict, List, Optional, Tuple
+
+from ..core.matcher import camelot_key, match_track, normalize_key_to_camelot, seconds_from_val
 from ..models import Candidate
-from ..core.matcher import match_track, seconds_from_val, camelot_key
-from .base import BaseProvider
+from .base import BaseProvider, ProviderCallOutcome, ProviderStatus
+
+
+def _extract_track_items(payload: Any) -> List[Dict[str, Any]]:
+    """Extract track item dicts across documented AudioMeta payload wrappers."""
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        tracks_node = payload.get("tracks")
+        if isinstance(tracks_node, dict) and isinstance(tracks_node.get("items"), list):
+            return [x for x in tracks_node["items"] if isinstance(x, dict)]
+        if isinstance(tracks_node, list):
+            return [x for x in tracks_node if isinstance(x, dict)]
+        for k in ("items", "results", "data", "hits"):
+            node = payload.get(k)
+            if isinstance(node, list):
+                return [x for x in node if isinstance(x, dict)]
+            if isinstance(node, dict) and isinstance(node.get("items"), list):
+                return [x for x in node["items"] if isinstance(x, dict)]
+    return []
 
 
 class AudioMetaProvider(BaseProvider):
     """Client for AudioMeta API."""
 
-    def __init__(self, api_key: Optional[str] = None, contact: str = "", max_requests: int = 25):
-        super().__init__("AudioMeta", default_delay=0.85, max_requests=max_requests, contact=contact)
-        self.api_key = api_key
+    ALLOWS_OPEN_PERSISTENT_CACHE = False
+    DEFAULT_CACHE_TTL_SECONDS = 86400
 
-    def search(self, artist: str, title: str) -> List[Candidate]:
-        if not self.api_key or not self.can_request():
-            return []
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        contact: str = "",
+        max_requests: int = 25,
+        db: Optional[Any] = None,
+        provider_terms_cleared: bool = False,
+        default_delay: float = 0.85,
+    ):
+        super().__init__(
+            "AudioMeta",
+            default_delay=default_delay,
+            max_requests=max_requests,
+            contact=contact,
+            db=db,
+            provider_terms_cleared=provider_terms_cleared,
+        )
+        self.api_key = (api_key or "").strip() or None
+        self.register_secret(self.api_key)
+
+    def verify_connectivity(self) -> ProviderCallOutcome:
+        """Verify Bearer authentication and endpoint response with a lightweight search probe."""
+        if not self.api_key:
+            return ProviderCallOutcome(provider=self.name, status=ProviderStatus.NOT_CONFIGURED, error="API key not set")
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        outcome = self.request_detailed(
+            "https://api.audiometa.io/v1/search",
+            params={"q": "Act of Rage Living Fast", "type": "track", "limit": 1},
+            headers=headers,
+            use_cache=False,
+        )
+        if outcome.status == ProviderStatus.OK:
+            if not isinstance(outcome.data, (dict, list)):
+                return ProviderCallOutcome(
+                    provider=self.name,
+                    status=ProviderStatus.MALFORMED_JSON,
+                    http_status=outcome.http_status,
+                    error="Unexpected non-object JSON payload",
+                    request_made=True,
+                )
+            items = _extract_track_items(outcome.data)
+            if not items:
+                outcome.status = ProviderStatus.EMPTY
+        return outcome
+
+    def search_detailed(self, artist: str, title: str) -> Tuple[List[Candidate], ProviderCallOutcome]:
+        if not self.api_key:
+            return [], ProviderCallOutcome(provider=self.name, status=ProviderStatus.NOT_CONFIGURED)
 
         headers = {"Authorization": f"Bearer {self.api_key}"}
-        hits = {}
+        hits: Dict[str, Dict[str, Any]] = {}
+        primary_outcome: Optional[ProviderCallOutcome] = None
 
-        # Search by title and artist
-        for q in dict.fromkeys([title, artist]):
+        queries = list(dict.fromkeys(q for q in [f"{artist} {title}".strip(), title, artist] if q.strip()))
+        for q in queries[:2]:
             if not self.can_request():
                 break
-            url = "https://api.audiometa.io/v1/search"
-            params = {"q": q, "type": "track", "limit": 50}
-            data = self.request(url, params=params, headers=headers)
-            if not data:
+            out = self.request_detailed(
+                "https://api.audiometa.io/v1/search",
+                params={"q": q, "type": "track", "limit": 25},
+                headers=headers,
+            )
+            if primary_outcome is None or out.status not in (ProviderStatus.OK, ProviderStatus.EMPTY):
+                primary_outcome = out
+            if out.status != ProviderStatus.OK:
+                if out.status in (
+                    ProviderStatus.AUTH_ERROR,
+                    ProviderStatus.QUOTA_EXCEEDED,
+                    ProviderStatus.RATE_LIMITED,
+                    ProviderStatus.UNSUPPORTED_ENDPOINT,
+                ):
+                    return [], out
                 continue
-            tracks = data.get("tracks", {}).get("items", [])
-            for item in tracks:
-                track_id = item.get("id")
-                if not track_id:
-                    continue
-                artists = [x.get("name", "") if isinstance(x, dict) else str(x) for x in item.get("artists", [])]
-                if match_track(artist, title, item.get("name", ""), artists):
+
+            for item in _extract_track_items(out.data):
+                track_id = str(item.get("id") or item.get("track_id") or "").strip()
+                t_title = str(item.get("name") or item.get("title") or "")
+                artists = [
+                    x.get("name", "") if isinstance(x, dict) else str(x)
+                    for x in (item.get("artists") or [])
+                ]
+                if track_id and match_track(artist, title, t_title, artists):
                     hits[track_id] = item
-
-        candidates = []
-        for track_id in list(hits.keys())[:2]:
-            if not self.can_request():
+            if hits:
                 break
-            detail_url = f"https://api.audiometa.io/v1/tracks/{urllib.parse.quote(track_id, safe='')}"
-            track_data = self.request(detail_url, headers=headers)
-            if not track_data:
-                continue
 
-            artists = [x.get("name", "") if isinstance(x, dict) else str(x) for x in track_data.get("artists", [])]
-            t_name = track_data.get("name", "")
-            features = track_data.get("audio_features") or {}
+        candidates: List[Candidate] = []
+        for track_id, search_item in list(hits.items())[:2]:
+            track_data: Dict[str, Any] = search_item
+            if "audio_features" not in search_item and self.can_request():
+                detail_url = f"https://api.audiometa.io/v1/tracks/{urllib.parse.quote(track_id, safe='')}"
+                det_out = self.request_detailed(detail_url, headers=headers)
+                if det_out.status == ProviderStatus.OK and isinstance(det_out.data, dict):
+                    inner = det_out.data.get("data")
+                    track_data = inner if isinstance(inner, dict) else det_out.data
+
+            artists = [
+                x.get("name", "") if isinstance(x, dict) else str(x)
+                for x in (track_data.get("artists") or search_item.get("artists") or [])
+            ]
+            t_name = str(track_data.get("name") or track_data.get("title") or search_item.get("name") or "")
+            features = track_data.get("audio_features") if isinstance(track_data.get("audio_features"), dict) else {}
 
             if match_track(artist, title, t_name, artists):
-                tempo = features.get("tempo")
-                bpm_val = round(float(tempo), 1) if tempo is not None else None
-                key_val = camelot_key(features.get("key"), features.get("mode"))
-                candidates.append(Candidate(
-                    provider="Audiometa",
-                    title=t_name,
-                    artists=artists,
-                    duration=seconds_from_val(track_data.get("duration_ms")),
-                    isrc=(track_data.get("external_ids") or {}).get("isrc"),
-                    bpm=bpm_val,
-                    key=key_val,
-                    url=track_data.get("href")
-                ))
+                tempo = features.get("tempo") if features.get("tempo") is not None else features.get("bpm")
+                bpm_val: Optional[float] = None
+                if tempo is not None:
+                    try:
+                        bpm_val = round(float(tempo), 1)
+                    except (ValueError, TypeError):
+                        bpm_val = None
 
-        return candidates
+                k_raw = features.get("key")
+                m_raw = features.get("mode")
+                key_val = camelot_key(k_raw, m_raw)
+                if not key_val and k_raw is not None:
+                    mode_str = str(m_raw or "").strip().lower()
+                    combined = f"{k_raw} {mode_str}".strip() if mode_str in ("major", "minor") else str(k_raw)
+                    key_val = normalize_key_to_camelot(combined) or None
+
+                ext_ids = track_data.get("external_ids") if isinstance(track_data.get("external_ids"), dict) else {}
+                isrc_val = track_data.get("isrc") or ext_ids.get("isrc")
+
+                candidates.append(
+                    Candidate(
+                        provider="Audiometa",
+                        title=t_name,
+                        artists=artists,
+                        duration=seconds_from_val(track_data.get("duration_ms") or track_data.get("duration")),
+                        isrc=isrc_val,
+                        bpm=bpm_val,
+                        key=key_val,
+                        url=track_data.get("href") or track_data.get("url"),
+                        source_family="audiometa",
+                    )
+                )
+
+        final_out = primary_outcome or ProviderCallOutcome(provider=self.name, status=ProviderStatus.EMPTY)
+        if final_out.status == ProviderStatus.OK and not candidates:
+            final_out = ProviderCallOutcome(
+                provider=self.name,
+                status=ProviderStatus.EMPTY,
+                http_status=final_out.http_status,
+                from_cache=final_out.from_cache,
+                request_made=final_out.request_made,
+            )
+        return candidates, final_out
+
+    def search(self, artist: str, title: str) -> List[Candidate]:
+        cands, _ = self.search_detailed(artist, title)
+        return cands

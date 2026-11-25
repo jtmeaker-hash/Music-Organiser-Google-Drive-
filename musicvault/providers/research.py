@@ -1,91 +1,164 @@
 """
-Intelligent online metadata research.
-Replaces brittle scraping (Reddit 403 errors) with legitimate open APIs (Wikidata, MusicBrainz, Wikipedia).
+Intelligent open-knowledge-graph metadata research via Wikidata API.
+Validates response schema strictly, restricts hints to musical entities with word-boundary matching,
+and labels all suggestions explicitly as review-only inferred hints (never catalogue verification).
 """
 import logging
-from typing import Dict, List, Any, Optional
-from ..core.genre import ALIASES_PARENT, canonical_genre
-from .base import BaseProvider
+import re
+from typing import Any, Dict, List, Optional
+
+from ..core.genre import SUBGENRE_PARENT
+from .base import BaseProvider, ProviderStatus
 
 logger = logging.getLogger("musicvault.research")
+
+# Explicit word-bounded genre phrase dictionary -> (Canonical Parent Genre, Optional Subgenre)
+_WIKIDATA_GENRE_PHRASES = [
+    ("euphoric hardstyle", ("Hardstyle", "Euphoric")),
+    ("rawstyle", ("Hardstyle", "Rawstyle")),
+    ("xtra raw", ("Hardstyle", "Xtra Raw")),
+    ("reverse bass", ("Hardstyle", "Reverse Bass")),
+    ("hardstyle", ("Hardstyle", "")),
+    ("frenchcore", ("Hardcore", "Frenchcore")),
+    ("uptempo hardcore", ("Hardcore", "Uptempo")),
+    ("happy hardcore", ("Happy Hardcore", "")),
+    ("hardcore techno", ("Hardcore", "")),
+    ("hypertechno", ("Techno", "Hypertechno")),
+    ("hard techno", ("Techno", "Hard Techno")),
+    ("techno", ("Techno", "")),
+    ("liquid funk", ("Drum & Bass", "Liquid")),
+    ("neurofunk", ("Drum & Bass", "Neurofunk")),
+    ("jump up", ("Drum & Bass", "Jump Up")),
+    ("drum and bass", ("Drum & Bass", "")),
+    ("drum & bass", ("Drum & Bass", "")),
+    ("uk garage", ("UK Garage", "")),
+    ("trance", ("Trance", "")),
+    ("dubstep", ("Dubstep", "")),
+    ("hip-hop", ("Hip-Hop", "")),
+    ("hip hop", ("Hip-Hop", "")),
+    ("house music", ("House", "")),
+    ("breakbeat", ("Breakbeat", "")),
+    ("jungle music", ("Jungle", "")),
+]
+
+_MUSIC_CONTEXT_RE = re.compile(
+    r"\b(?:song|single|track|recording|album|ep|remix|anthem|dj|producer|musician|"
+    r"musical|duo|trio|band|group|singer|rapper|composer|electronic|record\s+label)\b",
+    re.IGNORECASE,
+)
 
 
 class ResearchProvider(BaseProvider):
     """
-    Resilient metadata research engine.
-    Uses Wikidata API and Wikipedia knowledge graphs to discover musical genres.
+    Resilient open knowledge-graph research engine (Wikidata CC0).
+    Produces review-only inferred genre hints; never treated as recording verification.
     """
 
-    def __init__(self, contact: str = "", max_requests: int = 15):
-        super().__init__("OnlineResearch", default_delay=1.0, max_requests=max_requests, contact=contact)
+    ALLOWS_OPEN_PERSISTENT_CACHE = True
+    DEFAULT_CACHE_TTL_SECONDS = 7 * 86400
+
+    def __init__(
+        self,
+        contact: str = "",
+        max_requests: int = 15,
+        db: Optional[Any] = None,
+        provider_terms_cleared: bool = False,
+        default_delay: float = 1.0,
+    ):
+        super().__init__(
+            "OnlineResearch",
+            default_delay=default_delay,
+            max_requests=max_requests,
+            contact=contact,
+            db=db,
+            provider_terms_cleared=provider_terms_cleared,
+        )
+
+    @staticmethod
+    def _extract_validated_hints(data: Any, source_label: str) -> tuple[List[Dict[str, str]], List[Dict[str, Any]]]:
+        """Validate Wikidata wbsearchentities schema and extract word-bounded music genre hints."""
+        hits: List[Dict[str, str]] = []
+        hints: List[Dict[str, Any]] = []
+
+        if not isinstance(data, dict):
+            return hits, hints
+        search_items = data.get("search")
+        if not isinstance(search_items, list):
+            return hits, hints
+
+        for item in search_items[:5]:
+            if not isinstance(item, dict):
+                continue
+            q_id = str(item.get("id") or "").strip()
+            label = str(item.get("label") or "").strip()
+            desc = str(item.get("description") or "").strip()
+            if not q_id or not (label or desc):
+                continue
+
+            concept_url = str(item.get("concepturi") or f"https://www.wikidata.org/wiki/{q_id}")
+            hits.append({"source": source_label, "url": concept_url, "title": f"{label}: {desc}"})
+
+            combined = f"{label} {desc}"
+            # Require musical context in entity description/label so non-music entities aren't misread
+            if not _MUSIC_CONTEXT_RE.search(combined):
+                continue
+
+            matched_pairs: List[Dict[str, str]] = []
+            seen_parents = set()
+            for phrase, (parent_g, sub_g) in _WIKIDATA_GENRE_PHRASES:
+                if re.search(r"(?<![A-Za-z0-9])" + re.escape(phrase) + r"(?![A-Za-z0-9])", combined, flags=re.I):
+                    if parent_g not in seen_parents:
+                        seen_parents.add(parent_g)
+                        matched_pairs.append({"parent": parent_g, "subgenre": sub_g})
+
+            if matched_pairs:
+                hints.append(
+                    {
+                        "url": concept_url,
+                        "source": source_label,
+                        "evidence_type": "inferred",
+                        "genre_mappings": matched_pairs,
+                        # Structured list of canonical parent genre strings (safe against string indexing bugs)
+                        "parent_genres": [m["parent"] for m in matched_pairs],
+                    }
+                )
+        return hits, hints
 
     def research_track(self, artist: str, title: str) -> Dict[str, Any]:
-        """
-        Research genre hints for an uncertain track via open Wikidata and Wikipedia APIs.
-        """
-        hints: List[Dict[str, Any]] = []
-        hits: List[Dict[str, str]] = []
-
+        """Query Wikidata entities for track/artist genre hints with strict schema validation."""
         if not self.can_request():
             return {
                 "track": f"{artist} - {title}",
-                "hits": hits,
-                "genre_hints": hints,
-                "status": "BUDGET_REACHED"
+                "hits": [],
+                "genre_hints": [],
+                "status": "BUDGET_REACHED",
             }
 
-        # Query Wikidata entity search
         wiki_url = "https://www.wikidata.org/w/api.php"
         params = {
             "action": "wbsearchentities",
-            "search": f"{artist} {title}",
+            "search": f"{artist} {title}".strip(),
             "language": "en",
             "format": "json",
-            "limit": 5
+            "limit": 5,
         }
 
-        data = self.request(wiki_url, params=params)
-        if data and "search" in data:
-            for item in data["search"]:
-                q_id = item.get("id")
-                label = item.get("label", "")
-                desc = item.get("description", "")
-                concept_url = item.get("concepturi", f"https://www.wikidata.org/wiki/{q_id}")
-                hits.append({"source": "wikidata", "url": concept_url, "title": f"{label}: {desc}"})
+        out = self.request_detailed(wiki_url, params=params)
+        hits, hints = ([], [])
+        if out.status == ProviderStatus.OK:
+            hits, hints = self._extract_validated_hints(out.data, "wikidata_track")
 
-                # Check label and description for genre keywords
-                full_text = f"{label} {desc}".lower()
-                for keyword, canon in ALIASES_PARENT.items():
-                    if keyword in full_text:
-                        hints.append({
-                            "url": concept_url,
-                            "source": "wikidata",
-                            "genres": [(canon, "")]
-                        })
-
-        # Also search artist if no track hits
-        if not hints and self.can_request():
-            params["search"] = artist
-            artist_data = self.request(wiki_url, params=params)
-            if artist_data and "search" in artist_data:
-                for item in artist_data["search"][:2]:
-                    q_id = item.get("id")
-                    label = item.get("label", "")
-                    desc = item.get("description", "")
-                    concept_url = item.get("concepturi", f"https://www.wikidata.org/wiki/{q_id}")
-                    hits.append({"source": "wikidata_artist", "url": concept_url, "title": f"{label}: {desc}"})
-                    full_text = f"{label} {desc}".lower()
-                    for keyword, canon in ALIASES_PARENT.items():
-                        if keyword in full_text:
-                            hints.append({
-                                "url": concept_url,
-                                "source": "wikidata_artist",
-                                "genres": [(canon, "")]
-                            })
+        if not hints and artist.strip() and self.can_request():
+            artist_params = dict(params, search=artist.strip())
+            art_out = self.request_detailed(wiki_url, params=artist_params)
+            if art_out.status == ProviderStatus.OK:
+                a_hits, a_hints = self._extract_validated_hints(art_out.data, "wikidata_artist")
+                hits.extend(a_hits)
+                hints.extend(a_hints)
 
         return {
             "track": f"{artist} - {title}",
             "hits": hits[:8],
             "genre_hints": hints,
-            "status": "REVIEW_ONLY — snippets/titles not independently verified"
+            "status": "REVIEW_ONLY — inferred knowledge-graph hints, not recording verification",
         }

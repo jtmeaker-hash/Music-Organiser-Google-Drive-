@@ -159,9 +159,12 @@ def classify_track_genres(meta: TrackMetadata, candidates: List[Candidate],
 
     for c in candidates:
         v = (c.verification or "").lower()
-        if 'conflict' in v:
+        if 'conflict' in v or 'mismatch' in v:
             continue
         p = c.provider
+        if 'wikidata' in p.lower() or 'inferred' in v:
+            # Knowledge-graph hints are surfaced separately for human review, not weighted as catalogue votes
+            continue
         if p == 'Discogs release':
             cat, w = 'release', 25
         elif 'isrc supported' in v or 'duration supported' in v:
