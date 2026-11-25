@@ -1,110 +1,299 @@
 """
-Google Sheets v4 API client for reading master library index, verifying locks, and safe updates.
+Google Sheets v4 API client for read-only master library index loading, header schema
+verification, duplicate/missing Drive ID detection, and audited write helpers.
 """
 import json
-from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from googleapiclient.discovery import build
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
-from ..core.rules import EXTRA_HEADERS, FIELDS, COL
+from ..core.matcher import norm
+from ..core.rules import COL, EXTRA_HEADERS, FIELDS, parse_lock_states
+
+_VALID_DRIVE_ID_HEADERS = {
+    "id", "fileid", "driveid", "drivefileid", "googledriveid", "googlefileid", "trackid",
+}
+_EXPECTED_FIELD_HEADER_ALIASES = {
+    2: {"genre", "parentgenre", "primarygenre"},
+    3: {"subgenre", "subgenres", "secondarygenre", "style"},
+    4: {"bpm", "tempo"},
+    5: {"key", "camelot", "camelotkey", "musicalkey", "initialkey"},
+}
+_DRIVE_ID_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{10,80}$")
+
+
+@dataclass
+class VerifiedSheetIndex:
+    """Validated read-only snapshot of the Google Sheets 'Tracks' tab."""
+    schema_valid: bool
+    schema_error: str = ""
+    headers: List[str] = field(default_factory=list)
+    unique_rows_by_id: Dict[str, Tuple[int, List[str]]] = field(default_factory=dict)
+    duplicate_ids: Dict[str, List[int]] = field(default_factory=dict)
+    missing_id_rows: List[int] = field(default_factory=list)
+    verified_identities: Dict[str, Tuple[str, str]] = field(default_factory=dict)
+    total_data_rows: int = 0
+    drive_id_col: int = 14
+
+
+def validate_and_index_tracks_sheet(
+    header_row: List[Any], data_rows: List[List[Any]]
+) -> VerifiedSheetIndex:
+    """
+    Validate real Tracks!A1:AA1 headers and index Tracks!A2:AA rows by exact Drive file ID.
+    Detects incompatible headers, missing IDs, and duplicate Drive IDs without guessing rows.
+    """
+    headers = [str(x or "").strip() for x in (header_row or [])]
+    if not any(headers):
+        return VerifiedSheetIndex(
+            schema_valid=False,
+            schema_error="INCOMPATIBLE_HEADERS: Tracks!A1:AA1 header row is empty or missing",
+            headers=headers,
+        )
+
+    padded_headers = headers + [""] * max(0, 27 - len(headers))
+
+    # 1. Verify Drive File ID column at index 14 (Col O) vs all columns A:P
+    explicit_id_cols = [
+        idx for idx, h in enumerate(padded_headers[:16])
+        if norm(h) in ("driveid", "fileid", "drivefileid", "googledriveid")
+    ]
+    if explicit_id_cols and 14 not in explicit_id_cols:
+        return VerifiedSheetIndex(
+            schema_valid=False,
+            schema_error=f"INCOMPATIBLE_HEADERS: Drive ID header found at column index {explicit_id_cols[0]}, expected index 14 (Col O)",
+            headers=headers,
+        )
+
+    col_o_norm = norm(padded_headers[14])
+    if col_o_norm and col_o_norm not in _VALID_DRIVE_ID_HEADERS:
+        return VerifiedSheetIndex(
+            schema_valid=False,
+            schema_error=f"INCOMPATIBLE_HEADERS: Column O (index 14) header is '{padded_headers[14]}', expected Drive ID",
+            headers=headers,
+        )
+    if not col_o_norm:
+        # Legacy blank O1 header allowed ONLY if populated O2:O cells look like Drive file IDs
+        sample_o = [str(r[14]).strip() for r in data_rows if len(r) > 14 and str(r[14] or "").strip()][:10]
+        if sample_o and not all(_DRIVE_ID_TOKEN_RE.match(v) for v in sample_o):
+            return VerifiedSheetIndex(
+                schema_valid=False,
+                schema_error="INCOMPATIBLE_HEADERS: Column O header is blank and values do not match Drive file ID format",
+                headers=headers,
+            )
+
+    # 2. Verify core metadata headers C1:F1 (indices 2..5) when non-empty
+    for col_idx, allowed in _EXPECTED_FIELD_HEADER_ALIASES.items():
+        h_norm = norm(padded_headers[col_idx])
+        if h_norm and h_norm not in allowed:
+            return VerifiedSheetIndex(
+                schema_valid=False,
+                schema_error=f"INCOMPATIBLE_HEADERS: Column index {col_idx} header '{padded_headers[col_idx]}' conflicts with expected schema",
+                headers=headers,
+            )
+
+    # 3. Verify review columns Q1:AA1 (indices 16..26) are empty or match EXTRA_HEADERS
+    for offset, expected_h in enumerate(EXTRA_HEADERS):
+        actual_h = padded_headers[16 + offset]
+        if actual_h and actual_h != expected_h:
+            return VerifiedSheetIndex(
+                schema_valid=False,
+                schema_error=f"INCOMPATIBLE_REVIEW_HEADERS: Column index {16 + offset} has '{actual_h}', expected '{expected_h}'",
+                headers=headers,
+            )
+
+    # 4. Detect optional explicitly labeled Artist and Title columns in A1:P1
+    artist_col: Optional[int] = None
+    title_col: Optional[int] = None
+    for idx in range(16):
+        if idx in (2, 3, 4, 5, 14):
+            continue
+        hn = norm(padded_headers[idx])
+        if hn in ("artist", "artists", "primaryartist") and artist_col is None:
+            artist_col = idx
+        elif hn in ("title", "tracktitle", "songtitle") and title_col is None:
+            title_col = idx
+
+    # 5. Index rows starting at real sheet row 2 (never using fake row 999)
+    seen_rows: Dict[str, List[Tuple[int, List[str]]]] = {}
+    missing_id_rows: List[int] = []
+
+    for offset, raw_r in enumerate(data_rows):
+        row_num = offset + 2
+        str_row = [str(cell) if cell is not None else "" for cell in raw_r]
+        if not any(c.strip() for c in str_row):
+            continue
+        fid = str_row[14].strip() if len(str_row) > 14 else ""
+        if not fid:
+            missing_id_rows.append(row_num)
+            continue
+        padded_r = (str_row + [""] * max(0, 27 - len(str_row)))[:27]
+        seen_rows.setdefault(fid, []).append((row_num, padded_r))
+
+    unique_by_id: Dict[str, Tuple[int, List[str]]] = {}
+    duplicate_ids: Dict[str, List[int]] = {}
+    verified_identities: Dict[str, Tuple[str, str]] = {}
+
+    for fid, entries in seen_rows.items():
+        if len(entries) > 1:
+            duplicate_ids[fid] = [r_num for r_num, _ in entries]
+        else:
+            r_num, r_vals = entries[0]
+            unique_by_id[fid] = (r_num, r_vals)
+            if artist_col is not None and title_col is not None:
+                s_art = r_vals[artist_col].strip()
+                s_tit = r_vals[title_col].strip()
+                if s_art and s_tit:
+                    verified_identities[fid] = (s_art, s_tit)
+
+    return VerifiedSheetIndex(
+        schema_valid=True,
+        headers=headers,
+        unique_rows_by_id=unique_by_id,
+        duplicate_ids=duplicate_ids,
+        missing_id_rows=missing_id_rows,
+        verified_identities=verified_identities,
+        total_data_rows=len(data_rows),
+    )
 
 
 class SheetsService:
     """Wrapper around Google Sheets v4 API."""
 
     def __init__(self, credentials: Credentials):
-        self.service = build('sheets', 'v4', credentials=credentials)
+        self.service = build("sheets", "v4", credentials=credentials)
 
-    def fetch_master_rows(self, spreadsheet_id: str, range_name: str = "Tracks!A2:AA") -> List[List[Any]]:
-        """Fetch all track rows from master spreadsheet."""
+    def fetch_header_row(self, spreadsheet_id: str, range_name: str = "Tracks!A1:AA1") -> List[Any]:
+        """Fetch header row A1:AA1 from master spreadsheet (read-only)."""
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=range_name
+            range=range_name,
         ).execute()
-        return resp.get('values', [])
+        vals = resp.get("values", [[]])
+        return vals[0] if vals else []
+
+    def fetch_master_rows(self, spreadsheet_id: str, range_name: str = "Tracks!A2:AA") -> List[List[Any]]:
+        """Fetch all track data rows from master spreadsheet (read-only)."""
+        resp = self.service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+        ).execute()
+        return resp.get("values", [])
+
+    def load_verified_index(self, spreadsheet_id: str) -> VerifiedSheetIndex:
+        """Fetch headers + rows (read-only) and validate schema, duplicate IDs, and missing IDs."""
+        header_row = self.fetch_header_row(spreadsheet_id)
+        data_rows = self.fetch_master_rows(spreadsheet_id)
+        return validate_and_index_tracks_sheet(header_row, data_rows)
 
     def fetch_row(self, spreadsheet_id: str, row_num: int) -> List[Any]:
         """Fetch a single row (columns A:AA)."""
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range=f"Tracks!A{row_num}:AA{row_num}"
+            range=f"Tracks!A{row_num}:AA{row_num}",
         ).execute()
-        vals = resp.get('values', [[]])
+        vals = resp.get("values", [[]])
         return vals[0] if vals else []
 
     def verify_headers(self, spreadsheet_id: str) -> bool:
         """Verify that review headers in Q1:AA1 are empty or match expected schema."""
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
-            range="Tracks!Q1:AA1"
+            range="Tracks!Q1:AA1",
         ).execute()
-        header = resp.get('values', [[]])[0]
-        header = header + [''] * (len(EXTRA_HEADERS) - len(header))
+        header = resp.get("values", [[]])[0]
+        header = header + [""] * (len(EXTRA_HEADERS) - len(header))
         return not any(v and v != expected for v, expected in zip(header, EXTRA_HEADERS))
 
-    def create_pre_write_backup(self, spreadsheet_id: str, rows_to_backup: List[Tuple[int, List[Any]]],
-                                backup_dir: Path) -> Path:
-        """Create a local JSON backup of original rows before any update."""
+    def create_pre_write_backup(
+        self,
+        spreadsheet_id: str,
+        rows_to_backup: List[Tuple[int, List[Any]]],
+        backup_dir: Path,
+    ) -> Path:
+        """Create a local JSON backup of original rows before any future approved update."""
         backup_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
         backup_path = backup_dir / f"music_vault_backup_{timestamp}.json"
         data = {
-            'spreadsheet_id': spreadsheet_id,
-            'created_utc': datetime.now(timezone.utc).isoformat(),
-            'rows': [{'row': r_num, 'values': vals} for r_num, vals in rows_to_backup]
+            "spreadsheet_id": spreadsheet_id,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "rows": [{"row": r_num, "values": vals} for r_num, vals in rows_to_backup],
         }
-        with backup_path.open('w', encoding='utf-8') as f:
+        with backup_path.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         return backup_path
 
-    def apply_batch_updates(self, spreadsheet_id: str, updates: List[Tuple[int, List[Any], List[Any]]]) -> int:
+    def apply_batch_updates(
+        self,
+        spreadsheet_id: str,
+        updates: List[Tuple[int, List[Any], List[Any]]],
+        allow_live_writes: bool = False,
+    ) -> int:
         """
-        Execute safe batch updates:
-        1. Checks headers
-        2. Detects concurrent edits
-        3. Writes empty field cells and review columns Q:AA
+        Future audited batch writer (DISABLED in Music Vault v2.0.1 read-only corrective build).
+
+        Residual Google Sheets v4 limitation documented for future write reviews:
+        - Pre-write row re-fetch followed by `values.batchUpdate` is NOT atomic across concurrent
+          spreadsheet editors (a narrow TOCTOU window exists).
+        - Fails closed if `allow_live_writes` is False, headers mismatch, lock JSON is malformed,
+          a locked field is touched, or concurrent edits occurred.
         """
+        if not allow_live_writes:
+            raise RuntimeError(
+                "Live Google Sheets writes are disabled in Music Vault v2.0.1 (read-only corrective build)."
+            )
+
         if not self.verify_headers(spreadsheet_id):
             raise RuntimeError("Headers in Q1:AA1 do not match expected review schema.")
 
-        # Re-verify rows immediately before writing to catch concurrent edits
         for row_num, old_vals, _ in updates:
+            _, old_lock_err = parse_lock_states(old_vals)
+            if old_lock_err:
+                raise RuntimeError(f"Malformed lock JSON at row {row_num}; refusing write (fail-closed).")
             current = self.fetch_row(spreadsheet_id, row_num)
-            curr_padded = (list(current) + [''] * 27)[:27]
-            old_padded = (list(old_vals) + [''] * 27)[:27]
+            curr_states, curr_lock_err = parse_lock_states(current)
+            if curr_lock_err:
+                raise RuntimeError(f"Malformed current lock JSON at row {row_num}; refusing write (fail-closed).")
+            curr_padded = [str(x) if x is not None else "" for x in (list(current) + [""] * 27)[:27]]
+            old_padded = [str(x) if x is not None else "" for x in (list(old_vals) + [""] * 27)[:27]]
             if curr_padded != old_padded:
                 raise RuntimeError(f"Concurrent sheet edit detected at row {row_num}; aborting write.")
 
-        requests_to_send = [
-            {'range': 'Tracks!Q1:AA1', 'values': [EXTRA_HEADERS]}
-        ]
-
-        col_letters = {2: 'C', 3: 'D', 4: 'E', 5: 'F'}
+        requests_to_send = [{"range": "Tracks!Q1:AA1", "values": [EXTRA_HEADERS]}]
+        col_letters = {2: "C", 3: "D", 4: "E", 5: "F"}
 
         for row_num, old_vals, new_vals in updates:
-            # Write individual newly resolved fields without touching existing values
-            for field in FIELDS:
-                col_idx = COL[field]
-                has_old = len(old_vals) > col_idx and bool(old_vals[col_idx])
-                has_new = len(new_vals) > col_idx and bool(new_vals[col_idx])
-                if not has_old and has_new:
+            old_padded = [str(x) if x is not None else "" for x in (list(old_vals) + [""] * 27)[:27]]
+            new_padded = [str(x) if x is not None else "" for x in (list(new_vals) + [""] * 27)[:27]]
+            states, _ = parse_lock_states(old_padded)
+
+            for field_name in FIELDS:
+                col_idx = COL[field_name]
+                f_state = states.get(field_name, {}).get("state", "")
+                if f_state in ("HIGH_LOCKED", "USER_LOCKED"):
+                    continue
+                if not old_padded[col_idx] and new_padded[col_idx]:
                     col_letter = col_letters[col_idx]
-                    requests_to_send.append({
-                        'range': f"Tracks!{col_letter}{row_num}",
-                        'values': [[new_vals[col_idx]]]
-                    })
-            # Write review metadata columns Q:AA (indices 16 to 26)
-            requests_to_send.append({
-                'range': f"Tracks!Q{row_num}:AA{row_num}",
-                'values': [new_vals[16:27]]
-            })
+                    requests_to_send.append(
+                        {"range": f"Tracks!{col_letter}{row_num}", "values": [[new_padded[col_idx]]]}
+                    )
+
+            # Write non-empty review cells individually or preserve existing Q:AA values rather than clearing
+            merged_review = [
+                new_padded[i] if new_padded[i] != "" else old_padded[i]
+                for i in range(16, 27)
+            ]
+            requests_to_send.append({"range": f"Tracks!Q{row_num}:AA{row_num}", "values": [merged_review]})
 
         if requests_to_send:
             self.service.spreadsheets().values().batchUpdate(
                 spreadsheetId=spreadsheet_id,
-                body={'valueInputOption': 'RAW', 'data': requests_to_send}
+                body={"valueInputOption": "RAW", "data": requests_to_send},
             ).execute()
 
         return len(requests_to_send)
