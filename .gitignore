@@ -8,34 +8,72 @@ dist/
 build/
 *.egg-info/
 
-# Environments & secrets
-.env
-*.env
-*.env.local
+# Virtual environments
 .venv/
 venv/
 ENV/
 env/
 
-# Google OAuth tokens & secrets
-token.json
-client_secrets.json
-credentials.json
-oauth_*.json
+# Environments & secrets (keep placeholder template tracked)
+.env
+.env.*
+*.env
+*.env.local
+!.env.example
 
-# SQLite Databases & logs
+# Google OAuth & API credentials / tokens
+token.json
+*token*.json
+client_secrets.json
+client_secret*.json
+credentials.json
+*credentials*.json
+oauth_*.json
+.git-credentials
+
+# SQLite Databases, WAL/SHM & Backups
 *.db
+*.db-*
+*.db.*
 *.sqlite
 *.sqlite3
-*.log
+*.sqlite*
+*.bak
+*.backup
+*.backup.*
 
-# Backups & Rollback manifests
+# Logs & Diagnostics
+*.log
+logs/
+
+# Backups, Checkpoints & Generated Reports
 backups/
 manifests/
+reports/
 *_backup.json
 *_rollback.json
+*_report.csv
+*_report.json
+*_preview.csv
+*_preview.json
 checkpoint.json
 v*_local_checkpoint.json
+
+# Temporary audio / media artifacts
+tmp_media/
+*.tmp
+*.mp3
+*.wav
+*.flac
+*.aiff
+*.aif
+*.m4a
+*.ogg
+*.opus
+*.aac
+
+# Accidental nested repository checkout
+/Music-Organiser-Google-Drive-/
 
 # Test & coverage caches
 .pytest_cache/
