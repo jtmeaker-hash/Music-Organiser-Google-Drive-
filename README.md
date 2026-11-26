@@ -3,5 +3,9 @@
 A personal DJ library management and metadata
 verification tool using Google Colab.
 
-BPM and musical key metadata provided by
-[GetSongBPM](https://getsongbpm.com/).
+
+Data Sources & Acknowledgements
+
+MusicVault uses external music metadata providers to improve track identification, BPM detection and musical key classification.
+
+- "GetSongBPM" (https://getsongbpm.com/) — BPM and musical key metadata provider.
