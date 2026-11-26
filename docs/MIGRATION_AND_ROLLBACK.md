@@ -1,4 +1,4 @@
-# Database Migration, Inventory Reconciliation & Rollback Guide (v2.0.0 → v2.0.1)
+# Database Migration, Inventory Reconciliation, Research Recovery & Rollback Guide (v2.0.0 → v2.0.2)
 
 ## 1. Overview & Non-Destructive Guarantees
 
@@ -36,7 +36,34 @@ In `v2.0.0`:
 
 ---
 
-## 3. Manual Pre-Upgrade Backup Command
+## 3. Selective Research Recovery (`v2.0.2`)
+
+In `v2.0.1`, tracks queried while one or more providers were rate-limited or at per-run `BUDGET_EXHAUSTED` could be marked `no_match`, `partial`, or `success` (or exhaust `research_attempts = 3`) if another provider returned `empty` or partial evidence.
+
+`v2.0.2` adds additive operational columns (`research_incomplete`, `research_deferrals`, `candidates.updated_utc`) and `provider_operational_state` idempotently without rebuilding tables, plus `musicvault recover-research`:
+
+1. **Create a fresh verified backup first**:
+   ```bash
+   musicvault backup --label pre_v202_recovery
+   ```
+2. **Run dry-run recovery preview (default — zero DB mutations)** and inspect exported counts/reasons:
+   ```bash
+   musicvault recover-research --export-json recovery_preview.json --export-csv recovery_preview.csv
+   ```
+   - **Recoverable records**: live, non-quarantined, current-content tracks with demonstrable `rate_limited`, `cooldown_deferred`, `budget_exhausted`, `server_error`, `timeout`, or `network_error` entries in `provider_calls_json`.
+   - **Ambiguous records (reported separately, never reset)**: legacy `{}` audits, `v2.0.1` `filename_ambiguous` `no_match` records lacking swapped-orientation audit metadata, hard-blocked `auth_error`/`quota_exceeded` records, and newly configured providers.
+   - **Excluded records (never altered)**: quarantined (`quarantined=1`), non-live, stale, and `permanent_unsupported` records.
+3. **Apply selective recovery transactionally (only after reviewing the dry-run report)**:
+   ```bash
+   musicvault recover-research --apply --backup-file ~/.config/musicvault/musicvault.db.pre_v202_recovery_<TIMESTAMP>.sqlite
+   # Or create+verify a fresh backup inline right before the transaction:
+   musicvault recover-research --apply --create-backup
+   ```
+   All existing `candidates` and `hydration_*` fields are preserved, active provider cooldowns are respected, and running `--apply` again is a no-op (`0` rows modified).
+
+---
+
+## 4. Manual Pre-Upgrade Backup Command
 
 Before switching branches or running migrations on a live device, create an explicit verified backup while Music Vault is stopped:
 
