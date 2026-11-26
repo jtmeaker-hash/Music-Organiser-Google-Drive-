@@ -111,6 +111,7 @@ def hydrate_live_inventory(
     force_rehydrate: bool = False,
     secret_values: Optional[List[str]] = None,
     progress_callback: Optional[Callable[[int, int, Track, str, int], None]] = None,
+    selected_tracks: Optional[List[Track]] = None,
 ) -> HydrationSummary:
     """
     Hydrate up to `limit` live pending/incomplete tracks within `max_mib` byte budget.
@@ -125,25 +126,27 @@ def hydrate_live_inventory(
     secrets = secret_values or []
     use_sheet_flag = bool(sheet_identities)
 
-    # Count total live candidates genuinely needing hydration, then select up to `limit`
-    inv_stats = db.get_inventory_summary()
-    summary.eligible_pending = (
-        inv_stats["live_source_tracks"]
-        if force_rehydrate
-        else inv_stats.get("eligible_for_hydration", 0)
-    )
-
-    queue = db.get_live_tracks_for_hydration(
-        limit=max(1, int(limit)),
-        force_rehydrate=force_rehydrate,
-        use_sheet_uninspected=use_sheet_flag,
-    )
+    if selected_tracks is None:
+        inv_stats = db.get_inventory_summary()
+        summary.eligible_pending = (
+            inv_stats["live_source_tracks"]
+            if force_rehydrate
+            else inv_stats.get("eligible_for_hydration", 0)
+        )
+        queue = db.get_live_tracks_for_hydration(
+            limit=max(1, int(limit)),
+            force_rehydrate=force_rehydrate,
+            use_sheet_uninspected=use_sheet_flag,
+        )
+    else:
+        queue = selected_tracks
+        summary.eligible_pending = len(queue)
     if not queue:
         return summary
 
     try:
         for idx, track in enumerate(queue, 1):
-            if not track.is_live_source or track.quarantined:
+            if track.quarantined or (selected_tracks is None and not track.is_live_source):
                 continue
 
             ver = track.metadata.version or track.md5 or track.modified_time or ""

@@ -1,5 +1,5 @@
 """
-Command implementations for Music Vault Manager v2.0.2 (Read-Only Research Reliability Hotfix).
+Command implementations for Music Vault Manager v2.0.3 (Read-only library processing).
 Implements local status diagnostics, verified DB backups, transactional inventory scanning,
 bandwidth-bounded audio hydration, resumable online research, selective dry-run-first recovery,
 real read-only Sheets/Drive preview, and isolated offline benchmarks.
@@ -13,6 +13,7 @@ from .. import __version__
 from ..auth import GoogleAuthManager
 from ..config import Config
 from ..core.hydrator import hydrate_live_inventory
+from ..core.inventory import scan_root
 from ..core.organizer import evaluate_live_preview
 from ..core.researcher import execute_research_batch
 from ..db import Database, DatabaseMigrationError
@@ -55,7 +56,7 @@ def run_status(
 
     report: Dict[str, Any] = {
         "version": __version__,
-        "build_mode": "v2.0.2_read_only_research_hotfix",
+        "build_mode": f"v{__version__}_read_only",
         "environment": {
             "runtime": env_info.runtime,
             "distro": env_info.distro_name,
@@ -103,6 +104,12 @@ def run_status(
         print(f"  Migration bak:  {inv['last_migration_backup']}")
     print(f"  Total records:  {inv['total_records']}")
     print(f"    Live source:  {inv['live_source_tracks']} (ready artist+title: {inv['live_ready_identity']}, missing: {inv['live_missing_identity']})")
+    if inv.get("destination_tracks", 0) or inv.get("overlapping_root_tracks", 0):
+        print(
+            f"    Vault dest:   {inv.get('destination_tracks', 0)} | "
+            f"Unique union: {inv.get('unique_library_tracks', 0)} | "
+            f"Overlaps: {inv.get('overlapping_root_tracks', 0)}"
+        )
     print(f"    Quarantined:  {inv['quarantined_records']} (checkpoint-only: {inv['checkpoint_only_records']})")
     print(f"    Stale files:  {inv['stale_live_tracks']} | Unresolved conflicts: {inv['unresolved_conflicts']}")
     print(f"  Hydration:      {inv['hydration_status_counts'] or {'none': 0}}")
@@ -135,6 +142,9 @@ def run_status(
             "schema_version": inv["schema_version"],
             "total_records": inv["total_records"],
             "live_source_tracks": inv["live_source_tracks"],
+            "destination_tracks": inv.get("destination_tracks", 0),
+            "unique_library_tracks": inv.get("unique_library_tracks", 0),
+            "overlapping_root_tracks": inv.get("overlapping_root_tracks", 0),
             "quarantined_records": inv["quarantined_records"],
             "live_ready_identity": inv["live_ready_identity"],
             "live_missing_identity": inv["live_missing_identity"],
@@ -188,47 +198,15 @@ def run_scan(
     src_disp = short_file_id(source_id, verbose=verbose)
     print(f"\nStarting read-only Drive inventory scan on source folder ({src_disp})...")
 
-    scan_id = db.begin_scan_run(source_id)
-    seen = 0
-    counts: Dict[str, int] = {}
-    started = time.monotonic()
-
-    with termux_wake_lock() as wl_ok:
-        if detect_environment().wake_lock_detected and not wl_ok:
-            print("  [i] Note: host wake-lock not acquired inside PRoot; run 'termux-wake-lock' in native Termux for long batches.")
-        try:
-            for item in drive.scan_inventory(source_id):
-                outcome = db.reconcile_scanned_file(scan_id, source_id, item)
-                counts[outcome] = counts.get(outcome, 0) + 1
-                if outcome != "skipped_blank_id" and outcome != "duplicate_in_scan":
-                    seen += 1
-                if seen > 0 and seen % 50 == 0:
-                    elapsed = time.monotonic() - started
-                    print(f"  [scan] {seen} files reconciled ({elapsed:.1f}s elapsed)...")
-
-            finalized = db.complete_scan_run(scan_id, source_id, seen)
-            elapsed = time.monotonic() - started
-            print(
-                f"[✓] Inventory scan #{scan_id} completed in {elapsed:.1f}s: "
-                f"{finalized['live_source_tracks']} live source tracks | "
-                f"{finalized['quarantined_tracks']} quarantined checkpoint-only | "
-                f"outcomes={counts}"
-            )
-        except KeyboardInterrupt:
-            db.abort_scan_run(scan_id, seen_count=seen, reason="Interrupted by user (Ctrl+C)", interrupted=True)
-            print(
-                f"\n[!] Scan #{scan_id} interrupted after {seen} files. "
-                "Per-file checkpoints saved; unseen tracks were NOT marked absent."
-            )
-            return {"status": "interrupted", "seen": seen}
-        except Exception as exc:
-            err_clean = config.redact(exc)
-            db.abort_scan_run(scan_id, seen_count=seen, reason=err_clean, interrupted=False)
-            print(f"\n[✗] Scan #{scan_id} failed after {seen} files: {err_clean}")
-            print("    Unseen tracks were NOT marked absent.")
-            return {"status": "failed", "seen": seen, "error": err_clean}
-
-    result: Dict[str, Any] = {"status": "completed", "seen": seen, **finalized, "outcomes": counts}
+    with termux_wake_lock():
+        result = scan_root(db, drive, source_id, "source", config.redact)
+    if result["status"] != "completed":
+        print(f"[!] Source scan {result['status']}: {result['error']}")
+        return result
+    inventory = db.get_inventory_summary()
+    result["live_source_tracks"] = inventory["live_source_tracks"]
+    result["quarantined_tracks"] = inventory["quarantined_records"]
+    print(f"[✓] Source inventory completed: {result['seen']} distinct files")
     if hydrate_after:
         print(
             f"\n[--hydrate] Running bounded post-scan hydration "

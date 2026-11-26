@@ -119,13 +119,6 @@ def build_move_plan(
     eligible = bool(parts) and row_num is not None
     provisional = eligible and (confidence == "PROVISIONAL_REVIEW")
 
-    if dry_run or read_only_build:
-        authorized = False
-        executable = False
-    else:
-        authorized = eligible and (not provisional or allow_provisional)
-        executable = authorized
-
     return MovePlanItem(
         row_num=row_num,
         file_id=file_id,
@@ -135,9 +128,9 @@ def build_move_plan(
         reason=reason,
         routing_confidence=RoutingConfidence(confidence),
         eligible=eligible,
-        move_authorized=authorized,
+        move_authorized=False,
         provisional=provisional,
-        executable=executable,
+        executable=False,
         existing_genre=str(sheet_row[2]).strip() if len(sheet_row) > 2 else "",
     )
 
@@ -283,6 +276,12 @@ def evaluate_live_preview(
         if source_vault_invalid:
             summary.rows.append(
                 _make_hold_row(None, empty_existing, {}, "INVALID_SOURCE_VAULT_SEPARATION")
+            )
+            continue
+
+        if getattr(t, "location_ambiguous", False):
+            summary.rows.append(
+                _make_hold_row(None, empty_existing, {}, "AMBIGUOUS_OVERLAPPING_ROOT_MEMBERSHIP")
             )
             continue
 

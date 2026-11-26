@@ -1,7 +1,7 @@
 """
-Responsive Interactive Terminal Interface for Music Vault Manager v2.0.2.
+Responsive Interactive Terminal Interface for Music Vault Manager v2.0.3.
 Preserves options 1-6 workflow slots, adds bounded Hydrate, Local Status, Backup, and Recovery Preview,
-and enforces read-only cloud safety (no live Drive moves or Sheet writes in v2.0.2).
+and enforces read-only cloud safety (no live Drive moves or Sheet writes in v2.0.3).
 """
 from .. import __version__
 from ..config import Config
@@ -38,7 +38,8 @@ def main_menu(config: Config, db: Database) -> None:
             print("=" * width)
             print(f"  Env:       {env_info.short_label()}")
             print(
-                f"  Inventory: {inv['live_source_tracks']} live | "
+                f"  Inventory: {inv['live_source_tracks']} source | "
+                f"{inv.get('destination_tracks', 0)} vault | "
                 f"{inv['live_ready_identity']} ready | "
                 f"{inv['quarantined_records']} quarantined"
             )

@@ -1,9 +1,20 @@
-# Music Vault Manager (`v2.0.2` — Read-Only Research Reliability Hotfix)
+# Music Vault Manager (`v2.0.3` — Full-Library Inventory & Resumable Read-Only Processing)
+
+## MusicVault 2.0.3
+
+MusicVault inventories the configured source and destination vault by exact Drive file ID, with folder-level resume checkpoints and atomic per-root publication. Unified processing (`musicvault process`) resumes bounded hydration, field-aware research with SonoVault quota protection, reconciliation, and local coverage/Sheets/routing previews. Destination files are eligible for research without becoming move-eligible. All Google Drive and Google Sheets mutations remain unconditionally blocked at the service request boundary.
+
+- Use `musicvault process --scope all --inventory-only --dry-run` to preview inventory.
+- Use `musicvault process --scope all` for unified processing and add `--resume` to continue a paused or interrupted run.
+- On an existing database, verify shutdown and run `musicvault migrate --confirm-stopped` before processing.
+
+[Debian PRoot upgrade, provider settings, and rollback](docs/V203_TERMUX.md) · [Changelog](CHANGELOG.md)
+
 
 A modular Python CLI and terminal application for **Android (Termux & Debian/Ubuntu PRoot)** and Linux to inventory, hydrate audio tags, research recording metadata, and preview parent-genre organisation for DJ libraries stored on **Google Drive** and indexed in **Google Sheets**.
 
-> **Safety Notice (`v2.0.2` Read-Only Corrective Build):**
-> `v2.0.2` remains strictly **read-only against Google Drive and Google Sheets**. It never moves Drive files, creates Drive folders, renames files, modifies/transcodes audio, edits embedded tags, or writes to Google Sheets. `preview` forces `DRY_RUN=True`, `move_authorized=False`, and `executable=False` unconditionally regardless of `.env` flags.
+> **Safety Notice (`v2.0.3` Read-Only Build):**
+> `v2.0.3` enforces **unconditional read-only protection against Google Drive and Google Sheets** (`GET`/`HEAD` only at the Google API request builder boundary). It never moves Drive files, creates Drive folders, renames files, modifies/transcodes audio, edits embedded tags, or writes to Google Sheets. Previews force `DRY_RUN=True`, `move_authorized=False`, and `executable=False` unconditionally regardless of `.env` flags.
 
 ---
 

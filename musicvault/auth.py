@@ -32,7 +32,7 @@ class GoogleAuthManager:
         self.token_file = config.token_path
         self.client_secrets_file = config.client_secrets_path
 
-    def get_credentials(self, allow_interactive: bool = True) -> Optional[Credentials]:
+    def get_credentials(self, allow_interactive: bool = True, persist_refresh: bool = True) -> Optional[Credentials]:
         """
         Retrieve valid Google credentials, reusing or refreshing existing token.json first.
         Never deletes or overwrites token.json or client_secrets.json on transient errors.
@@ -52,7 +52,8 @@ class GoogleAuthManager:
         if creds and creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
-                self._save_token(creds)
+                if persist_refresh:
+                    self._save_token(creds)
                 return creds
             except RefreshError as ref_exc:
                 msg = redact_secrets(ref_exc, self.config.known_secrets())

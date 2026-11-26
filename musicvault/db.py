@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import stat
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -14,7 +15,7 @@ from .core.matcher import extract_version_tokens, norm, parse_artists
 from .models import Candidate, Track, TrackMetadata
 from .providers.base import canonical_provider_family
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _AUDIO_EXTENSIONS = (
     ".mp3", ".wav", ".flac", ".aiff", ".aif",
@@ -149,11 +150,12 @@ def _candidate_edition_identity(
 class Database:
     """Manages persistent SQLite operations, verified migrations, caching, and checkpoints."""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, initialize: bool = True):
         self.db_path = Path(db_path)
         self.last_backup_path: Optional[Path] = None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_or_migrate()
+        if initialize:
+            self._init_or_migrate()
 
     def _get_connection(self, isolation_level: Optional[str] = "") -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0, isolation_level=isolation_level)
@@ -314,13 +316,110 @@ class Database:
                 return 1
             return 0
 
+    def _ensure_v3_tables(self, conn: sqlite3.Connection) -> None:
+        for statement in (
+            """CREATE TABLE IF NOT EXISTS root_membership (
+                role TEXT NOT NULL, root_id TEXT NOT NULL, file_id TEXT NOT NULL,
+                parent_id TEXT NOT NULL, path_json TEXT NOT NULL, scan_id INTEGER NOT NULL,
+                ambiguous INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (role, root_id, file_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS root_membership_file
+               ON root_membership(file_id, role, root_id)""",
+            """CREATE TABLE IF NOT EXISTS root_observation (
+                scan_id INTEGER NOT NULL, file_id TEXT NOT NULL, item_json TEXT NOT NULL,
+                ambiguous INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (scan_id, file_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS process_runs (
+                id INTEGER PRIMARY KEY, selection TEXT NOT NULL, phase TEXT NOT NULL,
+                state_json TEXT NOT NULL, updated_utc TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS process_work (
+                run_id INTEGER NOT NULL, file_id TEXT NOT NULL, version TEXT NOT NULL,
+                hydrated INTEGER NOT NULL DEFAULT 0, researched INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (run_id, file_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS enrichment_work (
+                file_id TEXT NOT NULL, version TEXT NOT NULL, provider TEXT NOT NULL,
+                query_key TEXT NOT NULL, reason TEXT NOT NULL, due_utc TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(file_id, version, provider, query_key)
+            )""",
+            """CREATE TABLE IF NOT EXISTS scan_folders (
+                scan_id INTEGER NOT NULL,
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                folder_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                visited INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(scan_id, folder_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS scan_folders_pending
+               ON scan_folders(scan_id, visited, sequence)""",
+            """CREATE TABLE IF NOT EXISTS provider_metrics (
+                provider TEXT NOT NULL, metric TEXT NOT NULL, value REAL NOT NULL,
+                PRIMARY KEY(provider, metric)
+            )""",
+            """CREATE TABLE IF NOT EXISTS provider_breakers (
+                provider TEXT PRIMARY KEY, history TEXT NOT NULL, streak INTEGER NOT NULL,
+                level INTEGER NOT NULL, until_utc TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS provider_server_deadlines (
+                provider TEXT PRIMARY KEY, until_utc TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS scheduler_state (
+                name TEXT PRIMARY KEY, value INTEGER NOT NULL
+            )""",
+        ):
+            conn.execute(statement)
+        ew_cols = {r["name"] for r in conn.execute("PRAGMA table_info(enrichment_work)").fetchall()}
+        if ew_cols and "attempts" not in ew_cols:
+            conn.execute("ALTER TABLE enrichment_work ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+
+    def _seed_source_membership(self, conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            INSERT OR IGNORE INTO root_membership
+                (role, root_id, file_id, parent_id, path_json, scan_id)
+            SELECT 'source', configured_source_id, file_id,
+                COALESCE(NULLIF(observed_parent_id, ''), parent_id, ''), '[]', scan_generation
+            FROM tracks WHERE is_live_source = 1 AND quarantined = 0
+                AND COALESCE(configured_source_id, '') != ''
+        """)
+
+    def _migrate_v2_to_v3(self) -> None:
+        conn = self._get_connection(isolation_level=None)
+        try:
+            # A separate reader can take the online backup while this connection
+            # holds the reserved writer lock, including when WAL is active.
+            conn.execute("PRAGMA busy_timeout = 0")
+            conn.execute("BEGIN IMMEDIATE")
+            backup = self.create_verified_backup("pre_v203_migration")
+            self._ensure_auxiliary_tables(conn)
+            self._ensure_v3_tables(conn)
+            self._seed_source_membership(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
+                (SCHEMA_VERSION, _utc_iso(), backup.name, "multi-root inventory and processing"),
+            )
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("COMMIT")
+        except (Exception, KeyboardInterrupt) as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            raise DatabaseMigrationError(f"Schema v3 migration aborted: {exc}") from exc
+        finally:
+            conn.close()
+
     def _init_or_migrate(self) -> None:
         """Initialize fresh v2 database or transactionally migrate v2.0.0 database after backup."""
         current_ver = self.get_schema_version()
-        if current_ver >= SCHEMA_VERSION:
-            # Ensure auxiliary indexes/tables exist idempotently without re-backing-up
-            with self._get_connection() as conn:
-                self._ensure_auxiliary_tables(conn)
+        if current_ver > SCHEMA_VERSION:
+            raise DatabaseMigrationError("Database schema is newer than this MusicVault build.")
+        if current_ver == SCHEMA_VERSION:
+            return
+        if current_ver == 2:
+            self._migrate_v2_to_v3()
             return
 
         if current_ver == 0:
@@ -332,8 +431,7 @@ class Database:
             return
 
         # Existing legacy v1 (v2.0.0) database -> create verified online backup BEFORE touching DB!
-        backup_path = self.create_verified_backup(label="pre_v201_migration")
-        self._migrate_v1_to_v2(backup_path)
+        self._migrate_v1_to_v3()
 
     def _create_fresh_v2_schema(self) -> None:
         now = _utc_iso()
@@ -384,9 +482,10 @@ class Database:
             )
             """)
             self._ensure_auxiliary_tables(conn)
+            self._ensure_v3_tables(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_migrations (version, applied_utc, backup_path, notes) VALUES (?, ?, ?, ?)",
-                (SCHEMA_VERSION, now, "", "initial_v2_schema"),
+                (SCHEMA_VERSION, now, "", "initial_v3_schema"),
             )
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
@@ -516,12 +615,14 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tracks_live_research ON tracks(is_live_source, quarantined, research_status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conflicts_file ON metadata_conflicts(file_id)")
 
-    def _migrate_v1_to_v2(self, backup_path: Path) -> None:
-        """Transactionally migrate a v2.0.0 database to schema v2 without dropping or losing records."""
+    def _migrate_v1_to_v3(self) -> None:
+        """Migrate the legacy v2.0.0 database with all schema steps in one transaction."""
         now = _utc_iso()
         conn = self._get_connection(isolation_level=None)
         try:
+            conn.execute("PRAGMA busy_timeout = 0")
             conn.execute("BEGIN IMMEDIATE")
+            backup_path = self.create_verified_backup(label="pre_v201_migration")
 
             existing_track_cols = {
                 r["name"] for r in conn.execute("PRAGMA table_info(tracks)").fetchall()
@@ -568,6 +669,10 @@ class Database:
             UPDATE tracks
             SET record_origin = 'live_scan',
                 observed_parent_id = parent_id,
+                configured_source_id = CASE
+                    WHEN COALESCE(configured_source_id, '') = '' THEN parent_id
+                    ELSE configured_source_id
+                END,
                 is_live_source = 1,
                 quarantined = 0,
                 quarantine_reason = ''
@@ -651,6 +756,9 @@ class Database:
               AND (TRIM(COALESCE(artist, '')) = '' OR TRIM(COALESCE(title, '')) = '')
               AND hydration_status != 'permanent_unsupported'
             """)
+
+            self._ensure_v3_tables(conn)
+            self._seed_source_membership(conn)
 
             # 6. Backfill candidate content_version and track research_status
             conn.execute("""
@@ -824,15 +932,23 @@ class Database:
                 "SELECT * FROM candidates WHERE file_id = ? AND COALESCE(is_stale, 0) = 0", (fid,)
             ).fetchall()
         ]
+        f_decs = [
+            dict(r)
+            for r in conn.execute("SELECT * FROM field_decisions WHERE file_id = ?", (fid,)).fetchall()
+        ]
+        snap = dict(existing_row)
+        if f_decs:
+            snap["_archived_field_decisions"] = f_decs
         conn.execute(
             """
             INSERT INTO evidence_history (
                 file_id, old_version, archived_utc, reason, track_snapshot_json, candidates_json
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (fid, old_ver, _utc_iso(), reason, json.dumps(dict(existing_row)), json.dumps(cands)),
+            (fid, old_ver, _utc_iso(), reason, json.dumps(snap), json.dumps(cands)),
         )
         conn.execute("UPDATE candidates SET is_stale = 1 WHERE file_id = ?", (fid,))
+        conn.execute("DELETE FROM field_decisions WHERE file_id = ? AND state != 'USER_LOCKED'", (fid,))
 
     # --- Checkpoints & Safe Track Persistence ---
 
@@ -1067,7 +1183,8 @@ class Database:
             return int(cur.lastrowid)
 
     def reconcile_scanned_file(
-        self, scan_id: int, source_folder_id: str, item: Dict[str, Any]
+        self, scan_id: int, source_folder_id: str, item: Dict[str, Any],
+        connection: Optional[sqlite3.Connection] = None,
     ) -> str:
         """
         Reconcile a Drive file item by exact file_id without touching tags on unchanged files,
@@ -1076,7 +1193,7 @@ class Database:
         fid = str(item.get("id") or "").strip()
         now = _utc_iso()
         if not fid:
-            with self._get_connection() as conn:
+            with (nullcontext(connection) if connection is not None else self._get_connection()) as conn:
                 conn.execute(
                     "INSERT INTO audit_log (event_type, file_id, details_json, created_utc) VALUES (?, ?, ?, ?)",
                     ("SCAN_BLANK_FILE_ID", None, json.dumps({"name": item.get("name", "")}), now),
@@ -1092,7 +1209,7 @@ class Database:
         parent = str(item.get("scanned_parent") or (parents[0] if parents else "") or "")
         new_ver = md5 or mod
 
-        with self._get_connection() as conn:
+        with (nullcontext(connection) if connection is not None else self._get_connection()) as conn:
             existing = conn.execute("SELECT * FROM tracks WHERE file_id = ?", (fid,)).fetchone()
 
             if existing is None:
@@ -1855,11 +1972,44 @@ class Database:
 
     # --- Queries ---
 
+    @staticmethod
+    def _ambiguous_membership_ids(conn: sqlite3.Connection) -> Set[str]:
+        has_rm = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+        ).fetchone()
+        if not has_rm:
+            return set()
+        return {
+            r[0]
+            for r in conn.execute(
+                """
+                SELECT file_id FROM root_membership
+                GROUP BY file_id
+                HAVING COUNT(DISTINCT role) > 1 OR MAX(ambiguous) = 1
+                """
+            ).fetchall()
+        }
+
     def get_track(self, file_id: str) -> Optional[Track]:
         """Fetch a track by its exact Google Drive file ID."""
         with self._get_connection() as conn:
             row = conn.execute("SELECT * FROM tracks WHERE file_id = ?", (file_id,)).fetchone()
-            return self._row_to_track(row) if row else None
+            if not row:
+                return None
+            tr = self._row_to_track(row)
+            has_rm = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+            ).fetchone()
+            if has_rm:
+                amb = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT role) > 1 OR COALESCE(MAX(ambiguous), 0) = 1
+                    FROM root_membership WHERE file_id = ?
+                    """,
+                    (file_id,),
+                ).fetchone()
+                tr.location_ambiguous = bool(amb and amb[0])
+            return tr
 
     def get_all_tracks(self, live_only: bool = False) -> List[Track]:
         """Fetch stored tracks (optionally restricted to live non-quarantined source tracks)."""
@@ -1870,7 +2020,25 @@ class Database:
                 ).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM tracks ORDER BY name ASC, file_id ASC").fetchall()
-            return [self._row_to_track(r) for r in rows]
+            amb_ids = self._ambiguous_membership_ids(conn)
+            tracks_out = []
+            for r in rows:
+                tr = self._row_to_track(r)
+                tr.location_ambiguous = tr.file_id in amb_ids
+                tracks_out.append(tr)
+            return tracks_out
+
+    @staticmethod
+    def _work_scope(process_run: Optional[Tuple[int, int]], stage: str, claimed_only: bool = False) -> str:
+        if process_run is None:
+            return "is_live_source = 1"
+        run_id, epoch = map(int, process_run)
+        claimed = f"AND w.hydrated={epoch}" if claimed_only else ""
+        return f"""EXISTS (
+            SELECT 1 FROM process_work w
+            WHERE w.run_id={run_id} AND w.file_id=tracks.file_id
+              AND w.version=tracks.version AND w.{stage} != {epoch} {claimed}
+        )"""
 
     def get_live_tracks_for_hydration(
         self,
@@ -1879,19 +2047,22 @@ class Database:
         max_attempts: int = 4,
         force_rehydrate: bool = False,
         use_sheet_uninspected: bool = False,
-    ) -> List[Track]:
+        process_run: Optional[Tuple[int, int]] = None,
+        count_only: bool = False,
+    ) -> List[Track] | int:
         """
         Select live source tracks needing metadata hydration or retry.
         Excludes tagless/partial tracks whose audio stream was already inspected at the current
         file version unless force_rehydrate=True or sheet identity lookup is newly requested.
         """
         now = _utc_iso()
+        live_clause = self._work_scope(process_run, "hydrated")
         with self._get_connection() as conn:
             if force_rehydrate:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM tracks
-                    WHERE is_live_source = 1
+                    WHERE {live_clause}
                       AND quarantined = 0
                       AND hydration_status != 'permanent_unsupported'
                     ORDER BY content_stale DESC, hydration_attempts ASC, file_id ASC
@@ -1917,14 +2088,13 @@ class Database:
                 params.extend([max_attempts, now])
             params.extend([1 if use_sheet_uninspected else 0, limit])
 
-            rows = conn.execute(
-                f"""
+            query = f"""
                 SELECT * FROM tracks
-                WHERE is_live_source = 1
+                WHERE {live_clause}
                   AND quarantined = 0
                   AND hydration_status != 'permanent_unsupported'
                   AND (
-                      content_stale = 1
+                      (content_stale = 1 AND hydration_status NOT IN ('retryable_failure','success'))
                       OR hydration_status = 'pending'
                       {retry_clause}
                       OR (
@@ -1943,9 +2113,10 @@ class Database:
                   )
                 ORDER BY content_stale DESC, hydration_attempts ASC, file_id ASC
                 LIMIT ?
-                """,
-                tuple(params),
-            ).fetchall()
+                """
+            if count_only:
+                return conn.execute("SELECT COUNT(*) FROM (" + query + ")", (*params[:-1], -1)).fetchone()[0]
+            rows = conn.execute(query, tuple(params)).fetchall()
             return [self._row_to_track(r) for r in rows]
 
     def get_live_tracks_for_research(
@@ -1955,12 +2126,22 @@ class Database:
         include_title_only: bool = False,
         max_attempts: int = 3,
         now_utc: Optional[datetime] = None,
-    ) -> List[Track]:
+        process_run: Optional[Tuple[int, int]] = None,
+        count_only: bool = False,
+        queue_class: str = "",
+        enrichment_condition: str = "0",
+        only_enrichment: bool = False,
+        claimed_only: bool = False,
+    ) -> List[Track] | int:
         """
         Select next batch of live, non-stale tracks with searchable identity for online research.
         Includes pending tracks, version-changed tracks, due retryable_failure tracks, and
         incomplete tracks (research_incomplete=1) whose retry deadline has arrived.
         """
+        live_clause = self._work_scope(process_run, "researched", claimed_only)
+        first_pass = "(research_status = 'pending' AND research_attempts = 0 AND research_deferrals = 0 AND research_last_utc = '')"
+        queue_filter = {"first": first_pass, "retry": f"NOT {first_pass}"}.get(queue_class, "1")
+        retry_order = "COALESCE(NULLIF(research_last_utc, ''), research_next_retry_utc), " if queue_class == "retry" else ""
         now_dt = _norm_utc(now_utc)
         now = _utc_iso(now_dt)
         with self._get_connection() as conn:
@@ -1997,23 +2178,27 @@ class Database:
                 """
                 params = (now, max_attempts, now, max_attempts, now, limit)
 
-            rows = conn.execute(
-                f"""
+            if only_enrichment:
+                status_clause, params = "0", (limit,)
+
+            query = f"""
                 SELECT * FROM tracks
-                WHERE is_live_source = 1
+                WHERE {live_clause}
                   AND quarantined = 0
                   AND content_stale = 0
                   AND {identity_clause}
-                  AND {status_clause}
+                  AND ({status_clause} OR ({enrichment_condition}))
+                  AND ({queue_filter})
                 ORDER BY
-                    CASE WHEN research_status = 'pending' THEN 0 ELSE 1 END ASC,
+                    {retry_order}CASE WHEN research_status = 'pending' THEN 0 ELSE 1 END ASC,
                     research_attempts ASC,
                     COALESCE(research_deferrals, 0) ASC,
                     file_id ASC
                 LIMIT ?
-                """,
-                params,
-            ).fetchall()
+                """
+            if count_only:
+                return conn.execute("SELECT COUNT(*) FROM (" + query + ")", (*params[:-1], -1)).fetchone()[0]
+            rows = conn.execute(query, params).fetchall()
             return [self._row_to_track(r) for r in rows]
 
     def get_research_queue_diagnostics(
@@ -2349,6 +2534,78 @@ class Database:
                     (new_cd, new_lr, new_st, new_http, new_ek, new_rsn, new_fp, now, fam),
                 )
 
+    def clear_provider_quota_block(self, provider: str) -> int:
+        """
+        Clear a confirmed unknown quota block on `provider`, reset breaker/server deadline rows,
+        reset enrichment attempt counters for `provider`, and re-open non-quarantined tracks that
+        were parked in `unresolved` solely due to `quota_exceeded` on `provider`.
+        """
+        fam = canonical_provider_family(provider)
+        now = _utc_iso()
+        requeued = 0
+        with self._get_connection() as conn:
+            self.set_provider_operational_state(
+                fam,
+                cooldown_until_utc="",
+                last_status="ok",
+                error_kind="",
+                reason="",
+            )
+            has_brk = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_breakers'"
+            ).fetchone()
+            if has_brk:
+                conn.execute("DELETE FROM provider_breakers WHERE provider = ?", (fam,))
+                conn.execute("DELETE FROM provider_server_deadlines WHERE provider = ?", (fam,))
+                conn.execute("UPDATE enrichment_work SET attempts = 0, due_utc = '' WHERE provider = ?", (fam,))
+            rows = conn.execute(
+                """
+                SELECT file_id, provider_calls_json FROM tracks
+                WHERE quarantined = 0 AND research_status = 'unresolved'
+                """
+            ).fetchall()
+            still_blocked = {
+                r["provider"]
+                for r in conn.execute(
+                    "SELECT provider FROM provider_operational_state WHERE last_status IN ('auth_error','quota_exceeded','unsupported_endpoint') AND provider != ?",
+                    (fam,),
+                ).fetchall()
+            }
+            for row in rows:
+                try:
+                    audit = json.loads(row["provider_calls_json"] or "{}")
+                except ValueError:
+                    continue
+                if not isinstance(audit, dict):
+                    continue
+                had_cleared_quota = False
+                other_hard = False
+                for p_key, p_val in audit.items():
+                    if p_key == "_meta" or not isinstance(p_val, dict):
+                        continue
+                    pfam = canonical_provider_family(p_key)
+                    st = str(p_val.get("status") or "").strip().lower()
+                    if pfam == fam and st == "quota_exceeded":
+                        had_cleared_quota = True
+                    elif st in ("auth_error", "unsupported_endpoint") or (st == "quota_exceeded" and pfam in still_blocked):
+                        other_hard = True
+                if had_cleared_quota and not other_hard:
+                    conn.execute(
+                        """
+                        UPDATE tracks
+                        SET research_status = 'retryable_failure',
+                            research_incomplete = 1,
+                            research_attempts = CASE WHEN research_attempts >= 3 THEN 2 ELSE research_attempts END,
+                            research_next_retry_utc = '',
+                            research_error = ?,
+                            research_last_utc = ?
+                        WHERE file_id = ?
+                        """,
+                        (f"Quota reset confirmed for {fam}; queued for retry", now, row["file_id"]),
+                    )
+                    requeued += 1
+        return requeued
+
     def get_all_provider_operational_states(
         self,
         now_utc: Optional[datetime] = None,
@@ -2358,6 +2615,11 @@ class Database:
         now_dt = _norm_utc(now_utc)
         out: Dict[str, Dict[str, Any]] = {}
         with self._get_connection() as conn:
+            has_pos = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_operational_state'"
+            ).fetchone()
+            if not has_pos:
+                return out
             rows = conn.execute("SELECT * FROM provider_operational_state ORDER BY provider ASC").fetchall()
         for r in rows:
             d = dict(r)
@@ -2473,6 +2735,25 @@ class Database:
 
         with self._get_connection() as conn:
             all_rows = conn.execute("SELECT * FROM tracks ORDER BY file_id ASC").fetchall()
+            has_rm = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+            ).fetchone()
+            active_dest_ids = (
+                {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT DISTINCT file_id FROM root_membership WHERE role = 'destination'"
+                    ).fetchall()
+                }
+                if has_rm
+                else set()
+            )
+            active_hard_quota_fams = {
+                r["provider"]
+                for r in conn.execute(
+                    "SELECT provider FROM provider_operational_state WHERE last_status = 'quota_exceeded'"
+                ).fetchall()
+            }
             cand_counts = {
                 r["file_id"]: int(r["cnt"])
                 for r in conn.execute(
@@ -2494,7 +2775,8 @@ class Database:
         for row in all_rows:
             counts["total_records_inspected"] += 1
             fid = str(row["file_id"] or "")
-            if not bool(row["is_live_source"]) or bool(row["quarantined"]):
+            is_active_member = bool(row["is_live_source"]) or (fid in active_dest_ids)
+            if not is_active_member or bool(row["quarantined"]):
                 counts["excluded_quarantined_or_nonlive"] += 1
                 continue
             r_status = str(row["research_status"] or "pending")
@@ -2594,7 +2876,9 @@ class Database:
 
                 if (
                     st_p in _RECOVERABLE_PROVIDER_STATUSES
+                    or st_p == "deferred_primary_incomplete"
                     or alt_st in (_RECOVERABLE_PROVIDER_STATUSES | {"skipped_cooldown_or_budget"})
+                    or (st_p == "quota_exceeded" and fam not in active_hard_quota_fams)
                     or (p_val.get("lookup_completed") is False and p_val.get("retryable") is True)
                 ):
                     failed_transient_fams.append(fam)
@@ -2758,7 +3042,6 @@ class Database:
                                 research_error = ?,
                                 provider_calls_json = ?
                             WHERE file_id = ?
-                              AND is_live_source = 1
                               AND quarantined = 0
                               AND research_status != 'permanent_unsupported'
                             """,
@@ -2921,12 +3204,34 @@ class Database:
             mig_row = conn.execute(
                 "SELECT * FROM schema_migrations ORDER BY version DESC LIMIT 1"
             ).fetchone()
+            has_rm = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+            ).fetchone()
+            if has_rm:
+                src_mem = conn.execute(
+                    "SELECT COUNT(DISTINCT file_id) FROM root_membership WHERE role = 'source'"
+                ).fetchone()[0]
+                dst_mem = conn.execute(
+                    "SELECT COUNT(DISTINCT file_id) FROM root_membership WHERE role = 'destination'"
+                ).fetchone()[0]
+                uniq_mem = conn.execute(
+                    "SELECT COUNT(DISTINCT file_id) FROM root_membership"
+                ).fetchone()[0]
+                ovl_mem = conn.execute(
+                    "SELECT COUNT(*) FROM (SELECT file_id FROM root_membership GROUP BY file_id HAVING COUNT(DISTINCT role) > 1)"
+                ).fetchone()[0]
+            else:
+                src_mem, dst_mem, uniq_mem, ovl_mem = int(live), 0, int(live), 0
 
             return {
                 "schema_version": int(mig_row["version"]) if mig_row else 1,
                 "last_migration_backup": (mig_row["backup_path"] or "") if mig_row else "",
                 "total_records": int(total),
                 "live_source_tracks": int(live),
+                "source_membership_tracks": int(src_mem),
+                "destination_tracks": int(dst_mem),
+                "unique_library_tracks": int(uniq_mem),
+                "overlapping_root_tracks": int(ovl_mem),
                 "quarantined_records": int(quarantined),
                 "checkpoint_only_records": int(checkpoint_only),
                 "stale_live_tracks": int(stale),
