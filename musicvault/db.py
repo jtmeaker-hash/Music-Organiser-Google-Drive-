@@ -344,6 +344,14 @@ class Database:
                 query_key TEXT NOT NULL, reason TEXT NOT NULL, due_utc TEXT NOT NULL,
                 PRIMARY KEY(file_id, version, provider, query_key)
             )""",
+            """CREATE TABLE IF NOT EXISTS provider_metrics (
+                provider TEXT NOT NULL, metric TEXT NOT NULL, value REAL NOT NULL,
+                PRIMARY KEY(provider, metric)
+            )""",
+            """CREATE TABLE IF NOT EXISTS provider_breakers (
+                provider TEXT PRIMARY KEY, history TEXT NOT NULL, streak INTEGER NOT NULL,
+                level INTEGER NOT NULL, until_utc TEXT NOT NULL
+            )""",
             """CREATE TABLE IF NOT EXISTS scheduler_state (
                 name TEXT PRIMARY KEY, value INTEGER NOT NULL
             )""",
@@ -2050,6 +2058,7 @@ class Database:
         process_run: Optional[Tuple[int, int]] = None,
         queue_class: str = "",
         enrichment_condition: str = "0",
+        only_enrichment: bool = False,
     ) -> List[Track]:
         """
         Select next batch of live, non-stale tracks with searchable identity for online research.
@@ -2095,6 +2104,9 @@ class Database:
                 )
                 """
                 params = (now, max_attempts, now, max_attempts, now, limit)
+
+            if only_enrichment:
+                status_clause, params = "0", (limit,)
 
             rows = conn.execute(
                 f"""

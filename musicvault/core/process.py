@@ -83,13 +83,13 @@ def _checkpoint_track(conn, run, stage, track):
         )
 
 
-def _next_research(db, conn, run, condition="0"):
+def _next_research(db, conn, run, condition="0", only_enrichment=False):
     row = conn.execute("SELECT value FROM scheduler_state WHERE name='first_pass'").fetchone()
     streak = row[0] if row else 0
     order = ("retry", "first") if streak >= 4 else ("first", "retry")
     for category in order:
         tracks = db.get_live_tracks_for_research(
-            1, process_run=run, queue_class=category, enrichment_condition=condition,
+            1, process_run=run, queue_class=category, enrichment_condition=condition, only_enrichment=only_enrichment,
         )
         if tracks:
             return tracks[0], min(streak + 1, 4) if category == "first" else 0
@@ -186,8 +186,10 @@ def run_process(config, db, drive, args, *, drive_factory=None, policy=None,
         researched = 0
         last = None
         while not args.limit or researched < args.limit:
+            if policy and researched % args.batch_size == 0:
+                policy.new_batch()
             condition = policy.enrichment_condition() if policy else "0"
-            track, streak = _next_research(db, conn, run, condition)
+            track, streak = _next_research(db, conn, run, condition, bool(args.provider))
             if track is None:
                 break
             summary = execute_research_batch(

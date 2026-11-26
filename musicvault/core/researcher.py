@@ -455,7 +455,34 @@ def execute_research_batch(
                     ("MusicBrainz", mb, lambda p, a, ti: p.search_detailed(a, ti, isrc=t.metadata.isrc)),
                 ]
 
-                for p_name, p_inst, call_fn in active_calls:
+                def verify(candidates):
+                    verified = []
+                    for candidate in candidates:
+                        candidate.verification = verify_recording_candidate(
+                            query_artist=artist, query_title=title,
+                            identity_confidence=t.metadata.identity_confidence or "verified_embedded",
+                            local_isrc=t.metadata.isrc, local_duration=t.metadata.duration,
+                            candidate_title=candidate.title, candidate_artists=candidate.artists,
+                            candidate_isrc=candidate.isrc, candidate_duration=candidate.duration,
+                            alt_artist=alt_artist, alt_title=alt_title,
+                        )
+                        candidate.content_version = ver
+                        if candidate.verification not in ("Identity mismatch", "Version conflict"):
+                            verified.append(candidate)
+                    return verified
+
+                if policy is not None:
+                    stored = [c for c in db.get_candidates(t.file_id)
+                              if (not c.content_version or c.content_version == ver)
+                              and policy.permits(canonical_provider_family(c.source_family or c.provider))]
+                    remaining_calls = list(active_calls)
+                else:
+                    remaining_calls = active_calls
+                while remaining_calls:
+                    if policy is not None:
+                        needed = policy.needed_fields(t, stored + verify(track_candidates))
+                        remaining_calls = policy.ordered(remaining_calls, needed)
+                    p_name, p_inst, call_fn = remaining_calls.pop(0)
                     if p_inst is None:
                         provider_audit[p_name] = {
                             "status": "not_configured",
@@ -469,8 +496,6 @@ def execute_research_batch(
                         }
                         continue
 
-                    configured_providers += 1
-
                     # Reuse already-completed provider outcome ONLY when version AND exact (artist, title) match
                     prev_entry = prior_audit.get(p_name)
                     if (
@@ -480,7 +505,9 @@ def execute_research_batch(
                         and str(prev_entry.get("status") or "") in ("ok", "empty")
                         and prev_entry.get("query_artist") == artist
                         and prev_entry.get("query_title") == title
+                        and (policy is None or prev_entry.get("query_isrc", t.metadata.isrc) == t.metadata.isrc)
                     ):
+                        configured_providers += 1
                         skipped_already_done_same_version += 1
                         clean_catalogue_responses += 1
                         provider_audit[p_name] = {
@@ -495,8 +522,44 @@ def execute_research_batch(
                         }
                         continue
 
+                    if policy is not None:
+                        family = canonical_provider_family(p_name)
+                        skip = policy.reason_to_skip(family, needed)
+                        if skip:
+                            provider_audit[p_name] = {
+                                "status": skip, "lookup_completed": False, "actual_calls": 0,
+                                "request_made": False, "query_artist": artist, "query_title": title,
+                            }
+                            if skip == "outside_provider_selection":
+                                if isinstance(prev_entry, dict):
+                                    provider_audit[p_name] = prev_entry
+                                # An absent required audit must not look like a successful complete run.
+                                if policy.is_required(family):
+                                    hard_blocked_incomplete_count += 1
+                                continue
+                            policy.checkpoint(t, p_name, provider_audit[p_name])
+                            if skip == "terms_hold":
+                                configured_providers += 1
+                                hard_blocked_incomplete_count += 1
+                                hard_blocked_without_call += 1
+                            continue
+
+                    configured_providers += 1
                     c0, h0, s0 = _snapshot_provider_counters(p_inst)
-                    prim_cands, prim_out = call_fn(p_inst, artist, title)
+                    old_primary = (prev_entry.get("primary_query") or {}) if isinstance(prev_entry, dict) else {}
+                    reuse_empty = (
+                        policy is not None and alt_artist and alt_title
+                        and old_primary.get("status") in ("ok", "empty")
+                        and old_primary.get("matches") == 0
+                        and prev_entry.get("query_artist") == artist
+                        and prev_entry.get("query_title") == title
+                        and prev_entry.get("query_isrc", t.metadata.isrc) == t.metadata.isrc
+                    )
+                    if reuse_empty:
+                        prim_cands = []
+                        prim_out = ProviderCallOutcome(provider=p_name, status=ProviderStatus.EMPTY)
+                    else:
+                        prim_cands, prim_out = call_fn(p_inst, artist, title)
                     _record_issue(prim_out)
 
                     prim_audit: Dict[str, Any] = {
@@ -573,9 +636,13 @@ def execute_research_batch(
                         "retry_until_utc": getattr(effective_out, "retry_until_utc", ""),
                         "query_artist": artist,
                         "query_title": title,
+                        "query_isrc": t.metadata.isrc,
                         "primary_query": prim_audit,
                         "alternate_query": alt_audit,
                     }
+
+                    if policy is not None:
+                        policy.checkpoint(t, p_name, provider_audit[p_name], verify(effective_cands))
 
                     if is_clean:
                         clean_catalogue_responses += 1
@@ -614,6 +681,12 @@ def execute_research_batch(
                 and track_cache_hits == 0
             ):
                 summary.deferred_without_attempt += 1
+                if policy is not None and not retry_deadlines_utc:
+                    db.record_research_deferral(
+                        file_id=t.file_id, retry_until_utc="",
+                        reason="Deferred: no applicable provider request could run",
+                        now_utc=track_now_utc,
+                    )
                 if retry_deadlines_utc:
                     earliest_cd = min(retry_deadlines_utc)
                     if not summary.next_retry_utc or earliest_cd < summary.next_retry_utc:
@@ -629,7 +702,14 @@ def execute_research_batch(
                 any_healthy_provider = (
                     (mb is not None and mb.can_request())
                     if title_only_mode
-                    else any(p is not None and p.can_request() for p in (sono, am, dc, mb))
+                    else any(
+                        p is not None and p.can_request()
+                        and (policy is None or (
+                            policy.permits(canonical_provider_family(name))
+                            and (not policy.provider or policy.provider == canonical_provider_family(name))
+                        ))
+                        for name, p in (("SonoVault", sono), ("AudioMeta", am), ("Discogs", dc), ("MusicBrainz", mb))
+                    )
                 )
                 if not any_healthy_provider:
                     if budget_exhausted_without_call > 0:
@@ -642,28 +722,12 @@ def execute_research_batch(
                 continue
 
             if not title_only_mode:
-                verified_candidates: List[Candidate] = []
-                for c in track_candidates:
-                    c.verification = verify_recording_candidate(
-                        query_artist=artist,
-                        query_title=title,
-                        identity_confidence=t.metadata.identity_confidence or "verified_embedded",
-                        local_isrc=t.metadata.isrc,
-                        local_duration=t.metadata.duration,
-                        candidate_title=c.title,
-                        candidate_artists=c.artists,
-                        candidate_isrc=c.isrc,
-                        candidate_duration=c.duration,
-                        alt_artist=alt_artist,
-                        alt_title=alt_title,
-                    )
-                    c.content_version = ver
-                    if c.verification not in ("Identity mismatch", "Version conflict"):
-                        verified_candidates.append(c)
-                track_candidates = verified_candidates
+                track_candidates = verify(track_candidates)
 
                 existing_active = [
-                    c for c in db.get_candidates(t.file_id) if not c.content_version or c.content_version == ver
+                    c for c in db.get_candidates(t.file_id)
+                    if (not c.content_version or c.content_version == ver)
+                    and (policy is None or policy.permits(canonical_provider_family(c.source_family or c.provider)))
                 ]
                 has_good_genre = _has_verified_catalogue_genre(existing_active + track_candidates)
 
@@ -671,6 +735,7 @@ def execute_research_batch(
                     enable_wikidata_fallback
                     and wiki is not None
                     and not has_good_genre
+                    and (policy is None or not policy.provider)
                     and clean_catalogue_responses > 0
                 ):
                     wc0, wh0, ws0 = _snapshot_provider_counters(wiki)
@@ -722,7 +787,9 @@ def execute_research_batch(
             summary.attempted += 1
 
             existing_same_ver = [
-                c for c in db.get_candidates(t.file_id) if not c.content_version or c.content_version == ver
+                c for c in db.get_candidates(t.file_id)
+                    if (not c.content_version or c.content_version == ver)
+                    and (policy is None or policy.permits(canonical_provider_family(c.source_family or c.provider)))
             ]
             combined_preview = existing_same_ver + track_candidates
             has_rec_verified = (not title_only_mode) and _has_verified_recording(combined_preview)

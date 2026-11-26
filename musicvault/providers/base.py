@@ -340,6 +340,7 @@ class BaseProvider:
         self.default_delay = max(0.0, float(default_delay))
         self.max_requests = max(1, int(max_requests))
         self.request_count = 0
+        self.request_monitor = None
         self.db = db
         self.provider_terms_cleared = bool(provider_terms_cleared)
         self.max_retry_sleep_seconds = max(0.0, float(max_retry_sleep_seconds))
@@ -368,6 +369,7 @@ class BaseProvider:
         # 3. Monotonic same-provider inter-request pacing deadline
         self._next_pacing_mono: float = 0.0
         self._cred_fingerprint: str = ""
+        self._quota_reset_utc = ""
 
         if contact and contact.strip() and contact.strip() != DEFAULT_CONTACT:
             self.register_secret(contact.strip())
@@ -480,10 +482,17 @@ class BaseProvider:
                     if last_st == ProviderStatus.QUOTA_EXCEEDED.value:
                         self.hard_blocked = True
                         self.hard_block_status = ProviderStatus.QUOTA_EXCEEDED
+                        self._quota_reset_utc = cd_dt.isoformat()
                         self.hard_block_kind = "quota_exceeded"
                         self.hard_block_reason = self._cooldown_reason
             except ValueError:
                 pass
+
+        if not cd_raw and not cred_mismatch and is_cred_scoped_block:
+            self.hard_blocked = True
+            self.hard_block_status = ProviderStatus(last_st)
+            self.hard_block_kind = str(st.get("error_kind") or last_st)
+            self.hard_block_reason = str(st.get("reason") or last_st)
 
         last_req_raw = str(st.get("last_request_utc") or "").strip()
         if last_req_raw and self.default_delay > 0.0:
@@ -590,6 +599,7 @@ class BaseProvider:
                 self.hard_block_kind = ""
                 self._cooldown_until_mono = 0.0
                 self._cooldown_until_utc = ""
+                self._quota_reset_utc = ""
                 self._load_persisted_operational_state()
 
     def _redact(self, msg: Any) -> str:
@@ -602,8 +612,14 @@ class BaseProvider:
     def is_request_cap_reached(self) -> bool:
         return self.request_count >= self.max_requests
 
+    def _expire_timed_quota(self) -> None:
+        if self.hard_block_status == ProviderStatus.QUOTA_EXCEEDED and self._quota_reset_utc:
+            if self._quota_reset_utc <= self._now_utc_normalized().isoformat():
+                self.hard_blocked = False
+                self.hard_block_reason = self.hard_block_kind = self._quota_reset_utc = ""
+
     def can_request(self) -> bool:
-        """Check if provider is not hard-blocked, not in active cooldown, and under run request cap."""
+        self._expire_timed_quota()
         return (
             not self.hard_blocked
             and self.remaining_cooldown_seconds() <= 0.0
@@ -686,32 +702,28 @@ class BaseProvider:
         self._persist_operational_state(last_request_utc=self._now_utc_normalized().isoformat())
 
     def _precheck_unavailable(self) -> Optional[ProviderCallOutcome]:
+        self._expire_timed_quota()
         if self.hard_blocked:
-            # If quota block had a timed reset that has now expired, clear it automatically
-            if self.hard_block_status == ProviderStatus.QUOTA_EXCEEDED and self._cooldown_until_mono > 0.0:
-                if self.remaining_cooldown_seconds() <= 0.0:
-                    self.hard_blocked = False
-                    self.hard_block_reason = ""
-                    self.hard_block_kind = ""
-            if self.hard_blocked:
-                self.stats["skipped_blocked"] += 1
-                rem_q = self.remaining_cooldown_seconds()
-                outcome = ProviderCallOutcome(
-                    provider=self.name,
-                    status=self.hard_block_status,
-                    error=self.hard_block_reason or "provider hard-blocked",
-                    retry_after_seconds=rem_q,
-                    retry_until_utc=self.cooldown_until_utc,
-                    error_kind=self.hard_block_kind or self.hard_block_status.value,
-                    hard_blocked=True,
-                    request_made=False,
-                )
-                self.last_outcome = outcome
-                return outcome
+            self.stats["skipped_blocked"] += 1
+            rem_q = self.remaining_cooldown_seconds()
+            outcome = ProviderCallOutcome(
+                provider=self.name,
+                status=self.hard_block_status,
+                error=self.hard_block_reason or "provider hard-blocked",
+                retry_after_seconds=rem_q,
+                retry_until_utc=self.cooldown_until_utc,
+                error_kind=self.hard_block_kind or self.hard_block_status.value,
+                hard_blocked=True,
+                request_made=False,
+            )
+            self.last_outcome = outcome
+            return outcome
 
         rem_cd = self.remaining_cooldown_seconds()
         if rem_cd > 0.0:
             self.stats["skipped_cooldown"] += 1
+            if self.request_monitor:
+                self.request_monitor.count("cooldown_skips")
             outcome = ProviderCallOutcome(
                 provider=self.name,
                 status=ProviderStatus.COOLDOWN_DEFERRED,
@@ -754,6 +766,8 @@ class BaseProvider:
             cached = self._read_cache(cache_key)
             if cached is not None:
                 self.stats["cache_hits"] += 1
+                if self.request_monitor:
+                    self.request_monitor.count("cache_hits")
                 outcome = ProviderCallOutcome(
                     provider=self.name,
                     status=ProviderStatus.OK,
@@ -783,6 +797,7 @@ class BaseProvider:
             self.request_count += 1
             self.stats["calls"] += 1
 
+            started = self._clock_mono()
             try:
                 try:
                     resp = self.session.get(url, params=params, headers=merged_headers, timeout=timeout)
@@ -791,6 +806,23 @@ class BaseProvider:
                 code = resp.status_code
                 resp_headers = resp.headers or {}
                 now_utc = self._now_utc_normalized()
+
+                server_wait = parse_provider_reset_wait(resp_headers, self.source_family, now_utc=now_utc)
+                quota = code == 402 or (code == 429 and _is_documented_quota_exceeded(code, resp_headers, resp.text or ""))
+                is_mb_503_rl = _is_musicbrainz_503_rate_limit(self.source_family, code, resp_headers, resp.text or "")
+                breaker_wait = 0.0
+                if self.request_monitor and not resp.ok:
+                    kind = (
+                        "quota_exhaustion" if quota else
+                        "auth_failures" if code in (401, 403) else
+                        "rate_limits" if code == 429 or is_mb_503_rl else
+                        "temporary_failures" if code >= 500 else
+                        "successful_responses" if code == 404 and allow_404_as_empty else
+                        "other_failures"
+                    )
+                    breaker_wait = self.request_monitor.observe(
+                        kind, self._clock_mono() - started, now_utc, server_wait,
+                    )
 
                 if code in (401, 403):
                     self.hard_blocked = True
@@ -853,9 +885,7 @@ class BaseProvider:
                     self.last_outcome = outcome
                     return outcome
 
-                server_wait = parse_provider_reset_wait(resp_headers, self.source_family, now_utc=now_utc)
-
-                if code == 402 or (code == 429 and _is_documented_quota_exceeded(code, resp_headers, resp.text or "")):
+                if quota:
                     q_wait = server_wait if (server_wait is not None and server_wait > 0.0) else 0.0
                     self.hard_blocked = True
                     self.hard_block_status = ProviderStatus.QUOTA_EXCEEDED
@@ -881,6 +911,7 @@ class BaseProvider:
                             error_kind="quota_exceeded",
                             reason=self.hard_block_reason,
                         )
+                    self._quota_reset_utc = cd_utc
                     outcome = ProviderCallOutcome(
                         provider=self.name,
                         status=ProviderStatus.QUOTA_EXCEEDED,
@@ -895,16 +926,15 @@ class BaseProvider:
                     self.last_outcome = outcome
                     return outcome
 
-                is_mb_503_rl = _is_musicbrainz_503_rate_limit(self.source_family, code, resp_headers, resp.text or "")
                 if code == 429 or is_mb_503_rl:
-                    wait_s = server_wait if (server_wait is not None and server_wait > 0.0) else (2.0 * (2 ** attempt))
+                    wait_s = max(breaker_wait, server_wait or (2.0 * (2 ** attempt)))
                     err_kind = "musicbrainz_503_rate_limit" if is_mb_503_rl else "http_429_rate_limit"
                     self.stats["rate_limited"] += 1
                     if is_mb_503_rl:
                         self.stats["mb_503_rate_limited"] += 1
 
                     # Retry in-place ONLY if within remaining run cap AND full server wait fits sleep budget
-                    if attempt < 2 and self.request_count < self.max_requests and self._sleep_bounded(wait_s):
+                    if not breaker_wait and attempt < 2 and self.request_count < self.max_requests and self._sleep_bounded(wait_s):
                         continue
 
                     reason = f"HTTP {code} rate limited (retry after {wait_s:.1f}s)"
@@ -912,7 +942,7 @@ class BaseProvider:
                         wait_s,
                         status=ProviderStatus.RATE_LIMITED.value,
                         http_status=code,
-                        error_kind=err_kind,
+                        error_kind="circuit_breaker" if breaker_wait else err_kind,
                         reason=reason,
                     )
                     outcome = ProviderCallOutcome(
@@ -931,16 +961,16 @@ class BaseProvider:
                 if 500 <= code < 600:
                     self.stats["server_errors"] += 1
                     backoff = max(server_wait or 0.0, 2.0 * (2 ** attempt))
-                    if attempt < 2 and self.request_count < self.max_requests and self._sleep_bounded(backoff):
+                    if not breaker_wait and attempt < 2 and self.request_count < self.max_requests and self._sleep_bounded(backoff):
                         continue
 
-                    cd_wait = max(server_wait or 0.0, 30.0)
+                    cd_wait = max(breaker_wait, server_wait or 0.0, 30.0)
                     reason = f"HTTP {code} server unavailable"
                     cd_utc = self._set_cooldown(
                         cd_wait,
                         status=ProviderStatus.SERVER_ERROR.value,
                         http_status=code,
-                        error_kind="http_5xx_server_error",
+                        error_kind="circuit_breaker" if breaker_wait else "http_5xx_server_error",
                         reason=reason,
                     )
                     outcome = ProviderCallOutcome(
@@ -960,6 +990,8 @@ class BaseProvider:
                     try:
                         payload = resp.json()
                     except ValueError as json_exc:
+                        if self.request_monitor:
+                            self.request_monitor.observe("other_failures", self._clock_mono() - started, now_utc)
                         self.stats["malformed_json"] += 1
                         outcome = ProviderCallOutcome(
                             provider=self.name,
@@ -972,6 +1004,8 @@ class BaseProvider:
                         self.last_outcome = outcome
                         return outcome
 
+                    if self.request_monitor:
+                        self.request_monitor.observe("successful_responses", self._clock_mono() - started, now_utc)
                     self._clear_cooldown_after_ok(code)
 
                     # Proactive exhausted-window cooldown without shortening server reset or stalling current OK result
@@ -989,7 +1023,7 @@ class BaseProvider:
                             status=ProviderStatus.RATE_LIMITED.value,
                             http_status=code,
                             error_kind="proactive_ratelimit_window",
-                            reason=f"rate-limit window exhausted (0 remaining; reset in {proactive_wait:.1f}s)",
+                            reason=f"rate-limit window exhausted; retry held for {proactive_wait:.1f}s",
                         )
 
                     if use_cache:
@@ -1030,12 +1064,15 @@ class BaseProvider:
 
             except requests.Timeout as exc:
                 self.stats["timeouts"] += 1
+                breaker_wait = self.request_monitor.observe(
+                    "temporary_failures", self._clock_mono() - started, self._now_utc_normalized(),
+                ) if self.request_monitor else 0.0
                 backoff = 1.5 * (2 ** attempt)
-                if attempt < 2 and self.request_count < self.max_requests and self._sleep_bounded(backoff):
+                if not breaker_wait and attempt < 2 and self.request_count < self.max_requests and self._sleep_bounded(backoff):
                     continue
                 reason = f"Request timeout ({self._redact(exc)})"
                 cd_utc = self._set_cooldown(
-                    15.0,
+                    max(15.0, breaker_wait),
                     status=ProviderStatus.TIMEOUT.value,
                     http_status=None,
                     error_kind="timeout",
@@ -1045,7 +1082,7 @@ class BaseProvider:
                     provider=self.name,
                     status=ProviderStatus.TIMEOUT,
                     error=reason,
-                    retry_after_seconds=15.0,
+                    retry_after_seconds=max(15.0, breaker_wait),
                     retry_until_utc=cd_utc,
                     error_kind="timeout",
                     request_made=True,
@@ -1054,12 +1091,15 @@ class BaseProvider:
                 return outcome
             except requests.RequestException as exc:
                 self.stats["network_errors"] += 1
+                breaker_wait = self.request_monitor.observe(
+                    "temporary_failures", self._clock_mono() - started, self._now_utc_normalized(),
+                ) if self.request_monitor else 0.0
                 backoff = 1.5 * (2 ** attempt)
-                if attempt < 2 and self.request_count < self.max_requests and self._sleep_bounded(backoff):
+                if not breaker_wait and attempt < 2 and self.request_count < self.max_requests and self._sleep_bounded(backoff):
                     continue
                 reason = f"Network error ({self._redact(exc)})"
                 cd_utc = self._set_cooldown(
-                    15.0,
+                    max(15.0, breaker_wait),
                     status=ProviderStatus.NETWORK_ERROR.value,
                     http_status=None,
                     error_kind="network_error",
@@ -1069,7 +1109,7 @@ class BaseProvider:
                     provider=self.name,
                     status=ProviderStatus.NETWORK_ERROR,
                     error=reason,
-                    retry_after_seconds=15.0,
+                    retry_after_seconds=max(15.0, breaker_wait),
                     retry_until_utc=cd_utc,
                     error_kind="network_error",
                     request_made=True,

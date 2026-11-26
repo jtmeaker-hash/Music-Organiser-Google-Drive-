@@ -23,6 +23,8 @@ from .cli.wizard import run_setup_wizard
 from .auth import GoogleAuthManager
 from .config import Config
 from .core.process import run_process, snapshot_database
+from .core.provider_policy import CAPABILITIES, ProviderPolicy
+from .providers.base import canonical_provider_family
 from .services.drive import DriveService
 from .cli.formatting import export_safe_csv, export_safe_json
 from .db import Database, DatabaseMigrationError, SCHEMA_VERSION
@@ -50,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
     migration = subparsers.add_parser("migrate", help="Back up and migrate the local database")
     migration.add_argument("--confirm-stopped", required=True, action="store_true",
                            help="Confirm older MusicVault processes are stopped")
+
+    reset = subparsers.add_parser("clear-quota", help="Clear an unknown quota block after verifying the reset")
+    reset.add_argument("provider", choices=sorted(CAPABILITIES))
+    reset.add_argument("--confirm-reset", required=True, action="store_true")
 
     # scan
     sc_p = subparsers.add_parser("scan", help="Scan Google Drive source folder metadata inventory (read-only)")
@@ -180,6 +186,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 def run_process_cli(args, config, db):
+    policy = None if args.inventory_only or args.dry_run else ProviderPolicy(config)
     creds = GoogleAuthManager(config).get_credentials(
         allow_interactive=not args.dry_run, persist_refresh=not args.dry_run,
     )
@@ -187,11 +194,11 @@ def run_process_cli(args, config, db):
         print("Google authentication is required to read Drive inventory.")
         return 2
     result = run_process(config, db, DriveService(creds), args,
-                         drive_factory=lambda: DriveService(creds))
+                         drive_factory=lambda: DriveService(creds), policy=policy)
     print(config.redact(result))
-    if args.export_json:
+    if args.export_json and "coverage" not in result:
         export_safe_json(Path(args.export_json), result, config.known_secrets())
-    if args.export_csv:
+    if args.export_csv and "coverage" not in result:
         rows = [{"role": role, **info} for role, info in result["roots"].items()]
         fields = list(dict.fromkeys(key for row in rows for key in row))
         export_safe_csv(Path(args.export_csv), fields, rows, config.known_secrets())
@@ -202,6 +209,15 @@ def dispatch(args: argparse.Namespace, config: Config, db: Database) -> int:
     try:
         if not args.command:
             main_menu(config, db)
+        elif args.command == "clear-quota":
+            family = canonical_provider_family(args.provider)
+            state = db.get_provider_operational_state(family) or {}
+            if state.get("last_status") != "quota_exceeded" or state.get("cooldown_until_utc"):
+                print("No unknown quota block to clear for this provider.")
+                return 1
+            db.set_provider_operational_state(family, last_status="ok", cooldown_until_utc="")
+            print(f"Cleared the confirmed reset for {family}.")
+            return 0
         elif args.command == "process":
             return run_process_cli(args, config, db)
         elif args.command == "status":
