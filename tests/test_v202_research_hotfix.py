@@ -1037,3 +1037,262 @@ def test_selective_recovery_preview_apply_idempotency_exclusions_and_redaction(
     assert "private.dj.owner@example.org" not in res_console
     assert "sv_super_secret_token_777" not in res_console
     assert "private.dj.owner@example.org" not in res_json_path.read_text(encoding="utf-8")
+
+
+def test_v202_adversarial_review_edge_cases(
+    isolated_musicvault_environment: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """
+    Regression tests for all independent code-review findings:
+    1a. Hard-blocked (401) + cached clean provider with candidates does NOT busy-loop on subsequent runs,
+        and timed QUOTA_EXCEEDED preserves full Retry-After in research_next_retry_utc.
+    1b. Track needing only a cooling-down provider continues batch for healthy providers on subsequent tracks.
+    2a/2b. Partial candidates fetched before a sub-request 429 are retained, and verified recording keeps 'success'.
+    2c. Unverified/conflicting prior candidate fields never pollute a newly recording-verified upgrade.
+    2d. Re-query executes when (artist, title) is refined at the same file content version.
+    3a/3b. Gateway 522 and Retry-After:0 + RateLimit-Reset:60 honor the positive server wait.
+    """
+    clock = FakeClock()
+    cfg = Config()
+    cfg.set("SONOVAULT_API_KEY", "sv_key_rev")
+    db = Database(cfg.db_path)
+
+    # 3b & 3a: Retry-After: 0 alongside RateLimit-Reset: 60 returns 60.0 (never masked by 0), and HTTP 522 honors Retry-After!
+    assert parse_provider_reset_wait({"Retry-After": "0", "RateLimit-Reset": "60"}, "sonovault", now_utc=clock.now_utc()) == 60.0
+    sv_gw = SonoVaultProvider(
+        api_key="sv_gw_key",
+        default_delay=0.0,
+        max_retry_sleep_seconds=0.0,
+        clock_utc=clock.now_utc,
+        clock_mono=clock.now_mono,
+        sleep_fn=clock.sleep,
+    )
+    monkeypatch.setattr(sv_gw.session, "get", lambda *a, **kw: FakeResp(522, "Cloudflare origin timeout", headers={"Retry-After": "90"}))
+    out_522 = sv_gw.request_detailed("https://api.sonovault.now/v1/tracks/search", params={"q": "x"}, use_cache=False)
+    assert out_522.status == ProviderStatus.SERVER_ERROR
+    assert out_522.retry_after_seconds == 90.0
+
+    # 2c: Conflicting prior candidate ('Duration conflict' with bogus genre 'Techno' & bpm 128.0) MUST NOT
+    #     pollute an authoritative 'ISRC supported' upgrade ('Hardstyle')!
+    _seed_live_track(db, "UPG_1", "Act of Rage - Living Fast.flac", version="v_upg", isrc="NLFL72401034")
+    db.update_research_result(
+        "UPG_1",
+        status="partial",
+        version="v_upg",
+        candidates=[
+            Candidate(
+                provider="SonoVault",
+                title="Living Fast",
+                artists=["Act of Rage"],
+                bpm=128.0,
+                key="1A",
+                genre=["Techno"],
+                verification="Duration conflict",
+                content_version="v_upg",
+                source_family="sonovault",
+            )
+        ],
+        provider_calls={"SonoVault": {"status": "ok"}},
+        now_utc=clock.now_utc(),
+    )
+    upgraded = db.update_research_result(
+        "UPG_1",
+        status="success",
+        version="v_upg",
+        candidates=[
+            Candidate(
+                provider="SonoVault",
+                title="Living Fast",
+                artists=["Act of Rage"],
+                duration=240.0,
+                isrc="NLFL72401034",
+                bpm=None,
+                key=None,
+                genre=["Hardstyle"],
+                verification="ISRC supported",
+                content_version="v_upg",
+                source_family="sonovault",
+            )
+        ],
+        provider_calls={"SonoVault": {"status": "ok"}},
+        now_utc=clock.now_utc(),
+    )
+    assert len(upgraded) == 1
+    assert upgraded[0].verification == "ISRC supported"
+    assert upgraded[0].genre == ["Hardstyle"]  # Bogus 'Techno' from Duration conflict NOT unioned!
+    assert upgraded[0].bpm is None  # Bogus 128.0 from Duration conflict NOT inherited!
+    # Clean UPG_1 out of queue
+    with db._get_connection() as conn:
+        conn.execute("UPDATE tracks SET is_live_source = 0 WHERE file_id = 'UPG_1'")
+
+    # 1a + 2a + 2b: Discogs returns Hit #1 ('Duration supported') then Hit #2's release detail hits 429 (90s),
+    #               while SonoVault hits 401 AUTH_ERROR:
+    #               - Hit #1 candidate MUST be retained (2a)!
+    #               - Track status MUST stay 'success' with research_incomplete=True (2b)!
+    _seed_live_track(db, "PART_SUB_1", "Act of Rage - Living Fast.flac", version="v_ps1")
+    dc_sub = DiscogsProvider(
+        token="dc_tok_sub",
+        db=db,
+        default_delay=0.0,
+        max_retry_sleep_seconds=0.0,
+        clock_utc=clock.now_utc,
+        clock_mono=clock.now_mono,
+        sleep_fn=clock.sleep,
+    )
+
+    def _dc_sub_mock(url: str, **kw):
+        if "database/search" in url:
+            return FakeResp(200, {"results": [{"id": 101}, {"id": 102}]})
+        if url.endswith("/101"):
+            return FakeResp(
+                200,
+                {"uri": "https://discogs.com/release/101", "genres": ["Electronic"], "styles": ["Hardstyle"], "tracklist": [{"title": "Living Fast", "artists": [{"name": "Act of Rage"}], "duration": "4:00"}]},
+            )
+        return FakeResp(429, {"message": "Slow down"}, headers={"Retry-After": "90"})
+
+    monkeypatch.setattr(dc_sub.session, "get", _dc_sub_mock)
+    sum_sub = execute_research_batch(
+        cfg,
+        db,
+        limit=5,
+        enable_wikidata_fallback=False,
+        providers_override={"dc": dc_sub},
+        clock_utc=clock.now_utc,
+        clock_mono=clock.now_mono,
+        sleep_fn=clock.sleep,
+    )
+    assert sum_sub.matched_verified == 1
+    c_sub = db.get_candidates("PART_SUB_1")
+    assert len(c_sub) == 1 and c_sub[0].verification == "Duration supported"
+    t_sub = db.get_track("PART_SUB_1")
+    assert t_sub.research_status == "success" and t_sub.research_incomplete is True
+
+    # 1a (no busy-loop on untimed hard block + cached clean provider):
+    _seed_live_track(db, "HB_1", "Act of Rage - Song HB.flac", artist="Act of Rage", title="Song HB", version="v_hb1")
+    # Put PART_SUB_1 future retry past current clock
+    clock.advance(1.0)
+    sono_401 = SonoVaultProvider(
+        api_key="sv_bad_401",
+        db=db,
+        default_delay=0.0,
+        clock_utc=clock.now_utc,
+        clock_mono=clock.now_mono,
+        sleep_fn=clock.sleep,
+    )
+    mb_cached = MusicBrainzProvider(
+        db=db,
+        clock_utc=clock.now_utc,
+        clock_mono=clock.now_mono,
+        sleep_fn=clock.sleep,
+    )
+    monkeypatch.setattr(sono_401.session, "get", lambda *a, **kw: FakeResp(401, {"error": "Unauthorized"}))
+    monkeypatch.setattr(
+        mb_cached.session,
+        "get",
+        lambda url, **kw: FakeResp(
+            200,
+            {"recordings": [{"id": "rhb", "title": "Song HB", "length": 240000, "artist-credit": [{"name": "Act of Rage"}]}]}
+            if url.endswith("/recording")
+            else {"id": "rhb", "title": "Song HB", "length": 240000, "genres": [{"name": "hardstyle", "count": 2}]},
+        ),
+    )
+    sum_hb1 = execute_research_batch(
+        cfg,
+        db,
+        limit=5,
+        enable_wikidata_fallback=False,
+        providers_override={"sono": sono_401, "mb": mb_cached},
+        clock_utc=clock.now_utc,
+        clock_mono=clock.now_mono,
+        sleep_fn=clock.sleep,
+    )
+    assert sum_hb1.attempted == 1
+    t_hb = db.get_track("HB_1")
+    assert t_hb.research_status == "success"
+    assert t_hb.research_incomplete is False  # Untimed 401 does NOT leave track spinning in queue!
+
+    # Immediate re-run MUST attempt 0 tracks (no infinite loop!) and recover-research classifies HB_1 as ambiguous_hard_blocked!
+    sum_hb2 = execute_research_batch(
+        cfg,
+        db,
+        limit=5,
+        enable_wikidata_fallback=False,
+        providers_override={"sono": sono_401, "mb": mb_cached},
+        clock_utc=clock.now_utc,
+        clock_mono=clock.now_mono,
+        sleep_fn=clock.sleep,
+    )
+    assert sum_hb2.attempted == 0
+    rec_check = db.inspect_or_apply_research_recovery(configured_providers={"sonovault", "musicbrainz"}, apply=False, now_utc=clock.now_utc())
+    assert any(it["file_id"] == "HB_1" and it["reason"] == "ambiguous_hard_blocked_provider_audit" for it in rec_check["ambiguous_tracks"])
+
+    # 1b & 2d: Healthy provider continues past a track whose ONLY remaining provider is on cooldown,
+    #          AND changing (artist, title) on same file version triggers fresh query instead of reusing old audit!
+    _seed_live_track(db, "00_NEEDS_SONO_ONLY", "Artist A - Track A.flac", artist="Artist A", title="Track A", version="v_ta")
+    _seed_live_track(db, "ZZ_FRESH_FOR_MB", "Artist B - Track B.flac", artist="Artist B", title="Track B", version="v_tb")
+
+    sono_cd = SonoVaultProvider(
+        api_key="sv_cd_1b",
+        db=db,
+        default_delay=0.0,
+        max_retry_sleep_seconds=0.0,
+        clock_utc=clock.now_utc,
+        clock_mono=clock.now_mono,
+        sleep_fn=clock.sleep,
+    )
+    monkeypatch.setattr(sono_cd.session, "get", lambda *a, **kw: FakeResp(429, {"error": "Rate limit"}, headers={"Retry-After": "600"}))
+    # Trigger SonoVault cooldown on 00_NEEDS_SONO_ONLY while MB completes cleanly on 00_NEEDS_SONO_ONLY (limit=1)
+    monkeypatch.setattr(mb_cached.session, "get", lambda *a, **kw: FakeResp(200, {"recordings": []}))
+    execute_research_batch(
+        cfg,
+        db,
+        limit=1,
+        enable_wikidata_fallback=False,
+        providers_override={"sono": sono_cd, "mb": mb_cached},
+        clock_utc=clock.now_utc,
+        clock_mono=clock.now_mono,
+        sleep_fn=clock.sleep,
+    )
+    # Force 00_NEEDS_SONO_ONLY due right now while SonoVault is STILL on 600s cooldown:
+    # Run must skip 00_NEEDS_SONO_ONLY without breaking batch, and process ZZ_FRESH_FOR_MB on healthy MB!
+    with db._get_connection() as conn:
+        conn.execute("UPDATE tracks SET research_next_retry_utc = '' WHERE file_id = '00_NEEDS_SONO_ONLY'")
+
+    mb_seen_b: List[str] = []
+
+    def _mb_for_b(url: str, params: Optional[Dict[str, Any]] = None, **kw):
+        mb_seen_b.append(str((params or {}).get("query") or ""))
+        return FakeResp(200, {"recordings": []})
+
+    monkeypatch.setattr(mb_cached.session, "get", _mb_for_b)
+    sum_cont = execute_research_batch(
+        cfg,
+        db,
+        limit=5,
+        enable_wikidata_fallback=False,
+        providers_override={"sono": sono_cd, "mb": mb_cached},
+        clock_utc=clock.now_utc,
+        clock_mono=clock.now_mono,
+        sleep_fn=clock.sleep,
+    )
+    assert sum_cont.deferred_without_attempt == 1
+    assert sum_cont.attempted == 1  # Continued past 00_NEEDS_SONO_ONLY and researched ZZ_FRESH_FOR_MB!
+    assert any("Track B" in q for q in mb_seen_b)
+
+    # 2d: Refine artist/title on 00_NEEDS_SONO_ONLY at the SAME version 'v_ta' -> MB must NOT reuse stale query_title!
+    with db._get_connection() as conn:
+        conn.execute(
+            "UPDATE tracks SET artist = 'Refined Artist', title = 'Refined Title', research_next_retry_utc = '' WHERE file_id = '00_NEEDS_SONO_ONLY'"
+        )
+    mb_seen_b.clear()
+    execute_research_batch(
+        cfg,
+        db,
+        limit=1,
+        enable_wikidata_fallback=False,
+        providers_override={"sono": sono_cd, "mb": mb_cached},
+        clock_utc=clock.now_utc,
+        clock_mono=clock.now_mono,
+        sleep_fn=clock.sleep,
+    )
+    assert any("Refined Title" in q for q in mb_seen_b)

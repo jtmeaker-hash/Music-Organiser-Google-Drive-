@@ -6,11 +6,11 @@ Resumable, honest online metadata research scheduler and execution engine (v2.0.
 - Never treats deferred, blocked, or unattempted providers as definitive no_match.
 - Retains incomplete work and schedules retries without consuming track attempts on pure
   cooldown/budget deferrals; honors server retry waits beyond 3600s without shortening.
-- Distinguishes verified recording identity without genre from routing readiness, and never
-  promotes inferred Wikidata or title-only matches to verified recording evidence.
+- Continues healthy providers across remaining tracks when a single provider cools down or
+  caps out, avoids infinite retry loops on untimed hard blocks, and preserves partial
+  candidates even when detail sub-requests hit rate limits.
 """
 import json
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -52,6 +52,21 @@ _HARD_BLOCKED_OUTCOME_STATUSES = {
 
 def _default_utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _norm_utc(dt: Optional[datetime]) -> datetime:
+    d = dt or _default_utc_now()
+    if d.tzinfo is None:
+        return d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc)
+
+
+def _is_timed_quota_outcome(out: ProviderCallOutcome) -> bool:
+    if out.status != ProviderStatus.QUOTA_EXCEEDED:
+        return False
+    return float(getattr(out, "retry_after_seconds", 0.0) or 0.0) > 0.0 or bool(
+        str(getattr(out, "retry_until_utc", "") or "").strip()
+    )
 
 
 def _snapshot_provider_counters(p_inst: Any) -> Tuple[int, int, int]:
@@ -145,9 +160,7 @@ def execute_research_batch(
     never shortens server retry waits, and preserves/merges valid candidates non-destructively.
     """
     now_fn = clock_utc or _default_utc_now
-    cur_utc = now_fn()
-    if cur_utc.tzinfo is None:
-        cur_utc = cur_utc.replace(tzinfo=timezone.utc)
+    cur_utc = _norm_utc(now_fn())
 
     summary = ResearchRunSummary()
     inv = db.get_inventory_summary()
@@ -319,10 +332,10 @@ def execute_research_batch(
 
     try:
         for idx, t in enumerate(queue, 1):
-            track_now_utc = now_fn()
-            if track_now_utc.tzinfo is None:
-                track_now_utc = track_now_utc.replace(tzinfo=timezone.utc)
+            if summary.attempted >= max(1, int(limit)):
+                break
 
+            track_now_utc = _norm_utc(now_fn())
             ver = t.metadata.version or t.md5 or t.modified_time or ""
             artist = t.metadata.artist.strip()
             title = t.metadata.title.strip()
@@ -349,7 +362,6 @@ def execute_research_batch(
             retryable_incomplete_count = 0
             hard_blocked_incomplete_count = 0
             real_http_failure_count = 0
-            deferred_without_call_count = 0
             budget_exhausted_without_call = 0
             cooldown_deferred_without_call = 0
             hard_blocked_without_call = 0
@@ -384,8 +396,13 @@ def execute_research_batch(
 
                     _record_issue(out)
                     is_clean = out.status in (ProviderStatus.OK, ProviderStatus.EMPTY)
-                    is_retry = out.status in _RETRYABLE_OUTCOME_STATUSES
+                    timed_quota = _is_timed_quota_outcome(out)
+                    is_retry = (out.status in _RETRYABLE_OUTCOME_STATUSES) or timed_quota
                     is_hard = out.status in _HARD_BLOCKED_OUTCOME_STATUSES
+
+                    # Always retain any fetched partial candidates even if a follow-up sub-request failed
+                    if cands:
+                        track_candidates.extend(cands)
 
                     provider_audit["MusicBrainz"] = {
                         "status": out.status.value,
@@ -401,25 +418,24 @@ def execute_research_batch(
                         "retryable": is_retry,
                         "retry_until_utc": getattr(out, "retry_until_utc", ""),
                         "mode": "title_only",
+                        "query_title": t_hint,
                     }
                     if is_clean:
                         clean_catalogue_responses += 1
-                        track_candidates.extend(cands)
-                    elif is_retry:
+                    if is_retry:
                         retryable_incomplete_count += 1
                         _collect_wait(out)
-                        if out.request_made and out.status in _REAL_TRANSIENT_HTTP_FAILURE_STATUSES:
+                        if out.request_made and (out.status in _REAL_TRANSIENT_HTTP_FAILURE_STATUSES or timed_quota):
                             real_http_failure_count += 1
                         else:
-                            deferred_without_call_count += 1
                             if out.status == ProviderStatus.BUDGET_EXHAUSTED:
                                 budget_exhausted_without_call += 1
-                            elif out.status == ProviderStatus.COOLDOWN_DEFERRED:
+                            elif out.status == ProviderStatus.COOLDOWN_DEFERRED or timed_quota:
                                 cooldown_deferred_without_call += 1
-                    elif is_hard:
+                    if is_hard:
                         hard_blocked_incomplete_count += 1
                         _collect_wait(out)
-                        if not out.request_made and not out.from_cache:
+                        if not out.request_made and not out.from_cache and not timed_quota:
                             hard_blocked_without_call += 1
             else:
                 active_calls = [
@@ -445,13 +461,15 @@ def execute_research_batch(
 
                     configured_providers += 1
 
-                    # Reuse already-completed provider outcome at the exact same content version
+                    # Reuse already-completed provider outcome ONLY when version AND exact (artist, title) match
                     prev_entry = prior_audit.get(p_name)
                     if (
                         not force_refresh
                         and isinstance(prev_entry, dict)
                         and prev_entry.get("lookup_completed") is True
                         and str(prev_entry.get("status") or "") in ("ok", "empty")
+                        and prev_entry.get("query_artist") == artist
+                        and prev_entry.get("query_title") == title
                     ):
                         skipped_already_done_same_version += 1
                         clean_catalogue_responses += 1
@@ -494,6 +512,7 @@ def execute_research_batch(
                     ):
                         alt_cands, alt_out = call_fn(p_inst, alt_artist, alt_title)
                         _record_issue(alt_out)
+                        alt_timed_q = _is_timed_quota_outcome(alt_out)
                         alt_audit = {
                             "orientation": "swapped",
                             "status": alt_out.status.value,
@@ -503,7 +522,7 @@ def execute_research_batch(
                             "from_cache": alt_out.from_cache,
                             "request_made": alt_out.request_made,
                             "lookup_completed": alt_out.status in (ProviderStatus.OK, ProviderStatus.EMPTY),
-                            "retryable": alt_out.status in _RETRYABLE_OUTCOME_STATUSES,
+                            "retryable": (alt_out.status in _RETRYABLE_OUTCOME_STATUSES) or alt_timed_q,
                             "retry_until_utc": getattr(alt_out, "retry_until_utc", ""),
                         }
                         if alt_cands:
@@ -521,8 +540,13 @@ def execute_research_batch(
                     track_cache_hits += d_cache
 
                     is_clean = effective_out.status in (ProviderStatus.OK, ProviderStatus.EMPTY)
-                    is_retry = effective_out.status in _RETRYABLE_OUTCOME_STATUSES
+                    timed_quota = _is_timed_quota_outcome(effective_out)
+                    is_retry = (effective_out.status in _RETRYABLE_OUTCOME_STATUSES) or timed_quota
                     is_hard = effective_out.status in _HARD_BLOCKED_OUTCOME_STATUSES
+
+                    # Always retain any fetched partial candidates even when a detail sub-request hit 429/cooldown/cap!
+                    if effective_cands:
+                        track_candidates.extend(effective_cands)
 
                     provider_audit[p_name] = {
                         "status": effective_out.status.value,
@@ -537,38 +561,38 @@ def execute_research_batch(
                         "lookup_completed": is_clean,
                         "retryable": is_retry,
                         "retry_until_utc": getattr(effective_out, "retry_until_utc", ""),
+                        "query_artist": artist,
+                        "query_title": title,
                         "primary_query": prim_audit,
                         "alternate_query": alt_audit,
                     }
 
                     if is_clean:
                         clean_catalogue_responses += 1
-                        track_candidates.extend(effective_cands)
-                    elif is_retry:
+                    if is_retry:
                         retryable_incomplete_count += 1
                         _collect_wait(effective_out)
                         if (
-                            (prim_out.request_made and prim_out.status in _REAL_TRANSIENT_HTTP_FAILURE_STATUSES)
+                            (prim_out.request_made and (prim_out.status in _REAL_TRANSIENT_HTTP_FAILURE_STATUSES or _is_timed_quota_outcome(prim_out)))
                             or (
                                 alt_audit is not None
                                 and alt_audit.get("request_made")
-                                and effective_out.status in _REAL_TRANSIENT_HTTP_FAILURE_STATUSES
+                                and (effective_out.status in _REAL_TRANSIENT_HTTP_FAILURE_STATUSES or timed_quota)
                             )
                         ):
                             real_http_failure_count += 1
                         else:
-                            deferred_without_call_count += 1
                             if effective_out.status == ProviderStatus.BUDGET_EXHAUSTED:
                                 budget_exhausted_without_call += 1
-                            elif effective_out.status == ProviderStatus.COOLDOWN_DEFERRED:
+                            elif effective_out.status == ProviderStatus.COOLDOWN_DEFERRED or timed_quota:
                                 cooldown_deferred_without_call += 1
-                    elif is_hard:
+                    if is_hard:
                         hard_blocked_incomplete_count += 1
                         _collect_wait(effective_out)
-                        if d_calls == 0 and d_cache == 0:
+                        if d_calls == 0 and d_cache == 0 and not timed_quota:
                             hard_blocked_without_call += 1
 
-            # Check if ZERO needed providers could execute any HTTP or cached lookup for this track
+            # Check if ZERO needed providers for THIS track could execute any HTTP or cached lookup
             needed_providers = configured_providers - skipped_already_done_same_version
             unattempted_unavailable = (
                 budget_exhausted_without_call + cooldown_deferred_without_call + hard_blocked_without_call
@@ -580,24 +604,32 @@ def execute_research_batch(
                 and track_cache_hits == 0
             ):
                 summary.deferred_without_attempt += 1
-                if budget_exhausted_without_call > 0:
-                    summary.paused_provider_budget = True
-                if cooldown_deferred_without_call > 0:
-                    summary.paused_provider_cooldown = True
-                summary.paused_all_providers_unavailable = True
                 if retry_deadlines_utc:
                     earliest_cd = min(retry_deadlines_utc)
                     if not summary.next_retry_utc or earliest_cd < summary.next_retry_utc:
                         summary.next_retry_utc = earliest_cd
-                    # Persist retry deadline ONLY when cooldown applies (do NOT alter pending tracks on pure budget cap)
+                    # Persist retry deadline whenever a timed cooldown or timed quota applies
+                    db.record_research_deferral(
+                        file_id=t.file_id,
+                        retry_until_utc=earliest_cd,
+                        reason="Deferred: needed provider(s) cooling down (attempts preserved)",
+                        now_utc=track_now_utc,
+                    )
+
+                any_healthy_provider = (
+                    (mb is not None and mb.can_request())
+                    if title_only_mode
+                    else any(p is not None and p.can_request() for p in (sono, am, dc, mb))
+                )
+                if not any_healthy_provider:
+                    if budget_exhausted_without_call > 0:
+                        summary.paused_provider_budget = True
                     if cooldown_deferred_without_call > 0:
-                        db.record_research_deferral(
-                            file_id=t.file_id,
-                            retry_until_utc=earliest_cd,
-                            reason="Deferred: all eligible providers cooling down (attempts preserved)",
-                            now_utc=track_now_utc,
-                        )
-                break
+                        summary.paused_provider_cooldown = True
+                    summary.paused_all_providers_unavailable = True
+                    break
+                # At least one configured provider is still healthy for subsequent tracks in queue -> continue!
+                continue
 
             if not title_only_mode:
                 verified_candidates: List[Candidate] = []
@@ -625,8 +657,6 @@ def execute_research_batch(
                 ]
                 has_good_genre = _has_verified_catalogue_genre(existing_active + track_candidates)
 
-                # Wikidata inferred fallback ONLY when at least one catalogue provider responded cleanly in this pass
-                # and no verified catalogue genre exists yet
                 if (
                     enable_wikidata_fallback
                     and wiki is not None
@@ -698,13 +728,10 @@ def execute_research_batch(
             target_retry_utc = ""
             if has_retryable:
                 if retry_waits_sec:
-                    # Earliest server-communicated wait among retryable providers (honoring multi-hour waits in full!)
                     retry_delay_s = min(retry_waits_sec)
                 elif real_http_failure_count > 0:
-                    # Default exponential backoff when server gave no Retry-After header
                     retry_delay_s = min(3600.0, max(60.0, 120.0 * (2 ** t.research_attempts)))
                 else:
-                    # Pure per-run request-cap deferral on a mixed track: eligible on next run without artificial wait
                     retry_delay_s = 0.0
 
                 if retry_deadlines_utc:
@@ -719,46 +746,62 @@ def execute_research_batch(
             consume_attempt = bool(
                 lookup_complete
                 or real_http_failure_count > 0
-                or (has_hard_block and track_actual_calls > 0)
+                or (has_hard_block and not has_retryable)
             )
             increment_deferral = bool(has_retryable and not consume_attempt)
 
-            # Determine honest checkpoint status
+            # Determine honest checkpoint status (never downgrading verified recordings or busy-looping untimed hard blocks)
             if has_retryable:
                 is_incomplete = True
+                summary.incomplete_tracks += 1
                 if clean_catalogue_responses == 0 and not track_candidates:
-                    # All attempted providers failed/deferred in this pass -> retryable_failure (preserves prior candidates!)
                     next_status = "retryable_failure"
                     err_text = "Transient provider rate-limit/outage; prior evidence preserved"
                     summary.failed_retryable += 1
                 elif not has_any_cands:
-                    # One provider returned empty while another was rate-limited/deferred -> NEVER mark no_match!
                     next_status = "retryable_failure"
                     err_text = "Incomplete lookup (empty + retryable provider); scheduled for retry"
                     summary.failed_retryable += 1
+                elif has_rec_verified:
+                    next_status = "success"
+                    err_text = "Verified recording retained; remaining retryable provider(s) scheduled for retry"
+                    summary.matched_verified += 1
+                    if has_ver_genre:
+                        summary.matched_verified_with_genre += 1
+                    else:
+                        summary.matched_verified_no_genre += 1
                 else:
-                    # Partial/verified candidates gathered while >=1 provider remains retryable -> retain & retry!
                     next_status = "partial"
                     err_text = "Incomplete lookup (partial evidence retained; remaining provider(s) scheduled for retry)"
                     summary.matched_review_only += 1
-                summary.incomplete_tracks += 1
             elif has_hard_block and not lookup_complete:
-                is_incomplete = True
                 summary.incomplete_tracks += 1
                 if has_any_cands:
-                    next_status = "partial"
+                    # Untimed hard block (e.g. 401/404) with candidates: do NOT set research_incomplete=True
+                    # (which would busy-loop on every run); flag in _meta so recover-research reports it cleanly!
+                    is_incomplete = False
                     err_text = "Incomplete lookup: one or more providers blocked by auth/quota/endpoint error"
-                    summary.matched_review_only += 1
+                    if has_rec_verified:
+                        next_status = "success"
+                        summary.matched_verified += 1
+                        if has_ver_genre:
+                            summary.matched_verified_with_genre += 1
+                        else:
+                            summary.matched_verified_no_genre += 1
+                    else:
+                        next_status = "partial"
+                        summary.matched_review_only += 1
                 else:
-                    # Never treat blocked providers as definitive no_match!
+                    # Never treat blocked providers as definitive no_match; 'unresolved' is excluded from busy-retry!
+                    is_incomplete = True
                     next_status = "unresolved"
                     err_text = "Blocked provider(s) prevented complete lookup; not a definitive no_match"
                     summary.unresolved_blocked += 1
             else:
                 is_incomplete = False
-                summary.completed_tracks += 1
                 err_text = ""
                 if has_rec_verified:
+                    summary.completed_tracks += 1
                     next_status = "success"
                     summary.matched_verified += 1
                     if has_ver_genre:
@@ -766,19 +809,29 @@ def execute_research_batch(
                     else:
                         summary.matched_verified_no_genre += 1
                 elif has_any_cands:
+                    summary.completed_tracks += 1
                     next_status = "partial"
                     summary.matched_review_only += 1
                 elif clean_catalogue_responses > 0:
+                    summary.completed_tracks += 1
                     next_status = "no_match"
                     summary.no_match += 1
                 else:
-                    next_status = "retryable_failure"
-                    is_incomplete = True
-                    summary.completed_tracks -= 1
-                    summary.incomplete_tracks += 1
-                    summary.failed_retryable += 1
-                    retry_delay_s = 300.0
-                    err_text = "No configured provider could complete lookup"
+                    consume_attempt = True
+                    if configured_providers == 0:
+                        next_status = "unresolved"
+                        is_incomplete = False
+                        summary.unresolved_blocked += 1
+                        err_text = "No metadata providers configured or applicable for this track"
+                    else:
+                        next_status = "retryable_failure"
+                        is_incomplete = True
+                        summary.incomplete_tracks += 1
+                        summary.failed_retryable += 1
+                        retry_delay_s = 300.0
+                        target_retry_utc = (track_now_utc + timedelta(seconds=retry_delay_s)).isoformat()
+                        observed_retry_deadlines.append(target_retry_utc)
+                        err_text = "No configured provider could complete lookup"
 
             provider_audit["_meta"] = {
                 "schema": "v2.0.2",
@@ -790,6 +843,8 @@ def execute_research_batch(
                 "routing_ready_from_catalogue": bool(has_rec_verified and has_ver_genre),
                 "next_retry_utc": target_retry_utc,
                 "attempt_consumed": consume_attempt,
+                "query_artist": artist,
+                "query_title": title,
             }
 
             merged_after = db.update_research_result(

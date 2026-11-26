@@ -1,7 +1,7 @@
 """
-Responsive Interactive Terminal Interface for Music Vault Manager v2.0.1.
-Preserves options 1-6 workflow slots, adds bounded Hydrate, Local Status, and Backup,
-and enforces read-only cloud safety (no live Drive moves or Sheet writes in v2.0.1).
+Responsive Interactive Terminal Interface for Music Vault Manager v2.0.2.
+Preserves options 1-6 workflow slots, adds bounded Hydrate, Local Status, Backup, and Recovery Preview,
+and enforces read-only cloud safety (no live Drive moves or Sheet writes in v2.0.2).
 """
 from .. import __version__
 from ..config import Config
@@ -43,7 +43,7 @@ def main_menu(config: Config, db: Database) -> None:
                 f"{inv['quarantined_records']} quarantined"
             )
             print(f"  Providers: SonoVault:{sono_st} | AudioMeta:{am_st} | Discogs:{dc_st}")
-            print("  Safety:    DRY-RUN ENFORCED (Cloud writes disabled in v2.0.1)")
+            print(f"  Safety:    DRY-RUN ENFORCED (Cloud writes disabled in v{__version__})")
             print("-" * width)
             print("  1. Run 10-Track Control Benchmark (Isolated Fixture)")
             print("  2. Run 50-Track Benchmark Check (Isolated Fixture)")
@@ -95,7 +95,7 @@ def main_menu(config: Config, db: Database) -> None:
                 break
             else:
                 print(
-                    "[!] Invalid option. Enter 0-9 (note: live write/move toggles are unavailable in read-only v2.0.1)."
+                    f"[!] Invalid option. Enter 0-9 or R (note: live write/move toggles are unavailable in read-only v{__version__})."
                 )
         except (KeyboardInterrupt, EOFError):
             print("\n[i] Interrupted cleanly. Checkpoints preserved. Goodbye!\n")

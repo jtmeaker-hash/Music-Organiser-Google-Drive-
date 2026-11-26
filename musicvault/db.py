@@ -30,8 +30,15 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _norm_utc(dt: Optional[datetime] = None) -> datetime:
+    d = dt or _utc_now()
+    if d.tzinfo is None:
+        return d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc)
+
+
 def _utc_iso(dt: Optional[datetime] = None) -> str:
-    return (dt or _utc_now()).isoformat()
+    return _norm_utc(dt).isoformat()
 
 
 def _has_audio_extension(name: str) -> bool:
@@ -384,7 +391,8 @@ class Database:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
@@ -1410,7 +1418,8 @@ class Database:
                 )
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
@@ -1615,19 +1624,33 @@ class Database:
                     ex_c.updated_utc = now_iso
                 continue
 
-            # Equal or stronger authoritative refresh: update while preserving non-blank fields omitted by refresh
+            # Equal or stronger authoritative refresh: update while preserving non-blank fields omitted by refresh,
+            # NEVER carrying over unverified/conflicting fields (ex_rank < 3) onto recording-verified evidence (inc_rank >= 3).
+            can_inherit_prior_fields = not (inc_rank >= 3 and ex_rank < 3)
             merged_provider = inc.provider or ex_c.provider
             merged_title = inc.title or ex_c.title
             merged_artists = list(inc.artists) if inc.artists else list(ex_c.artists or [])
-            merged_dur = inc.duration if inc.duration is not None else ex_c.duration
-            merged_isrc = inc.isrc or ex_c.isrc
-            merged_bpm = inc.bpm if inc.bpm is not None else ex_c.bpm
-            merged_key = inc.key or ex_c.key
-            merged_genres = list(dict.fromkeys((inc.genre or []) + (ex_c.genre or [])))
-            merged_labels = list(dict.fromkeys((inc.labels or []) + (ex_c.labels or [])))
+            merged_dur = inc.duration if inc.duration is not None else (ex_c.duration if can_inherit_prior_fields else None)
+            merged_isrc = inc.isrc or (ex_c.isrc if can_inherit_prior_fields else None)
+            merged_bpm = inc.bpm if inc.bpm is not None else (ex_c.bpm if can_inherit_prior_fields else None)
+            merged_key = inc.key or (ex_c.key if can_inherit_prior_fields else None)
+            if inc_rank > ex_rank:
+                merged_genres = (
+                    list(dict.fromkeys(inc.genre))
+                    if inc.genre
+                    else (list(dict.fromkeys(ex_c.genre or [])) if can_inherit_prior_fields else [])
+                )
+                merged_labels = (
+                    list(dict.fromkeys(inc.labels))
+                    if inc.labels
+                    else (list(dict.fromkeys(ex_c.labels or [])) if can_inherit_prior_fields else [])
+                )
+            else:
+                merged_genres = list(dict.fromkeys((inc.genre or []) + (ex_c.genre or [])))
+                merged_labels = list(dict.fromkeys((inc.labels or []) + (ex_c.labels or [])))
             merged_url = inc.url or ex_c.url
             merged_verif = inc.verification if inc_rank >= ex_rank else ex_c.verification
-            merged_mconf = inc.match_confidence or ex_c.match_confidence
+            merged_mconf = inc.match_confidence or (ex_c.match_confidence if can_inherit_prior_fields else "")
 
             conn.execute(
                 """
@@ -1700,9 +1723,7 @@ class Database:
         merged candidates. Never shortens server-required retry waits and never consumes track attempts
         for pure cooldown/budget deferrals.
         """
-        now_dt = now_utc or _utc_now()
-        if now_dt.tzinfo is None:
-            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        now_dt = _norm_utc(now_utc)
         now = _utc_iso(now_dt)
 
         computed_retry_dt: Optional[datetime] = None
@@ -1710,9 +1731,7 @@ class Database:
             computed_retry_dt = now_dt + timedelta(seconds=float(retry_delay_seconds))
         if retry_until_utc and retry_until_utc.strip():
             try:
-                parsed_ru = datetime.fromisoformat(retry_until_utc.strip().replace("Z", "+00:00"))
-                if parsed_ru.tzinfo is None:
-                    parsed_ru = parsed_ru.replace(tzinfo=timezone.utc)
+                parsed_ru = _norm_utc(datetime.fromisoformat(retry_until_utc.strip().replace("Z", "+00:00")))
                 if computed_retry_dt is None or parsed_ru > computed_retry_dt:
                     computed_retry_dt = parsed_ru
             except ValueError:
@@ -1727,7 +1746,8 @@ class Database:
                 (file_id,),
             ).fetchone()
             if existing is None:
-                conn.execute("ROLLBACK")
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
                 return []
 
             prev_attempts = int(existing["research_attempts"] or 0)
@@ -1773,7 +1793,8 @@ class Database:
             conn.execute("COMMIT")
             return merged_cands
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
@@ -1790,9 +1811,7 @@ class Database:
         Record a pure provider cooldown/budget deferral WITHOUT incrementing research_attempts
         and WITHOUT altering candidates or overwriting stronger existing status.
         """
-        now_dt = now_utc or _utc_now()
-        if now_dt.tzinfo is None:
-            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        now_dt = _norm_utc(now_utc)
         now = _utc_iso(now_dt)
 
         conn = self._get_connection(isolation_level=None)
@@ -1803,7 +1822,8 @@ class Database:
                 (file_id,),
             ).fetchone()
             if row is None:
-                conn.execute("ROLLBACK")
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
                 return
             deferrals = int(row["research_deferrals"] or 0) + 1
             next_r = retry_until_utc or row["research_next_retry_utc"] or ""
@@ -1827,7 +1847,8 @@ class Database:
             )
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
@@ -1940,9 +1961,7 @@ class Database:
         Includes pending tracks, version-changed tracks, due retryable_failure tracks, and
         incomplete tracks (research_incomplete=1) whose retry deadline has arrived.
         """
-        now_dt = now_utc or _utc_now()
-        if now_dt.tzinfo is None:
-            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        now_dt = _norm_utc(now_utc)
         now = _utc_iso(now_dt)
         with self._get_connection() as conn:
             if include_title_only:
@@ -2004,9 +2023,7 @@ class Database:
         now_utc: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """Return exact counts of deferred retries, exhausted tracks, blocked tracks, and earliest next_retry_utc."""
-        now_dt = now_utc or _utc_now()
-        if now_dt.tzinfo is None:
-            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        now_dt = _norm_utc(now_utc)
         now = _utc_iso(now_dt)
 
         with self._get_connection() as conn:
@@ -2279,9 +2296,7 @@ class Database:
     ) -> None:
         """Persist minimal operational cooldown/pacing state (never stores restricted API payloads or raw keys)."""
         fam = canonical_provider_family(provider)
-        now_dt = now_utc or _utc_now()
-        if now_dt.tzinfo is None:
-            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        now_dt = _norm_utc(now_utc)
         now = _utc_iso(now_dt)
 
         with self._get_connection() as conn:
@@ -2340,9 +2355,7 @@ class Database:
         active_only: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """Inspect persisted provider cooldowns and remaining wait seconds."""
-        now_dt = now_utc or _utc_now()
-        if now_dt.tzinfo is None:
-            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        now_dt = _norm_utc(now_utc)
         out: Dict[str, Dict[str, Any]] = {}
         with self._get_connection() as conn:
             rows = conn.execute("SELECT * FROM provider_operational_state ORDER BY provider ASC").fetchall()
@@ -2352,9 +2365,7 @@ class Database:
             cd_raw = str(d.get("cooldown_until_utc") or "").strip()
             if cd_raw:
                 try:
-                    cd_dt = datetime.fromisoformat(cd_raw.replace("Z", "+00:00"))
-                    if cd_dt.tzinfo is None:
-                        cd_dt = cd_dt.replace(tzinfo=timezone.utc)
+                    cd_dt = _norm_utc(datetime.fromisoformat(cd_raw.replace("Z", "+00:00")))
                     rem = max(0.0, (cd_dt - now_dt).total_seconds())
                 except ValueError:
                     rem = 0.0
@@ -2372,9 +2383,7 @@ class Database:
         now_utc: Optional[datetime] = None,
     ) -> Optional[Any]:
         """Retrieve cached provider response only if within UTC TTL window."""
-        ref_now = now_utc or _utc_now()
-        if ref_now.tzinfo is None:
-            ref_now = ref_now.replace(tzinfo=timezone.utc)
+        ref_now = _norm_utc(now_utc)
         with self._get_connection() as conn:
             row = conn.execute(
                 "SELECT response_json, created_utc, ttl_seconds FROM provider_cache WHERE provider = ? AND cache_key = ?",
@@ -2407,9 +2416,7 @@ class Database:
         """Cache provider response with UTC timestamp and explicit TTL."""
         if ttl_seconds <= 0:
             return
-        ref_now = now_utc or _utc_now()
-        if ref_now.tzinfo is None:
-            ref_now = ref_now.replace(tzinfo=timezone.utc)
+        ref_now = _norm_utc(now_utc)
         now = _utc_iso(ref_now)
         with self._get_connection() as conn:
             conn.execute(
@@ -2441,9 +2448,7 @@ class Database:
         - Requires a verified SQLite backup (--create-backup or --backup-file) when apply=True.
         - Respects active provider cooldowns and is strictly idempotent.
         """
-        now_dt = now_utc or _utc_now()
-        if now_dt.tzinfo is None:
-            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        now_dt = _norm_utc(now_utc)
         now_iso = _utc_iso(now_dt)
         cfg_families = {canonical_provider_family(p) for p in (configured_providers or set()) if p}
 
@@ -2657,7 +2662,11 @@ class Database:
 
             has_v202_meta = isinstance(parsed_audit.get("_meta"), dict)
             id_conf = str(row["identity_confidence"] or "")
-            if not has_v202_meta and id_conf == "filename_ambiguous" and r_status == "no_match":
+            if (
+                not has_v202_meta
+                and id_conf == "filename_ambiguous"
+                and (r_status == "no_match" or (r_status == "partial" and fid not in verified_ids))
+            ):
                 amb_reason = "ambiguous_v201_unrecorded_alt_orientation"
                 counts["ambiguous_total"] += 1
                 ambiguous_reasons[amb_reason] = ambiguous_reasons.get(amb_reason, 0) + 1

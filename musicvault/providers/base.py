@@ -156,13 +156,20 @@ def parse_provider_reset_wait(
     ref_now = now_utc or _default_utc_now()
     if ref_now.tzinfo is None:
         ref_now = ref_now.replace(tzinfo=timezone.utc)
+    else:
+        ref_now = ref_now.astimezone(timezone.utc)
     now_epoch = ref_now.timestamp()
+
+    positive_waits: list[float] = []
+    explicit_zero = False
 
     retry_hdr = _get_header_ci(headers, "Retry-After")
     if retry_hdr is not None and retry_hdr.strip():
         ra = parse_retry_after(retry_hdr, max_cap=None, now_utc=ref_now)
-        if ra > 0.0 or retry_hdr.strip() == "0":
-            return ra
+        if ra > 0.0:
+            positive_waits.append(ra)
+        elif retry_hdr.strip() == "0":
+            explicit_zero = True
 
     x_reset = _get_header_ci(headers, "X-RateLimit-Reset")
     if x_reset is not None and x_reset.strip():
@@ -170,15 +177,21 @@ def parse_provider_reset_wait(
         try:
             val_x = float(raw_x)
             if val_x >= _EPOCH_MILLIS_THRESHOLD:
-                return max(0.0, (val_x / 1000.0) - now_epoch)
-            if source_family == "musicbrainz" or val_x >= _EPOCH_SECONDS_THRESHOLD:
-                return max(0.0, val_x - now_epoch)
-            if val_x >= 0.0:
-                return val_x
+                wx = max(0.0, (val_x / 1000.0) - now_epoch)
+            elif source_family == "musicbrainz" or val_x >= _EPOCH_SECONDS_THRESHOLD:
+                wx = max(0.0, val_x - now_epoch)
+            elif val_x >= 0.0:
+                wx = val_x
+            else:
+                wx = 0.0
+            if wx > 0.0:
+                positive_waits.append(wx)
+            elif raw_x == "0":
+                explicit_zero = True
         except ValueError:
             ra_x = parse_retry_after(raw_x, max_cap=None, now_utc=ref_now)
             if ra_x > 0.0:
-                return ra_x
+                positive_waits.append(ra_x)
 
     ietf_reset = _get_header_ci(headers, "RateLimit-Reset")
     if ietf_reset is not None and ietf_reset.strip():
@@ -186,21 +199,32 @@ def parse_provider_reset_wait(
         try:
             val_r = float(raw_r)
             if val_r >= _EPOCH_MILLIS_THRESHOLD:
-                return max(0.0, (val_r / 1000.0) - now_epoch)
-            if val_r >= _EPOCH_SECONDS_THRESHOLD:
-                return max(0.0, val_r - now_epoch)
-            if val_r >= 0.0:
-                return val_r
+                wr = max(0.0, (val_r / 1000.0) - now_epoch)
+            elif val_r >= _EPOCH_SECONDS_THRESHOLD:
+                wr = max(0.0, val_r - now_epoch)
+            elif val_r >= 0.0:
+                wr = val_r
+            else:
+                wr = 0.0
+            if wr > 0.0:
+                positive_waits.append(wr)
+            elif raw_r == "0":
+                explicit_zero = True
         except ValueError:
             ra_r = parse_retry_after(raw_r, max_cap=None, now_utc=ref_now)
             if ra_r > 0.0:
-                return ra_r
+                positive_waits.append(ra_r)
 
     if source_family == "discogs":
         dc_rem = _get_header_ci(headers, "X-Discogs-Ratelimit-Remaining")
         if dc_rem is not None and dc_rem.strip().isdigit() and int(dc_rem.strip()) == 0:
-            return 60.0
+            positive_waits.append(60.0)
 
+    if positive_waits:
+        # Never let Retry-After: 0 or a shorter header mask a longer server-required reset window
+        return max(positive_waits)
+    if explicit_zero:
+        return 0.0
     return None
 
 
@@ -624,16 +648,42 @@ class BaseProvider:
         self.retry_sleep_used += delay
         return True
 
+    def _effective_pacing_delay(self) -> float:
+        min_req = float(getattr(self, "MIN_REQUIRED_DELAY_SECONDS", 0.0) or 0.0)
+        return max(0.0, float(self.default_delay), min_req)
+
     def _enforce_pacing_before_request(self) -> None:
-        if self.default_delay > 0.0:
+        eff_delay = self._effective_pacing_delay()
+        if eff_delay > 0.0:
+            if self.db is not None and hasattr(self.db, "get_provider_operational_state"):
+                try:
+                    st = self.db.get_provider_operational_state(self.source_family)
+                    lr_raw = str((st or {}).get("last_request_utc") or "").strip()
+                    if lr_raw:
+                        lr_dt = datetime.fromisoformat(lr_raw.replace("Z", "+00:00"))
+                        lr_dt = lr_dt.replace(tzinfo=timezone.utc) if lr_dt.tzinfo is None else lr_dt.astimezone(timezone.utc)
+                        elapsed = (self._now_utc_normalized() - lr_dt).total_seconds()
+                        if 0.0 <= elapsed < eff_delay:
+                            self._next_pacing_mono = max(
+                                self._next_pacing_mono,
+                                self._clock_mono() + (eff_delay - elapsed),
+                            )
+                except Exception:
+                    pass
             now_m = self._clock_mono()
             wait_p = self._next_pacing_mono - now_m
             if wait_p > 0.0:
                 self._sleep_fn(wait_p)
             req_start_m = self._clock_mono()
-            self._next_pacing_mono = req_start_m + self.default_delay
+            self._next_pacing_mono = req_start_m + eff_delay
         req_utc = self._now_utc_normalized().isoformat()
         self._persist_operational_state(last_request_utc=req_utc)
+
+    def _record_pacing_after_request(self) -> None:
+        eff_delay = self._effective_pacing_delay()
+        if eff_delay > 0.0:
+            self._next_pacing_mono = max(self._next_pacing_mono, self._clock_mono() + eff_delay)
+        self._persist_operational_state(last_request_utc=self._now_utc_normalized().isoformat())
 
     def _precheck_unavailable(self) -> Optional[ProviderCallOutcome]:
         if self.hard_blocked:
@@ -734,7 +784,10 @@ class BaseProvider:
             self.stats["calls"] += 1
 
             try:
-                resp = self.session.get(url, params=params, headers=merged_headers, timeout=timeout)
+                try:
+                    resp = self.session.get(url, params=params, headers=merged_headers, timeout=timeout)
+                finally:
+                    self._record_pacing_after_request()
                 code = resp.status_code
                 resp_headers = resp.headers or {}
                 now_utc = self._now_utc_normalized()
@@ -775,7 +828,7 @@ class BaseProvider:
                     self.last_outcome = outcome
                     return outcome
 
-                if code in (404, 405, 410):
+                if code in (404, 405, 410, 501):
                     self.hard_blocked = True
                     self.hard_block_status = ProviderStatus.UNSUPPORTED_ENDPOINT
                     self.hard_block_kind = "unsupported_endpoint"
@@ -875,7 +928,7 @@ class BaseProvider:
                     self.last_outcome = outcome
                     return outcome
 
-                if code in (500, 502, 503, 504):
+                if 500 <= code < 600:
                     self.stats["server_errors"] += 1
                     backoff = max(server_wait or 0.0, 2.0 * (2 ** attempt))
                     if attempt < 2 and self.request_count < self.max_requests and self._sleep_bounded(backoff):
@@ -952,11 +1005,23 @@ class BaseProvider:
                     self.last_outcome = outcome
                     return outcome
 
+                unexp_wait = server_wait if (server_wait is not None and server_wait > 0.0) else 0.0
+                cd_unexp = ""
+                if unexp_wait > 0.0:
+                    cd_unexp = self._set_cooldown(
+                        unexp_wait,
+                        status=ProviderStatus.SERVER_ERROR.value,
+                        http_status=code,
+                        error_kind="unexpected_http_status",
+                        reason=f"HTTP {code}",
+                    )
                 outcome = ProviderCallOutcome(
                     provider=self.name,
                     status=ProviderStatus.SERVER_ERROR,
                     http_status=code,
                     error=f"HTTP {code}",
+                    retry_after_seconds=unexp_wait,
+                    retry_until_utc=cd_unexp,
                     error_kind="unexpected_http_status",
                     request_made=True,
                 )

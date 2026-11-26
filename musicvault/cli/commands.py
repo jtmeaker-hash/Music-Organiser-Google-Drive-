@@ -1,8 +1,8 @@
 """
-Command implementations for Music Vault Manager v2.0.1 (Read-Only Corrective Build).
+Command implementations for Music Vault Manager v2.0.2 (Read-Only Research Reliability Hotfix).
 Implements local status diagnostics, verified DB backups, transactional inventory scanning,
-bandwidth-bounded audio hydration, resumable online research, real read-only Sheets/Drive preview,
-and isolated offline benchmarks.
+bandwidth-bounded audio hydration, resumable online research, selective dry-run-first recovery,
+real read-only Sheets/Drive preview, and isolated offline benchmarks.
 """
 import logging
 import time
@@ -438,6 +438,30 @@ def run_research(
 
     secrets = config.known_secrets()
 
+    def _write_research_exports() -> None:
+        if export_json:
+            export_safe_json(export_json, summary.__dict__, secrets)
+            print(f"[✓] Exported research JSON summary to {export_json}")
+        if export_csv:
+            rows_out = [
+                {
+                    "file_id": short_file_id(t.file_id, verbose=verbose),
+                    "name": t.name,
+                    "artist": t.metadata.artist,
+                    "title": t.metadata.title,
+                    "research_status": t.research_status,
+                    "research_incomplete": t.research_incomplete,
+                    "attempts": t.research_attempts,
+                    "deferrals": t.research_deferrals,
+                    "next_retry_utc": t.research_next_retry_utc,
+                    "candidates_count": len(db.get_candidates(t.file_id)),
+                }
+                for t in db.get_all_tracks(live_only=True)
+            ]
+            if rows_out:
+                export_safe_csv(export_csv, list(rows_out[0].keys()), rows_out, secrets)
+                print(f"[✓] Exported research CSV report to {export_csv}")
+
     if summary.attempted == 0:
         if summary.paused_all_providers_unavailable:
             stop_reasons = []
@@ -460,9 +484,7 @@ def run_research(
         for issue in summary.actionable_issues:
             print(f"  [!] Provider issue: {config.redact(issue)}")
         print()
-        if export_json:
-            export_safe_json(export_json, summary.__dict__, secrets)
-            print(f"[✓] Exported research JSON summary to {export_json}")
+        _write_research_exports()
         return summary
 
     print(
@@ -516,28 +538,7 @@ def run_research(
         print("  [!] Interrupted by user (Ctrl+C). Completed per-track checkpoints saved.")
     print()
 
-    if export_json:
-        export_safe_json(export_json, summary.__dict__, secrets)
-        print(f"[✓] Exported research JSON summary to {export_json}")
-    if export_csv:
-        rows_out = [
-            {
-                "file_id": short_file_id(t.file_id, verbose=verbose),
-                "name": t.name,
-                "artist": t.metadata.artist,
-                "title": t.metadata.title,
-                "research_status": t.research_status,
-                "research_incomplete": t.research_incomplete,
-                "attempts": t.research_attempts,
-                "deferrals": t.research_deferrals,
-                "next_retry_utc": t.research_next_retry_utc,
-                "candidates_count": len(db.get_candidates(t.file_id)),
-            }
-            for t in db.get_all_tracks(live_only=True)
-        ]
-        if rows_out:
-            export_safe_csv(export_csv, list(rows_out[0].keys()), rows_out, secrets)
-            print(f"[✓] Exported research CSV report to {export_csv}")
+    _write_research_exports()
 
     return summary
 
@@ -796,7 +797,7 @@ def run_preview(
     print(
         f"Eligible: {preview.eligible_count} (provisional: {preview.provisional_count}) | "
         f"Move-Authorized: {preview.authorized_count} | Executable: {preview.executable_count} | "
-        "FORCED_DRY_RUN: True (zero Drive/Sheet writes in v2.0.1)\n"
+        f"FORCED_DRY_RUN: True (zero Drive/Sheet writes in v{__version__})\n"
     )
 
     secrets = config.known_secrets()
