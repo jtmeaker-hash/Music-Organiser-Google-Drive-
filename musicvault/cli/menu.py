@@ -12,6 +12,7 @@ from .commands import (
     run_benchmark,
     run_hydrate,
     run_preview,
+    run_recover_research,
     run_research,
     run_scan,
     run_status,
@@ -53,10 +54,11 @@ def main_menu(config: Config, db: Database) -> None:
             print("  7. Hydrate Audio Metadata Tags (Bounded 10 / 32 MiB)")
             print("  8. View Local Status & Diagnostics (No Network)")
             print("  9. Create Verified SQLite Database Backup")
+            print("  R. Preview Selective Research Recovery (Dry-Run)")
             print("  0. Exit")
             print("=" * width)
 
-            choice = input("Select an option [0-9]: ").strip().lower()
+            choice = input("Select an option [0-9, R]: ").strip().lower()
 
             if choice == "1":
                 run_benchmark(config, db, sample_size=10)
@@ -84,6 +86,9 @@ def main_menu(config: Config, db: Database) -> None:
                 input("\nPress ENTER to return to menu...")
             elif choice in ("9", "b", "backup"):
                 run_backup(config, db, label="menu_manual")
+                input("\nPress ENTER to return to menu...")
+            elif choice in ("r", "recover", "recover-research"):
+                run_recover_research(config, db, apply=False)
                 input("\nPress ENTER to return to menu...")
             elif choice in ("0", "q", "exit"):
                 print("\nExiting Music Vault Manager. Goodbye!\n")

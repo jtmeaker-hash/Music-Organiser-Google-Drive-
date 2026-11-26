@@ -47,9 +47,15 @@ def run_status(
     db_ok, db_msg = db.verify_integrity()
     inv = db.get_inventory_summary()
 
+    inv_for_report = dict(inv)
+    if isinstance(inv_for_report.get("last_scan"), dict):
+        ls_copy = dict(inv_for_report["last_scan"])
+        ls_copy["source_folder_id"] = short_file_id(ls_copy.get("source_folder_id", ""), verbose=verbose)
+        inv_for_report["last_scan"] = ls_copy
+
     report: Dict[str, Any] = {
         "version": __version__,
-        "build_mode": "v2.0.1_read_only_corrective",
+        "build_mode": "v2.0.2_read_only_research_hotfix",
         "environment": {
             "runtime": env_info.runtime,
             "distro": env_info.distro_name,
@@ -76,7 +82,7 @@ def run_status(
         "database": {
             "integrity_ok": db_ok,
             "integrity_detail": db_msg,
-            **inv,
+            **inv_for_report,
         },
     }
 
@@ -101,7 +107,16 @@ def run_status(
     print(f"    Stale files:  {inv['stale_live_tracks']} | Unresolved conflicts: {inv['unresolved_conflicts']}")
     print(f"  Hydration:      {inv['hydration_status_counts'] or {'none': 0}}")
     print(f"  Bytes read:     {format_mib(inv['total_hydration_bytes'])}")
-    print(f"  Research:       {inv['research_status_counts'] or {'none': 0}} (eligible pending: {inv['eligible_for_research']})")
+    print(
+        f"  Research:       {inv['research_status_counts'] or {'none': 0}} "
+        f"(eligible: {inv['eligible_for_research']}, incomplete: {inv.get('incomplete_research_tracks', 0)})"
+    )
+    if inv.get("active_provider_cooldowns"):
+        cd_parts = [
+            f"{p}:{info.get('remaining_cooldown_seconds', 0)}s"
+            for p, info in inv["active_provider_cooldowns"].items()
+        ]
+        print(f"  Cooldowns:      {', '.join(cd_parts)}")
     if inv.get("last_scan"):
         ls = inv["last_scan"]
         src_disp = short_file_id(ls.get("source_folder_id", ""), verbose=verbose)
@@ -412,36 +427,95 @@ def run_research(
         f"(quarantined excluded: {summary.quarantined_excluded}, stale excluded: {summary.stale_excluded})"
     )
     print(
-        f"  Identity readiness:    already researched={summary.already_completed} | "
-        f"deferred missing identity={summary.deferred_missing_identity} | "
-        f"deferred title-only={summary.deferred_title_only}"
+        f"  Identity & queue:      researched_complete={summary.already_completed} | "
+        f"deferred_retry={summary.deferred_retry_not_due} | "
+        f"exhausted_cap={summary.exhausted_retry_limit}"
+    )
+    print(
+        f"                         missing_identity={summary.deferred_missing_identity} | "
+        f"title_only={summary.deferred_title_only}"
     )
 
+    secrets = config.known_secrets()
+
     if summary.attempted == 0:
-        print(f"  [!] NO WORK PERFORMED: {summary.no_work_reason}\n")
+        if summary.paused_all_providers_unavailable:
+            stop_reasons = []
+            if summary.paused_provider_cooldown:
+                stop_reasons.append("provider cooldown active")
+            if summary.paused_provider_budget:
+                stop_reasons.append("run request budget reached")
+            reason_str = ", ".join(stop_reasons) or "all configured providers unavailable"
+            print(
+                f"  [!] PAUSED ({reason_str}): 0 tracks consumed attempts "
+                f"(deferred without penalty={summary.deferred_without_attempt})."
+            )
+            if summary.next_retry_utc:
+                print(f"  [i] Next retry window: {summary.next_retry_utc}")
+        else:
+            print(f"  [!] NO WORK PERFORMED: {config.redact(summary.no_work_reason)}")
+        if summary.provider_cooldowns:
+            for p_name, cd_utc in sorted(summary.provider_cooldowns.items()):
+                print(f"  [cooldown] {p_name}: until {cd_utc}")
+        for issue in summary.actionable_issues:
+            print(f"  [!] Provider issue: {config.redact(issue)}")
+        print()
+        if export_json:
+            export_safe_json(export_json, summary.__dict__, secrets)
+            print(f"[✓] Exported research JSON summary to {export_json}")
         return summary
 
-    print(f"  Attempted this batch:  {summary.attempted} (limit={limit})")
-    print(f"  Recording-verified:    {summary.matched_verified}")
-    print(f"  Review-only matches:   {summary.matched_review_only}")
-    print(f"  Empty / no match:      {summary.no_match}")
+    print(
+        f"  Attempted this batch:  {summary.attempted} (limit={limit}; "
+        f"completed={summary.completed_tracks}, incomplete_retained={summary.incomplete_tracks})"
+    )
+    print(
+        f"  Recording-verified:    {summary.matched_verified} "
+        f"(with_genre={summary.matched_verified_with_genre}, identity_only_no_genre={summary.matched_verified_no_genre})"
+    )
+    print(f"  Review-only / partial: {summary.matched_review_only}")
+    print(f"  Definitive no match:   {summary.no_match}")
     print(f"  Retryable failures:    {summary.failed_retryable}")
+    if summary.unresolved_blocked:
+        print(f"  Blocked / unresolved:  {summary.unresolved_blocked}")
+    print(
+        f"  Traffic diagnostics:   actual_http_requests={summary.total_actual_http_requests} | "
+        f"cache_hits={summary.total_cache_hits}"
+    )
+
     if summary.provider_telemetry:
-        print("  Provider calls:")
+        print("  Provider telemetry:")
         for p_name, stats in summary.provider_telemetry.items():
-            if stats.get("calls", 0) or stats.get("cache_hits", 0):
+            skipped_tot = (
+                stats.get("skipped_cooldown", 0)
+                + stats.get("skipped_budget", 0)
+                + stats.get("skipped_blocked", 0)
+            )
+            if stats.get("calls", 0) or stats.get("cache_hits", 0) or skipped_tot:
                 print(
                     f"    - {p_name}: http_calls={stats.get('calls', 0)}, cache_hits={stats.get('cache_hits', 0)}, "
-                    f"ok={stats.get('ok', 0)}, auth_err={stats.get('auth_errors', 0)}, "
-                    f"rate_lim={stats.get('rate_limited', 0)}, err={stats.get('server_errors', 0) + stats.get('network_errors', 0)}"
+                    f"skipped={skipped_tot} (cd={stats.get('skipped_cooldown', 0)}/cap={stats.get('skipped_budget', 0)}/blk={stats.get('skipped_blocked', 0)}), "
+                    f"ok={stats.get('ok', 0)}, rate_lim={stats.get('rate_limited', 0)}, "
+                    f"auth_err={stats.get('auth_errors', 0)}, quota_err={stats.get('quota_exceeded', 0)}, "
+                    f"err={stats.get('server_errors', 0) + stats.get('network_errors', 0) + stats.get('timeouts', 0)}"
                 )
+
+    if summary.provider_cooldowns:
+        print("  Active provider cooldowns:")
+        for p_name, cd_utc in sorted(summary.provider_cooldowns.items()):
+            print(f"    - {p_name}: retry after {cd_utc}")
+    if summary.paused_provider_budget:
+        print("  [!] Stopped early: provider per-run request cap reached (unqueried tracks preserved).")
+    if summary.paused_provider_cooldown:
+        print("  [!] Stopped early: eligible providers entered cooldown (unqueried tracks preserved).")
+    if summary.next_retry_utc and (summary.incomplete_tracks > 0 or summary.paused_provider_cooldown):
+        print(f"  [i] Earliest scheduled retry UTC: {summary.next_retry_utc}")
     for issue in summary.actionable_issues:
         print(f"  [!] Provider issue: {config.redact(issue)}")
     if summary.interrupted:
         print("  [!] Interrupted by user (Ctrl+C). Completed per-track checkpoints saved.")
     print()
 
-    secrets = config.known_secrets()
     if export_json:
         export_safe_json(export_json, summary.__dict__, secrets)
         print(f"[✓] Exported research JSON summary to {export_json}")
@@ -453,7 +527,10 @@ def run_research(
                 "artist": t.metadata.artist,
                 "title": t.metadata.title,
                 "research_status": t.research_status,
+                "research_incomplete": t.research_incomplete,
                 "attempts": t.research_attempts,
+                "deferrals": t.research_deferrals,
+                "next_retry_utc": t.research_next_retry_utc,
                 "candidates_count": len(db.get_candidates(t.file_id)),
             }
             for t in db.get_all_tracks(live_only=True)
@@ -463,6 +540,157 @@ def run_research(
             print(f"[✓] Exported research CSV report to {export_csv}")
 
     return summary
+
+
+def run_recover_research(
+    config: Config,
+    db: Database,
+    apply: bool = False,
+    create_backup: bool = False,
+    backup_file: Optional[Path] = None,
+    verbose: bool = False,
+    wide: bool = False,
+    export_json: Optional[Path] = None,
+    export_csv: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Selective dry-run-first research recovery for live, non-quarantined, current-content tracks
+    stranded by transient/cooldown/budget provider failures.
+    Never runs automatically; requires --apply plus a verified SQLite backup to mutate.
+    """
+    configured_provs = {"musicbrainz"}
+    if config.sonovault_api_key:
+        configured_provs.add("sonovault")
+    if config.audiometa_api_key:
+        configured_provs.add("audiometa")
+    if config.discogs_token:
+        configured_provs.add("discogs")
+
+    try:
+        report = db.inspect_or_apply_research_recovery(
+            configured_providers=configured_provs,
+            apply=apply,
+            verified_backup_path=backup_file,
+            create_backup=create_backup,
+        )
+    except DatabaseMigrationError as exc:
+        err_clean = config.redact(exc)
+        print(f"\n[✗] Selective recovery aborted safely: {err_clean}\n")
+        return {"mode": "error", "error": err_clean}
+
+    counts = report["counts"]
+    mode_banner = (
+        "APPLIED TRANSACTIONALLY" if report["mode"] == "applied" else "DRY-RUN PREVIEW (0 DB mutations)"
+    )
+    print(f"\n=== SELECTIVE RESEARCH RECOVERY — {mode_banner} ===")
+    if report.get("verified_backup"):
+        print(f"  Verified backup:       {report['verified_backup']}")
+    print(f"  Total records checked: {counts['total_records_inspected']}")
+    print(
+        f"  Excluded safely:       quarantined/non-live={counts['excluded_quarantined_or_nonlive']} | "
+        f"permanent_unsupported={counts['excluded_permanent_unsupported']} | "
+        f"stale={counts['excluded_stale_or_version_mismatch']} | "
+        f"missing_identity={counts['excluded_missing_identity']}"
+    )
+    print(f"  Already in queue:      {counts['already_queued_or_recovered']}")
+    print(f"  Cleanly completed:     {counts['clean_completed_no_action']}")
+    print(f"  Recoverable tracks:    {counts['recoverable_total']} (applied={counts['applied_count']})")
+    for r_key, r_cnt in sorted(report["recoverable_reasons"].items()):
+        print(f"    - {r_key}: {r_cnt}")
+
+    print(f"  Ambiguous (NOT reset): {counts['ambiguous_total']}")
+    for a_key, a_cnt in sorted(report["ambiguous_reasons"].items()):
+        print(f"    - {a_key}: {a_cnt}")
+
+    if report["active_provider_cooldowns"]:
+        print("  Active provider cooldowns respected:")
+        for p_fam, p_info in sorted(report["active_provider_cooldowns"].items()):
+            print(f"    - {p_fam}: until {p_info.get('cooldown_until_utc', '')} ({p_info.get('remaining_cooldown_seconds', 0)}s)")
+
+    sample_rows = [
+        {
+            "file_id": short_file_id(it["file_id"], verbose=verbose),
+            "name": it["name"],
+            "prior": f"{it['prior_status']} (att={it['prior_attempts']})",
+            "cands": str(it["preserved_candidates"]),
+            "failed": ",".join(it["failed_providers"]),
+            "reason": it["reason"],
+        }
+        for it in report["recoverable_tracks"][:20]
+    ]
+    if sample_rows:
+        print("\nRecoverable Track Sample (up to 20):")
+        cols = [
+            ("file_id", "File ID", 15 if not verbose else 35),
+            ("name", "Track", 32),
+            ("prior", "Prior State", 18),
+            ("cands", "Cands", 6),
+            ("failed", "Failed Provs", 20),
+            ("reason", "Reason", 34),
+        ]
+        print(render_responsive_records(sample_rows, cols, force_wide=wide))
+
+    if not apply and counts["recoverable_total"] > 0:
+        print(
+            "\n  [i] Dry-run complete. To apply selectively after creating a fresh verified backup:\n"
+            "      musicvault recover-research --apply --create-backup\n"
+        )
+    elif apply:
+        print(f"\n  [✓] Recovery committed ({counts['applied_count']} track(s) re-queued; candidates & hydration preserved).\n")
+    else:
+        print("\n  [i] No demonstrably incomplete tracks require recovery.\n")
+
+    # Mask Drive IDs by default in exported artifacts unless --verbose is explicitly passed
+    masked_report = {
+        **report,
+        "recoverable_tracks": [
+            {**it, "file_id": short_file_id(it["file_id"], verbose=verbose)}
+            for it in report["recoverable_tracks"]
+        ],
+        "ambiguous_tracks": [
+            {**it, "file_id": short_file_id(it["file_id"], verbose=verbose)}
+            for it in report["ambiguous_tracks"]
+        ],
+    }
+    secrets = config.known_secrets()
+    if export_json:
+        export_safe_json(export_json, masked_report, secrets)
+        print(f"[✓] Exported recovery JSON report to {export_json}")
+    if export_csv:
+        csv_items: List[Dict[str, Any]] = []
+        for it in masked_report["recoverable_tracks"]:
+            csv_items.append(
+                {
+                    "category": "recoverable",
+                    "file_id": it["file_id"],
+                    "name": it["name"],
+                    "status": it["prior_status"],
+                    "attempts": it["prior_attempts"],
+                    "preserved_candidates": it["preserved_candidates"],
+                    "providers": ",".join(it["failed_providers"]),
+                    "next_retry_utc": it["next_retry_utc"],
+                    "reason": it["reason"],
+                }
+            )
+        for it in masked_report["ambiguous_tracks"]:
+            csv_items.append(
+                {
+                    "category": "ambiguous_not_reset",
+                    "file_id": it["file_id"],
+                    "name": it["name"],
+                    "status": it["research_status"],
+                    "attempts": it["attempts"],
+                    "preserved_candidates": "",
+                    "providers": ",".join(it.get("blocked_providers") or it.get("unqueried_configured_providers") or []),
+                    "next_retry_utc": "",
+                    "reason": it["reason"],
+                }
+            )
+        if csv_items:
+            export_safe_csv(export_csv, list(csv_items[0].keys()), csv_items, secrets)
+            print(f"[✓] Exported recovery CSV report to {export_csv}")
+
+    return masked_report
 
 
 def run_preview(
@@ -575,7 +803,13 @@ def run_preview(
     if export_json:
         payload = {
             "summary": {k: v for k, v in preview.__dict__.items() if k != "rows"},
-            "rows": [r.__dict__ for r in preview.rows],
+            "rows": [
+                {
+                    **r.__dict__,
+                    "file_id": r.file_id if verbose else short_file_id(r.file_id, verbose=False),
+                }
+                for r in preview.rows
+            ],
         }
         export_safe_json(export_json, payload, secrets)
         print(f"[✓] Exported live preview JSON report to {export_json}")

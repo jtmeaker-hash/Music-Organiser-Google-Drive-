@@ -163,9 +163,18 @@ def field_decision(candidates: List[Candidate], field: str, proposed_value: Any)
         vals = {x[0] for x in matched_genres}
         if len(vals) != 1 or canon_val not in vals:
             return ("LOW", "conflicting catalogue genre evidence; review required")
-        # Also block promotion if any non-conflicting Discogs release candidate disagrees
+        # Also block promotion if any non-conflicting catalogue candidate (e.g. Discogs release) disagrees;
+        # weak inferred knowledge-graph or title-only hints never downgrade verified catalogue evidence.
         for c in candidates:
-            if "conflict" in (c.verification or "").lower() or "mismatch" in (c.verification or "").lower():
+            v_low = (c.verification or "").lower()
+            fam = c.source_family or canonical_provider_family(c.provider)
+            if (
+                "conflict" in v_low
+                or "mismatch" in v_low
+                or "inferred" in v_low
+                or "title-only" in v_low
+                or fam == "wikidata"
+            ):
                 continue
             for g in (c.genre or []):
                 cg = canonical_genre(g)

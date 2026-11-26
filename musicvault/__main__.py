@@ -1,5 +1,5 @@
 """
-Package CLI entrypoint for Music Vault Manager v2.0.1.
+Package CLI entrypoint for Music Vault Manager v2.0.2.
 """
 import argparse
 import sys
@@ -12,6 +12,7 @@ from .cli.commands import (
     run_benchmark,
     run_hydrate,
     run_preview,
+    run_recover_research,
     run_research,
     run_scan,
     run_status,
@@ -25,7 +26,7 @@ from .db import Database, DatabaseMigrationError
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="musicvault",
-        description="Music Vault Manager v2.0.1: Read-Only Audio Library Metadata & Organisation Preview Tool",
+        description="Music Vault Manager v2.0.2: Read-Only Audio Library Metadata & Organisation Preview Tool",
     )
     parser.add_argument("--version", action="version", version=f"musicvault {__version__}")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -69,6 +70,19 @@ def build_parser() -> argparse.ArgumentParser:
     rs_p.add_argument("--verbose", action="store_true", help="Include full Drive file IDs in exports")
     rs_p.add_argument("--export-json", type=str, default="", help="Export research summary to JSON")
     rs_p.add_argument("--export-csv", type=str, default="", help="Export research status table to safe CSV")
+
+    # recover-research (dry-run default; requires --apply + verified backup to mutate)
+    rc_p = subparsers.add_parser(
+        "recover-research",
+        help="Preview (dry-run) or selectively re-queue tracks with incomplete/failed provider research audits",
+    )
+    rc_p.add_argument("--apply", action="store_true", help="Transactionally apply selective recovery (requires verified backup)")
+    rc_p.add_argument("--create-backup", action="store_true", help="Create and verify a fresh SQLite backup before --apply")
+    rc_p.add_argument("--backup-file", type=str, default="", help="Path to an existing verified SQLite backup file for --apply")
+    rc_p.add_argument("--wide", action="store_true", help="Force wide horizontal table output")
+    rc_p.add_argument("--verbose", action="store_true", help="Show full Drive file IDs")
+    rc_p.add_argument("--export-json", type=str, default="", help="Export recovery audit report to UTF-8 JSON")
+    rc_p.add_argument("--export-csv", type=str, default="", help="Export recovery audit rows to formula-safe UTF-8 CSV")
 
     # preview
     pv_p = subparsers.add_parser("preview", help="Run read-only live Google Sheets & Drive organisation preview")
@@ -159,6 +173,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 export_json=Path(args.export_json) if args.export_json else None,
                 export_csv=Path(args.export_csv) if args.export_csv else None,
             )
+        elif args.command == "recover-research":
+            rec_res = run_recover_research(
+                config,
+                db,
+                apply=args.apply,
+                create_backup=args.create_backup,
+                backup_file=Path(args.backup_file) if args.backup_file else None,
+                verbose=args.verbose,
+                wide=args.wide,
+                export_json=Path(args.export_json) if args.export_json else None,
+                export_csv=Path(args.export_csv) if args.export_csv else None,
+            )
+            return 1 if rec_res.get("mode") == "error" else 0
         elif args.command == "preview":
             run_preview(
                 config,

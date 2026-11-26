@@ -1580,15 +1580,15 @@ class Database:
             ex_rank = _candidate_verification_rank(ex_c.verification)
 
             if inc_rank < ex_rank:
-                # Incoming is weaker than stored evidence: preserve stronger verification & primary identity;
-                # only backfill missing supplementary fields if incoming is at least catalogue text-matched (rank >= 2).
+                # Incoming is weaker than stored evidence: preserve stronger verification & all populated fields;
+                # only backfill completely missing supplementary fields if incoming is catalogue-matched (rank >= 2).
                 if inc_rank >= 2:
                     merged_bpm = ex_c.bpm if ex_c.bpm is not None else inc.bpm
                     merged_key = ex_c.key or inc.key
                     merged_isrc = ex_c.isrc or inc.isrc
                     merged_url = ex_c.url or inc.url
-                    merged_genres = list(dict.fromkeys((ex_c.genre or []) + (inc.genre or [])))
-                    merged_labels = list(dict.fromkeys((ex_c.labels or []) + (inc.labels or [])))
+                    merged_genres = list(ex_c.genre) if ex_c.genre else list(dict.fromkeys(inc.genre or []))
+                    merged_labels = list(ex_c.labels) if ex_c.labels else list(dict.fromkeys(inc.labels or []))
                     conn.execute(
                         """
                         UPDATE candidates SET
