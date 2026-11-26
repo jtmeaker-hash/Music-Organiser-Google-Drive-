@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 from .read_only import read_only_request
 
 from ..core.matcher import norm
-from ..core.rules import COL, EXTRA_HEADERS, FIELDS, parse_lock_states
+from ..core.rules import EXTRA_HEADERS
 
 _VALID_DRIVE_ID_HEADERS = {
     "id", "fileid", "driveid", "drivefileid", "googledriveid", "googlefileid", "trackid",
@@ -40,85 +40,63 @@ class VerifiedSheetIndex:
     verified_identities: Dict[str, Tuple[str, str]] = field(default_factory=dict)
     total_data_rows: int = 0
     drive_id_col: int = 14
+    columns: Dict[int, int] = field(default_factory=dict)
+
+
+def resolve_tracks_headers(header_row: List[Any]) -> VerifiedSheetIndex:
+    """Map explicit aliases to the canonical review layout used by the rules engine."""
+    headers = [str(value or "").strip() for value in header_row]
+    padded = headers + [""] * max(0, 27 - len(headers))
+    if not any(headers):
+        return VerifiedSheetIndex(False, "INCOMPATIBLE_HEADERS: missing Tracks header")
+    for i, expected in enumerate(EXTRA_HEADERS, 16):
+        if padded[i] and padded[i] != expected:
+            return VerifiedSheetIndex(False, f"INCOMPATIBLE_REVIEW_HEADERS: column {i + 1}", headers)
+    normalized = [norm(header) for header in padded]
+    columns = {}
+    aliases = {
+        **_EXPECTED_FIELD_HEADER_ALIASES,
+        14: _VALID_DRIVE_ID_HEADERS,
+        0: {"title", "tracktitle", "songtitle"},
+        1: {"artist", "artists", "primaryartist"},
+    }
+    for canonical, accepted in aliases.items():
+        matches = [i for i, label in enumerate(normalized) if label in accepted and not 16 <= i <= 26]
+        if len(matches) > 1:
+            return VerifiedSheetIndex(False, f"INCOMPATIBLE_HEADERS: ambiguous aliases for field {canonical}", headers)
+        if matches:
+            columns[canonical] = matches[0]
+        elif canonical >= 2:
+            if normalized[canonical]:
+                return VerifiedSheetIndex(False, f"INCOMPATIBLE_HEADERS: missing field at column {canonical + 1}", headers)
+            columns[canonical] = canonical
+    if len(set(columns.values())) != len(columns):
+        return VerifiedSheetIndex(False, "INCOMPATIBLE_HEADERS: overlapping field mappings", headers)
+    return VerifiedSheetIndex(True, headers=headers, drive_id_col=columns[14], columns=columns)
+
+
+def normalize_tracks_row(raw, index):
+    original = [str(cell) if cell is not None else "" for cell in raw]
+    padded = original + [""] * max(0, 27 - len(original))
+    canonical = padded[:27]
+    for dest, source in index.columns.items():
+        canonical[dest] = padded[source] if source < len(padded) else ""
+    return canonical
 
 
 def validate_and_index_tracks_sheet(
     header_row: List[Any], data_rows: List[List[Any]]
 ) -> VerifiedSheetIndex:
-    """
-    Validate real Tracks!A1:AA1 headers and index Tracks!A2:AA rows by exact Drive file ID.
-    Detects incompatible headers, missing IDs, and duplicate Drive IDs without guessing rows.
-    """
-    headers = [str(x or "").strip() for x in (header_row or [])]
-    if not any(headers):
-        return VerifiedSheetIndex(
-            schema_valid=False,
-            schema_error="INCOMPATIBLE_HEADERS: Tracks!A1:AA1 header row is empty or missing",
-            headers=headers,
-        )
-
-    padded_headers = headers + [""] * max(0, 27 - len(headers))
-
-    # 1. Verify Drive File ID column at index 14 (Col O) vs all columns A:P
-    explicit_id_cols = [
-        idx for idx, h in enumerate(padded_headers[:16])
-        if norm(h) in ("driveid", "fileid", "drivefileid", "googledriveid")
-    ]
-    if explicit_id_cols and 14 not in explicit_id_cols:
-        return VerifiedSheetIndex(
-            schema_valid=False,
-            schema_error=f"INCOMPATIBLE_HEADERS: Drive ID header found at column index {explicit_id_cols[0]}, expected index 14 (Col O)",
-            headers=headers,
-        )
-
-    col_o_norm = norm(padded_headers[14])
-    if col_o_norm and col_o_norm not in _VALID_DRIVE_ID_HEADERS:
-        return VerifiedSheetIndex(
-            schema_valid=False,
-            schema_error=f"INCOMPATIBLE_HEADERS: Column O (index 14) header is '{padded_headers[14]}', expected Drive ID",
-            headers=headers,
-        )
-    if not col_o_norm:
-        # Legacy blank O1 header allowed ONLY if populated O2:O cells look like Drive file IDs
-        sample_o = [str(r[14]).strip() for r in data_rows if len(r) > 14 and str(r[14] or "").strip()][:10]
-        if sample_o and not all(_DRIVE_ID_TOKEN_RE.match(v) for v in sample_o):
-            return VerifiedSheetIndex(
-                schema_valid=False,
-                schema_error="INCOMPATIBLE_HEADERS: Column O header is blank and values do not match Drive file ID format",
-                headers=headers,
-            )
-
-    # 2. Verify core metadata headers C1:F1 (indices 2..5) when non-empty
-    for col_idx, allowed in _EXPECTED_FIELD_HEADER_ALIASES.items():
-        h_norm = norm(padded_headers[col_idx])
-        if h_norm and h_norm not in allowed:
-            return VerifiedSheetIndex(
-                schema_valid=False,
-                schema_error=f"INCOMPATIBLE_HEADERS: Column index {col_idx} header '{padded_headers[col_idx]}' conflicts with expected schema",
-                headers=headers,
-            )
-
-    # 3. Verify review columns Q1:AA1 (indices 16..26) are empty or match EXTRA_HEADERS
-    for offset, expected_h in enumerate(EXTRA_HEADERS):
-        actual_h = padded_headers[16 + offset]
-        if actual_h and actual_h != expected_h:
-            return VerifiedSheetIndex(
-                schema_valid=False,
-                schema_error=f"INCOMPATIBLE_REVIEW_HEADERS: Column index {16 + offset} has '{actual_h}', expected '{expected_h}'",
-                headers=headers,
-            )
-
-    # 4. Detect optional explicitly labeled Artist and Title columns in A1:P1
-    artist_col: Optional[int] = None
-    title_col: Optional[int] = None
-    for idx in range(16):
-        if idx in (2, 3, 4, 5, 14):
-            continue
-        hn = norm(padded_headers[idx])
-        if hn in ("artist", "artists", "primaryartist") and artist_col is None:
-            artist_col = idx
-        elif hn in ("title", "tracktitle", "songtitle") and title_col is None:
-            title_col = idx
+    """Validate the Tracks layout and index exact IDs, excluding ambiguous rows."""
+    index = resolve_tracks_headers(header_row)
+    if not index.schema_valid:
+        return index
+    drive_col, headers = index.drive_id_col, index.headers
+    if drive_col >= len(headers) or not headers[drive_col]:
+        sample = [str(r[drive_col]).strip() for r in data_rows
+                  if len(r) > drive_col and str(r[drive_col] or "").strip()][:10]
+        if sample and not all(_DRIVE_ID_TOKEN_RE.fullmatch(value) for value in sample):
+            return VerifiedSheetIndex(False, "INCOMPATIBLE_HEADERS: invalid legacy Drive IDs", headers)
 
     # 5. Index rows starting at real sheet row 2 (never using fake row 999)
     seen_rows: Dict[str, List[Tuple[int, List[str]]]] = {}
@@ -129,11 +107,11 @@ def validate_and_index_tracks_sheet(
         str_row = [str(cell) if cell is not None else "" for cell in raw_r]
         if not any(c.strip() for c in str_row):
             continue
-        fid = str_row[14].strip() if len(str_row) > 14 else ""
+        fid = str_row[drive_col].strip() if len(str_row) > drive_col else ""
         if not fid:
             missing_id_rows.append(row_num)
             continue
-        padded_r = (str_row + [""] * max(0, 27 - len(str_row)))[:27]
+        padded_r = normalize_tracks_row(str_row, index)
         seen_rows.setdefault(fid, []).append((row_num, padded_r))
 
     unique_by_id: Dict[str, Tuple[int, List[str]]] = {}
@@ -146,9 +124,9 @@ def validate_and_index_tracks_sheet(
         else:
             r_num, r_vals = entries[0]
             unique_by_id[fid] = (r_num, r_vals)
-            if artist_col is not None and title_col is not None:
-                s_art = r_vals[artist_col].strip()
-                s_tit = r_vals[title_col].strip()
+            if 1 in index.columns and 0 in index.columns:
+                s_art = r_vals[1].strip()
+                s_tit = r_vals[0].strip()
                 if s_art and s_tit:
                     verified_identities[fid] = (s_art, s_tit)
 
@@ -160,6 +138,7 @@ def validate_and_index_tracks_sheet(
         missing_id_rows=missing_id_rows,
         verified_identities=verified_identities,
         total_data_rows=len(data_rows),
+        drive_id_col=drive_col, columns=index.columns,
     )
 
 
@@ -185,6 +164,22 @@ class SheetsService:
             range=range_name,
         ).execute()
         return resp.get("values", [])
+
+    def iter_tracks_rows(self, spreadsheet_id: str, last_column: str, batch_size: int = 200):
+        """Yield bounded pages using the declared grid bounds, including gaps."""
+        metadata = self.service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(title,gridProperties(rowCount)))",
+        ).execute()
+        tracks = next((s["properties"] for s in metadata.get("sheets", [])
+                       if s.get("properties", {}).get("title") == "Tracks"), None)
+        if not tracks:
+            raise ValueError("Tracks sheet is missing.")
+        last_row = int(tracks["gridProperties"]["rowCount"])
+        for start in range(2, last_row + 1, batch_size):
+            end = min(last_row, start + batch_size - 1)
+            rows = self.fetch_master_rows(spreadsheet_id, f"Tracks!A{start}:{last_column}{end}")
+            yield from enumerate(rows, start)
 
     def load_verified_index(self, spreadsheet_id: str) -> VerifiedSheetIndex:
         """Fetch headers + rows (read-only) and validate schema, duplicate IDs, and missing IDs."""

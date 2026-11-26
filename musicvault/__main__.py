@@ -23,9 +23,11 @@ from .cli.wizard import run_setup_wizard
 from .auth import GoogleAuthManager
 from .config import Config
 from .core.process import run_process, snapshot_database
+from .core.coverage import library_report
 from .core.provider_policy import CAPABILITIES, ProviderPolicy
 from .providers.base import canonical_provider_family
 from .services.drive import DriveService
+from .services.sheets import SheetsService
 from .cli.formatting import export_safe_csv, export_safe_json
 from .db import Database, DatabaseMigrationError, SCHEMA_VERSION
 from .db_lock import database_lock
@@ -193,8 +195,12 @@ def run_process_cli(args, config, db):
     if not creds:
         print("Google authentication is required to read Drive inventory.")
         return 2
-    result = run_process(config, db, DriveService(creds), args,
-                         drive_factory=lambda: DriveService(creds), policy=policy)
+    drive = DriveService(creds)
+    preview = None if args.inventory_only else lambda conn, _run_id: library_report(
+        conn, db, config, args, SheetsService(creds), drive,
+    )
+    result = run_process(config, db, drive, args,
+                         drive_factory=lambda: DriveService(creds), policy=policy, preview=preview)
     print(config.redact(result))
     if args.export_json and "coverage" not in result:
         export_safe_json(Path(args.export_json), result, config.known_secrets())
