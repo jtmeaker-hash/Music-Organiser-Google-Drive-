@@ -484,6 +484,10 @@ def execute_research_batch(
                         remaining_calls = policy.ordered(remaining_calls, needed)
                     p_name, p_inst, call_fn = remaining_calls.pop(0)
                     if p_inst is None:
+                        if policy is not None and policy.required is not None and policy.is_required(canonical_provider_family(p_name)):
+                            configured_providers += 1
+                            hard_blocked_incomplete_count += 1
+                            hard_blocked_without_call += 1
                         provider_audit[p_name] = {
                             "status": "not_configured",
                             "matches": 0,

@@ -23,7 +23,7 @@ def _make_executable(path: Path, body: str) -> None:
 
 
 def test_version_bumped_to_2_0_1():
-    assert musicvault.__version__ == "2.0.2"
+    assert musicvault.__version__ == "2.0.3"
     assert sys.version_info >= (3, 11)
 
 

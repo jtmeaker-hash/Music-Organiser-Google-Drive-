@@ -1,5 +1,16 @@
 # Music Vault Manager (`v2.0.2` — Read-Only Research Reliability Hotfix)
 
+## MusicVault 2.0.3
+
+MusicVault can inventory the configured source and destination vault by exact Drive file ID. Unified processing resumes bounded hydration, field-aware research, reconciliation, and local previews. Destination files are eligible for research. Drive and Sheets writes are blocked.
+
+- Use `musicvault process --scope all --inventory-only --dry-run` to preview inventory.
+- Use `musicvault process --scope all` for unified processing and add `--resume` to continue a paused run.
+- On an existing database, verify shutdown and run the explicit, backed-up migration before processing.
+
+[Debian PRoot upgrade, provider settings, and rollback](docs/V203_TERMUX.md) · [Changelog](CHANGELOG.md)
+
+
 A modular Python CLI and terminal application for **Android (Termux & Debian/Ubuntu PRoot)** and Linux to inventory, hydrate audio tags, research recording metadata, and preview parent-genre organisation for DJ libraries stored on **Google Drive** and indexed in **Google Sheets**.
 
 > **Safety Notice (`v2.0.2` Read-Only Corrective Build):**

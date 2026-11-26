@@ -817,7 +817,7 @@ class BaseProvider:
                         "auth_failures" if code in (401, 403) else
                         "rate_limits" if code == 429 or is_mb_503_rl else
                         "temporary_failures" if code >= 500 else
-                        "successful_responses" if code == 404 and allow_404_as_empty else
+                        "expected_empty_responses" if code == 404 and allow_404_as_empty else
                         "other_failures"
                     )
                     breaker_wait = self.request_monitor.observe(
@@ -990,8 +990,15 @@ class BaseProvider:
                     try:
                         payload = resp.json()
                     except ValueError as json_exc:
+                        breaker_until = ""
                         if self.request_monitor:
-                            self.request_monitor.observe("other_failures", self._clock_mono() - started, now_utc)
+                            self.request_monitor.count("malformed_responses")
+                            wait = self.request_monitor.observe("temporary_failures", self._clock_mono() - started, now_utc)
+                            if wait:
+                                breaker_until = self._set_cooldown(
+                                    wait, ProviderStatus.SERVER_ERROR.value, code, "circuit_breaker",
+                                    "Repeated malformed provider responses",
+                                )
                         self.stats["malformed_json"] += 1
                         outcome = ProviderCallOutcome(
                             provider=self.name,
@@ -999,6 +1006,7 @@ class BaseProvider:
                             http_status=code,
                             error=f"Malformed JSON response ({self._redact(json_exc)})",
                             error_kind="malformed_json",
+                            retry_until_utc=breaker_until,
                             request_made=True,
                         )
                         self.last_outcome = outcome

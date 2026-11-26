@@ -352,6 +352,9 @@ class Database:
                 provider TEXT PRIMARY KEY, history TEXT NOT NULL, streak INTEGER NOT NULL,
                 level INTEGER NOT NULL, until_utc TEXT NOT NULL
             )""",
+            """CREATE TABLE IF NOT EXISTS provider_server_deadlines (
+                provider TEXT PRIMARY KEY, until_utc TEXT NOT NULL
+            )""",
             """CREATE TABLE IF NOT EXISTS scheduler_state (
                 name TEXT PRIMARY KEY, value INTEGER NOT NULL
             )""",
@@ -414,8 +417,7 @@ class Database:
             return
 
         # Existing legacy v1 (v2.0.0) database -> create verified online backup BEFORE touching DB!
-        backup_path = self.create_verified_backup(label="pre_v201_migration")
-        self._migrate_v1_to_v2(backup_path)
+        self._migrate_v1_to_v3()
 
     def _create_fresh_v2_schema(self) -> None:
         now = _utc_iso()
@@ -599,12 +601,14 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tracks_live_research ON tracks(is_live_source, quarantined, research_status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conflicts_file ON metadata_conflicts(file_id)")
 
-    def _migrate_v1_to_v2(self, backup_path: Path) -> None:
-        """Transactionally migrate a v2.0.0 database to schema v2 without dropping or losing records."""
+    def _migrate_v1_to_v3(self) -> None:
+        """Migrate the legacy v2.0.0 database with all schema steps in one transaction."""
         now = _utc_iso()
         conn = self._get_connection(isolation_level=None)
         try:
+            conn.execute("PRAGMA busy_timeout = 0")
             conn.execute("BEGIN IMMEDIATE")
+            backup_path = self.create_verified_backup(label="pre_v201_migration")
 
             existing_track_cols = {
                 r["name"] for r in conn.execute("PRAGMA table_info(tracks)").fetchall()
@@ -1960,14 +1964,15 @@ class Database:
             return [self._row_to_track(r) for r in rows]
 
     @staticmethod
-    def _work_scope(process_run: Optional[Tuple[int, int]], stage: str) -> str:
+    def _work_scope(process_run: Optional[Tuple[int, int]], stage: str, claimed_only: bool = False) -> str:
         if process_run is None:
             return "is_live_source = 1"
         run_id, epoch = map(int, process_run)
+        claimed = f"AND w.hydrated={epoch}" if claimed_only else ""
         return f"""EXISTS (
             SELECT 1 FROM process_work w
             WHERE w.run_id={run_id} AND w.file_id=tracks.file_id
-              AND w.version=tracks.version AND w.{stage} != {epoch}
+              AND w.version=tracks.version AND w.{stage} != {epoch} {claimed}
         )"""
 
     def get_live_tracks_for_hydration(
@@ -1978,7 +1983,8 @@ class Database:
         force_rehydrate: bool = False,
         use_sheet_uninspected: bool = False,
         process_run: Optional[Tuple[int, int]] = None,
-    ) -> List[Track]:
+        count_only: bool = False,
+    ) -> List[Track] | int:
         """
         Select live source tracks needing metadata hydration or retry.
         Excludes tagless/partial tracks whose audio stream was already inspected at the current
@@ -2017,14 +2023,13 @@ class Database:
                 params.extend([max_attempts, now])
             params.extend([1 if use_sheet_uninspected else 0, limit])
 
-            rows = conn.execute(
-                f"""
+            query = f"""
                 SELECT * FROM tracks
                 WHERE {live_clause}
                   AND quarantined = 0
                   AND hydration_status != 'permanent_unsupported'
                   AND (
-                      content_stale = 1
+                      (content_stale = 1 AND hydration_status NOT IN ('retryable_failure','success'))
                       OR hydration_status = 'pending'
                       {retry_clause}
                       OR (
@@ -2043,9 +2048,10 @@ class Database:
                   )
                 ORDER BY content_stale DESC, hydration_attempts ASC, file_id ASC
                 LIMIT ?
-                """,
-                tuple(params),
-            ).fetchall()
+                """
+            if count_only:
+                return conn.execute("SELECT COUNT(*) FROM (" + query + ")", (*params[:-1], -1)).fetchone()[0]
+            rows = conn.execute(query, tuple(params)).fetchall()
             return [self._row_to_track(r) for r in rows]
 
     def get_live_tracks_for_research(
@@ -2056,16 +2062,18 @@ class Database:
         max_attempts: int = 3,
         now_utc: Optional[datetime] = None,
         process_run: Optional[Tuple[int, int]] = None,
+        count_only: bool = False,
         queue_class: str = "",
         enrichment_condition: str = "0",
         only_enrichment: bool = False,
-    ) -> List[Track]:
+        claimed_only: bool = False,
+    ) -> List[Track] | int:
         """
         Select next batch of live, non-stale tracks with searchable identity for online research.
         Includes pending tracks, version-changed tracks, due retryable_failure tracks, and
         incomplete tracks (research_incomplete=1) whose retry deadline has arrived.
         """
-        live_clause = self._work_scope(process_run, "researched")
+        live_clause = self._work_scope(process_run, "researched", claimed_only)
         first_pass = "(research_status = 'pending' AND research_attempts = 0 AND research_deferrals = 0 AND research_last_utc = '')"
         queue_filter = {"first": first_pass, "retry": f"NOT {first_pass}"}.get(queue_class, "1")
         retry_order = "COALESCE(NULLIF(research_last_utc, ''), research_next_retry_utc), " if queue_class == "retry" else ""
@@ -2108,8 +2116,7 @@ class Database:
             if only_enrichment:
                 status_clause, params = "0", (limit,)
 
-            rows = conn.execute(
-                f"""
+            query = f"""
                 SELECT * FROM tracks
                 WHERE {live_clause}
                   AND quarantined = 0
@@ -2123,9 +2130,10 @@ class Database:
                     COALESCE(research_deferrals, 0) ASC,
                     file_id ASC
                 LIMIT ?
-                """,
-                params,
-            ).fetchall()
+                """
+            if count_only:
+                return conn.execute("SELECT COUNT(*) FROM (" + query + ")", (*params[:-1], -1)).fetchone()[0]
+            rows = conn.execute(query, params).fetchall()
             return [self._row_to_track(r) for r in rows]
 
     def get_research_queue_diagnostics(

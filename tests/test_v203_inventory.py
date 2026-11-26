@@ -50,3 +50,56 @@ def test_write_boundary_denies_permissive_calls():
     for method in ("POST", "PUT", "PATCH", "DELETE"):
         with pytest.raises(RuntimeError):
             read_only_request(None, None, "https://example.invalid", method=method)
+
+
+def test_drive_paginates_shared_nested_folders_and_ignores_shortcut():
+    service = DriveService.__new__(DriveService)
+    calls = []
+
+    class Request:
+        def __init__(self, response):
+            self.response = response
+
+        def execute(self, **_kwargs):
+            return self.response
+
+    class API:
+        def files(self):
+            return self
+
+        def get(self, **_kwargs):
+            return Request({"mimeType": "application/vnd.google-apps.folder", "driveId": "shared"})
+
+        def list(self, **kwargs):
+            calls.append(kwargs)
+            if "'folder'" in kwargs["q"]:
+                return Request({"files": [file("nested-id", "folder")]})
+            if kwargs["pageToken"] == "second":
+                return Request({"files": [
+                    {"id": "folder", "name": "Nested", "mimeType": "application/vnd.google-apps.folder"},
+                    {"id": "shortcut", "name": "Shortcut.flac", "mimeType": "application/vnd.google-apps.shortcut"},
+                    {"id": "unsupported", "name": "data.zip"},
+                ]})
+            return Request({"nextPageToken": "second", "files": [file("root-id", "root")]})
+
+    service.service = API()
+    counts = {}
+    result = list(service.scan_inventory("root", counts))
+    assert [row["id"] for row in result] == ["root-id", "nested-id"]
+    assert result[1]["scanned_path"] == ["Nested", "Same name.flac"]
+    assert counts == {"shortcuts": 1, "unsupported": 1}
+    assert all(call["driveId"] == "shared" and call["includeItemsFromAllDrives"] for call in calls)
+
+
+def test_google_discovery_mutation_requests_are_blocked():
+    from google.auth.credentials import AnonymousCredentials
+
+    drive = DriveService(AnonymousCredentials())
+    sheets = SheetsService(AnonymousCredentials())
+    assert drive.service.files().get(fileId="synthetic").method == "GET"
+    with pytest.raises(RuntimeError, match="disabled"):
+        drive.service.files().update(fileId="synthetic", body={"name": "changed"})
+    with pytest.raises(RuntimeError, match="disabled"):
+        drive.service.files().delete(fileId="synthetic")
+    with pytest.raises(RuntimeError, match="disabled"):
+        sheets.service.spreadsheets().values().batchUpdate(spreadsheetId="synthetic", body={})

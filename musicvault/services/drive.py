@@ -3,9 +3,11 @@ Google Drive v3 API client for inventory scanning, bounded ranged audio reads,
 opt-in temporary downloads with disk/budget guards, and folder inspection.
 """
 import io
+import json
 import shutil
+import sqlite3
 import urllib.parse
-from collections import deque
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 from google.auth.transport.requests import AuthorizedSession
@@ -58,49 +60,61 @@ class DriveService:
             raise RuntimeError("Configured inventory root is not an accessible folder.")
         drive_id = root.get("driveId")
         corpus = {"corpora": "drive", "driveId": drive_id} if drive_id else {}
-        queue = deque([(root_folder_id, ())])
-        seen_folders = set()
-
-        while queue:
-            folder_id, folder_path = queue.popleft()
-            if folder_id in seen_folders:
-                continue
-            seen_folders.add(folder_id)
-
-            page_token = None
-            tokens = set()
+        # Keep the traversal frontier on disk so wide folder trees do not
+        # accumulate in memory alongside a page of Drive results.
+        with closing(sqlite3.connect("")) as folders:
+            folders.execute("PRAGMA temp_store=FILE")
+            folders.execute("""CREATE TABLE pending (
+                sequence INTEGER PRIMARY KEY, folder_id TEXT UNIQUE, path TEXT, visited INTEGER DEFAULT 0
+            )""")
+            folders.execute("CREATE INDEX pending_visited ON pending(visited,sequence)")
+            folders.execute("INSERT INTO pending(folder_id,path) VALUES (?, '[]')", (root_folder_id,))
             while True:
-                resp = self.service.files().list(
-                    q=f"'{folder_id}' in parents and trashed = false",
-                    fields="nextPageToken,incompleteSearch,files(id,name,mimeType,size,md5Checksum,modifiedTime,parents)",
-                    supportsAllDrives=True, includeItemsFromAllDrives=True, **corpus,
-                    pageSize=1000,
-                    pageToken=page_token,
-                ).execute(num_retries=3)
-
-                if resp.get("incompleteSearch"):
-                    raise RuntimeError("Drive reported an incomplete folder listing.")
-                for item in resp.get("files", []):
-                    mime = item.get("mimeType", "")
-                    if mime == "application/vnd.google-apps.folder":
-                        queue.append((item["id"], (*folder_path, item.get("name", ""))))
-                    elif mime == "application/vnd.google-apps.shortcut":
-                        counters["shortcuts"] = counters.get("shortcuts", 0) + 1
-                    else:
-                        ext = Path(item.get("name", "")).suffix.lower()
-                        if ext in SUPPORTED_AUDIO_EXTENSIONS:
-                            item["scanned_parent"] = folder_id
-                            item["scanned_path"] = [*folder_path, item.get("name", "")]
-                            yield item
-                        else:
-                            counters["unsupported"] = counters.get("unsupported", 0) + 1
-
-                page_token = resp.get("nextPageToken")
-                if not page_token:
+                next_folder = folders.execute("""
+                    SELECT sequence,folder_id,path FROM pending WHERE visited=0 ORDER BY sequence LIMIT 1
+                """).fetchone()
+                if next_folder is None:
                     break
-                if page_token in tokens:
-                    raise RuntimeError("Drive repeated a pagination token.")
-                tokens.add(page_token)
+                sequence, folder_id, path = next_folder
+                folders.execute("UPDATE pending SET visited=1 WHERE sequence=?", (sequence,))
+                folder_path = json.loads(path)
+                page_token = None
+                tokens = set()
+                while True:
+                    resp = self.service.files().list(
+                        q=f"'{folder_id}' in parents and trashed = false",
+                        fields="nextPageToken,incompleteSearch,files(id,name,mimeType,size,md5Checksum,modifiedTime,parents)",
+                        supportsAllDrives=True, includeItemsFromAllDrives=True, **corpus,
+                        pageSize=1000,
+                        pageToken=page_token,
+                    ).execute(num_retries=3)
+
+                    if resp.get("incompleteSearch"):
+                        raise RuntimeError("Drive reported an incomplete folder listing.")
+                    for item in resp.get("files", []):
+                        mime = item.get("mimeType", "")
+                        if mime == "application/vnd.google-apps.folder":
+                            folders.execute(
+                                "INSERT OR IGNORE INTO pending(folder_id,path) VALUES (?,?)",
+                                (item["id"], json.dumps([*folder_path, item.get("name", "")])),
+                            )
+                        elif mime == "application/vnd.google-apps.shortcut":
+                            counters["shortcuts"] = counters.get("shortcuts", 0) + 1
+                        else:
+                            ext = Path(item.get("name", "")).suffix.lower()
+                            if ext in SUPPORTED_AUDIO_EXTENSIONS:
+                                item["scanned_parent"] = folder_id
+                                item["scanned_path"] = [*folder_path, item.get("name", "")]
+                                yield item
+                            else:
+                                counters["unsupported"] = counters.get("unsupported", 0) + 1
+
+                    page_token = resp.get("nextPageToken")
+                    if not page_token:
+                        break
+                    if page_token in tokens:
+                        raise RuntimeError("Drive repeated a pagination token.")
+                    tokens.add(page_token)
 
     def open_range_reader(
         self,
@@ -201,18 +215,25 @@ class DriveService:
         """Return map of folder name -> list of folder IDs under parent (read-only)."""
         found: Dict[str, List[str]] = {}
         token = None
+        tokens = set()
         while True:
             resp = self.service.files().list(
                 q=f"'{parent_id}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'",
-                fields="nextPageToken, files(id, name)",
+                fields="nextPageToken,incompleteSearch,files(id,name)",
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
                 pageSize=1000,
                 pageToken=token,
             ).execute(num_retries=3)
+            if resp.get("incompleteSearch"):
+                raise RuntimeError("Drive reported an incomplete destination listing.")
             for f in resp.get("files", []):
                 found.setdefault(f["name"], []).append(f["id"])
             token = resp.get("nextPageToken")
             if not token:
                 break
+            if token in tokens:
+                raise RuntimeError("Drive repeated a destination listing page token.")
+            tokens.add(token)
         return found
 
     def ensure_folder(self, parent_id: str, folder_name: str, allow_live_writes: bool = False) -> str:

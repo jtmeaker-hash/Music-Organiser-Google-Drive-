@@ -1,5 +1,5 @@
 """
-Command implementations for Music Vault Manager v2.0.2 (Read-Only Research Reliability Hotfix).
+Command implementations for Music Vault Manager v2.0.3 (Read-only library processing).
 Implements local status diagnostics, verified DB backups, transactional inventory scanning,
 bandwidth-bounded audio hydration, resumable online research, selective dry-run-first recovery,
 real read-only Sheets/Drive preview, and isolated offline benchmarks.
@@ -56,7 +56,7 @@ def run_status(
 
     report: Dict[str, Any] = {
         "version": __version__,
-        "build_mode": "v2.0.2_read_only_research_hotfix",
+        "build_mode": f"v{__version__}_read_only",
         "environment": {
             "runtime": env_info.runtime,
             "distro": env_info.distro_name,

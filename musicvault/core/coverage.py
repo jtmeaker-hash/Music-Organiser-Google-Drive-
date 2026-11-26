@@ -7,14 +7,14 @@ from contextlib import ExitStack
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from ..cli.formatting import sanitize_csv_cell, short_file_id
+from ..cli.formatting import _redact_json_tree, sanitize_csv_cell, short_file_id
 from ..providers.base import canonical_provider_family
 from ..services.sheets import _DRIVE_ID_TOKEN_RE, normalize_tracks_row, resolve_tracks_headers
 from .genre import SUBGENRE_PARENT, canonical_genre
 from .matcher import extract_version_tokens, norm, versions_compatible
 from .organizer import _vault_parent_folder_key
 from .provider_policy import provider_report
-from .rules import COL, build_track_proposal, field_decision, parse_lock_states
+from .rules import COL, build_track_proposal, candidate_field_values, field_decision, parse_lock_states
 
 FIELDS = ("artist", "title", "edition", "duration", "bpm", "key", "genre", "subgenre", "label", "isrc")
 ATTRIBUTED = ("identity", "bpm", "key", "genre", "subgenre")
@@ -74,7 +74,6 @@ def decisions(track, candidates, manual):
                 state = "conflicting"
             elif confidence == "HIGH" and value:
                 state = "verified"
-                from .rules import candidate_field_values
                 sources = sorted({item[1] for item in candidate_field_values(candidates, field)})
             elif field == "subgenre":
                 corroborated = {}
@@ -114,6 +113,7 @@ def decisions(track, candidates, manual):
                     state, confidence, sources, reason = (
                         "verified", "HIGH", sorted(families), "Recording-level evidence",
                     )
+        disputed = state == "conflicting"
         if field in manual and manual[field][0] and manual[field][1] in MANUAL_STATES:
             value, lock = manual[field]
             state, confidence, sources, reason = (
@@ -121,7 +121,8 @@ def decisions(track, candidates, manual):
                 "HIGH", ["manual"], "Preserved accepted value",
             )
         results[field] = {"state": state, "value": str(value or ""), "confidence": confidence,
-                          "provenance": sources, "reason": reason, "candidates": evidence}
+                          "provenance": sources, "reason": reason, "candidates": evidence,
+                          "conflict": disputed}
     return results, proposal.get("tempo_hint", "")
 
 
@@ -188,7 +189,7 @@ def read_sheet(conn, sheets, sheet_id):
     }
 
 
-def _track_report(conn, db, row, config, sheet_info, folders):
+def _track_report(conn, db, row, config, sheet_info, folders, location_verified):
     track = db._row_to_track(row)
     terms = config.provider_terms_cleared
     candidates = [c for c in db.get_candidates(track.file_id)
@@ -223,19 +224,22 @@ def _track_report(conn, db, row, config, sheet_info, folders):
         detail["proposed"] = (detail["old"] or detail["value"]) if (
             detail["old"] or detail["state"] in {"accepted", "verified"}
         ) else ""
-    conflict = any(value["state"] == "conflicting" for value in field_data.values()) or bool(tempo_hint)
+    metadata_complete = all(value["state"] in {"accepted", "verified"} for value in field_data.values())
+    conflict = any(value["conflict"] for value in field_data.values()) or bool(tempo_hint)
     review = bool(track.quarantined or lock_error or conflict or (research_complete and track.research_status == "partial"))
     genre = field_data["genre"]
     targets = folders.get(_vault_parent_folder_key(canonical_genre(genre["value"])), [])
-    if row["destination_member"] and len(targets) == 1 and row["destination_parent"] == targets[0] and not row["source_member"] and not row["ambiguous"]:
+    if row["destination_member"] and genre["state"] == "verified" and len(targets) == 1 and row["destination_parent"] == targets[0] and not row["source_member"] and not row["ambiguous"]:
         route = "already_correctly_located"
     elif row["source_member"] and row["destination_member"] or row["ambiguous"]:
         route = "ambiguous_location"
     elif row["destination_member"]:
         route = "destination_only"
+    elif not location_verified:
+        route = "unverified_root_membership"
     elif len(sheet_rows) != 1 or lock_error:
         route = "sheet_mapping_hold"
-    elif review or no_match or pending or not research_complete or genre["state"] != "verified":
+    elif review or no_match or pending or not research_complete or not metadata_complete or genre["state"] != "verified":
         route = "review_or_incomplete"
     elif len(targets) != 1:
         route = "unknown_or_ambiguous_destination"
@@ -250,7 +254,7 @@ def _track_report(conn, db, row, config, sheet_info, folders):
             for entry in audit.values()
         )),
         "research_complete": research_complete,
-        "metadata_complete": all(value["state"] in {"accepted", "verified"} for value in field_data.values()),
+        "metadata_complete": metadata_complete,
         "enrichment_pending": pending,
         "review_required": review,
         "terminal_no_match": no_match,
@@ -268,6 +272,7 @@ def _track_report(conn, db, row, config, sheet_info, folders):
 
 def library_report(conn, db, config, args, sheets, drive):
     """Stream optional detail files and retain only the summary in memory."""
+    conn.execute("PRAGMA temp_store=FILE")
     try:
         sheet_info = read_sheet(conn, sheets, config.sheet_id)
     except Exception as exc:
@@ -278,6 +283,12 @@ def library_report(conn, db, config, args, sheets, drive):
             folders.setdefault(_vault_parent_folder_key(name), []).extend(ids)
     except Exception:
         folders = {}
+    location_verified = (
+        config.source_folder_id != config.vault_folder_id
+        and conn.execute("""SELECT COUNT(DISTINCT source_folder_id) FROM scan_runs
+                            WHERE source_folder_id IN (?,?) AND status='completed'""",
+                         (config.source_folder_id, config.vault_folder_id)).fetchone()[0] == 2
+    )
     totals = {scope: Counter() for scope in ("source", "destination", "unique")}
     field_counts = {scope: {field: Counter() for field in FIELDS} for scope in totals}
     accepted, unique = {}, {}
@@ -297,6 +308,7 @@ def library_report(conn, db, config, args, sheets, drive):
         FROM membership m JOIN tracks t USING(file_id)
     """, (config.source_folder_id, config.vault_folder_id))
     outputs = []
+    secrets = config.known_secrets()
     try:
         with ExitStack() as stack:
             for kind, path in (("csv", args.export_csv), ("json", args.export_json)):
@@ -315,7 +327,7 @@ def library_report(conn, db, config, args, sheets, drive):
                 json_stream.write('{"rows":[')
             first = True
             for row in rows:
-                detail, providers = _track_report(conn, db, row, config, sheet_info, folders)
+                detail, providers = _track_report(conn, db, row, config, sheet_info, folders, location_verified)
                 if args.verbose:
                     detail["file_id"] = row["file_id"]
                 for family, (fields, unique_fields) in providers.items():
@@ -330,21 +342,24 @@ def library_report(conn, db, config, args, sheets, drive):
                     totals[scope]["denominator"] += 1
                     totals[scope].update(key for key, value in detail["states"].items() if value)
                     for field in FIELDS:
-                        field_counts[scope][field][detail["fields"][field]["state"]] += 1
+                        item = detail["fields"][field]
+                        field_counts[scope][field][item["state"]] += 1
+                        if item["conflict"] and item["state"] != "conflicting":
+                            field_counts[scope][field]["conflict_with_preserved_value"] += 1
                 if args.file_id and row["file_id"] not in args.file_id:
                     continue
                 if csv_writer:
                     csv_writer.writerow({
                         key: sanitize_csv_cell(json.dumps(value) if isinstance(value, dict) else value,
-                                               config.known_secrets())
+                                               secrets)
                         for key, value in detail.items()
                     })
                 if json_stream:
                     if not first:
                         json_stream.write(",")
-                    json_stream.write(config.redact(json.dumps(detail, ensure_ascii=False)))
+                    json_stream.write(json.dumps(_redact_json_tree(detail, secrets), ensure_ascii=False))
                     first = False
-            telemetry = provider_report(conn)
+            telemetry = provider_report(conn, config)
             for family, values in telemetry.items():
                 values.update(accepted_contribution=dict(accepted.get(family, {})),
                               unique_contribution=dict(unique.get(family, {})))

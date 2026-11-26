@@ -7,7 +7,7 @@ from ..db import _utc_iso
 from ..services.drive import DriveService
 
 
-def scan_root(db, drive, root_id, role, redact=str):
+def scan_root(db, drive, root_id, role, redact=str, on_complete=None):
     scan_id = db.begin_scan_run(root_id)
     counts = Counter()
     try:
@@ -66,7 +66,7 @@ def scan_root(db, drive, root_id, role, redact=str):
                             UPDATE tracks SET is_live_source=?, configured_source_id=?,
                             scan_generation=? WHERE file_id=?
                         """, (*(tuple(prior)[:3] if prior else (0, "", 0)), file_id))
-                    if prior and prior["quarantined"] and "checkpoint" not in prior["quarantine_reason"]:
+                    if prior and prior["quarantined"] and (ambiguous or "checkpoint" not in (prior["quarantine_reason"] or "")):
                         conn.execute("""
                             UPDATE tracks SET quarantined=1, quarantine_reason=? WHERE file_id=?
                         """, (prior["quarantine_reason"], file_id))
@@ -85,10 +85,17 @@ def scan_root(db, drive, root_id, role, redact=str):
                     WHERE scan_id=?
                 """, (_utc_iso(), counts["seen"], scan_id))
                 conn.execute("DELETE FROM root_observation WHERE scan_id=?", (scan_id,))
-        return {"status": "completed", "scan_id": scan_id, "seen": counts["seen"], **counts}
+                result = {"status": "completed", "scan_id": scan_id, "seen": counts["seen"], **counts}
+                if on_complete:
+                    on_complete(conn, result)
+        return result
     except (Exception, KeyboardInterrupt) as exc:
         interrupted = isinstance(exc, KeyboardInterrupt)
         error = "Interrupted by user" if interrupted else redact(exc)
+        with closing(db._get_connection()) as conn:
+            status = conn.execute("SELECT status FROM scan_runs WHERE scan_id=?", (scan_id,)).fetchone()[0]
+        if status == "completed":
+            return {"status": "completed", "scan_id": scan_id, "seen": counts["seen"], **counts}
         db.abort_scan_run(scan_id, counts["seen"], error, interrupted=interrupted)
         with closing(db._get_connection()) as conn, conn:
             conn.execute("DELETE FROM root_observation WHERE scan_id=?", (scan_id,))

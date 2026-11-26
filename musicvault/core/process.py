@@ -64,6 +64,11 @@ def _populate_work(conn, run_id, roots, file_ids):
     params = [value for pair in roots.items() for value in pair]
     id_filter = f"AND t.file_id IN ({','.join('?' for _ in file_ids)})" if file_ids else ""
     conn.execute(f"""
+        DELETE FROM process_work WHERE run_id=? AND NOT EXISTS (
+            SELECT 1 FROM root_membership m WHERE m.file_id=process_work.file_id AND ({root_terms})
+        )
+    """, (run_id, *params))
+    conn.execute(f"""
         INSERT INTO process_work(run_id,file_id,version)
         SELECT DISTINCT ?, t.file_id, t.version
         FROM tracks t JOIN root_membership m ON m.file_id=t.file_id
@@ -83,13 +88,14 @@ def _checkpoint_track(conn, run, stage, track):
         )
 
 
-def _next_research(db, conn, run, condition="0", only_enrichment=False):
+def _next_research(db, conn, run, condition="0", only_enrichment=False, claimed_only=False):
     row = conn.execute("SELECT value FROM scheduler_state WHERE name='first_pass'").fetchone()
     streak = row[0] if row else 0
     order = ("retry", "first") if streak >= 4 else ("first", "retry")
     for category in order:
         tracks = db.get_live_tracks_for_research(
-            1, process_run=run, queue_class=category, enrichment_condition=condition, only_enrichment=only_enrichment,
+            1, process_run=run, queue_class=category, enrichment_condition=condition,
+            only_enrichment=only_enrichment, claimed_only=claimed_only,
         )
         if tracks:
             return tracks[0], min(streak + 1, 4) if category == "first" else 0
@@ -133,10 +139,17 @@ def run_process(config, db, drive, args, *, drive_factory=None, policy=None,
         for role, root in roots.items():
             if state["roots"].get(role, {}).get("status") == "completed":
                 continue
-            report = scan_root(db, drive, root, role, config.redact)
+            def checkpoint_inventory(scan_conn, report):
+                state["roots"][role] = report
+                scan_conn.execute(
+                    "UPDATE process_runs SET phase='inventory',state_json=?,updated_utc=? WHERE id=?",
+                    (json.dumps(state), _utc_iso(), run_id),
+                )
+
+            report = scan_root(db, drive, root, role, config.redact, checkpoint_inventory)
             state["roots"][role] = report
-            _save(conn, run_id, "inventory", state)
             if report["status"] != "completed":
+                _save(conn, run_id, "inventory", state)
                 result.update(status=report["status"], error=report["error"])
                 return result
 
@@ -149,16 +162,28 @@ def run_process(config, db, drive, args, *, drive_factory=None, policy=None,
         with conn:
             _populate_work(conn, run_id, roots, args.file_id)
         if args.dry_run:
-            result["eligible_hydration"] = len(db.get_live_tracks_for_hydration(1, process_run=run)) > 0
-            result["eligible_research"] = len(db.get_live_tracks_for_research(1, process_run=run)) > 0
+            result["eligible_hydration"] = db.get_live_tracks_for_hydration(1, process_run=run, count_only=True)
+            result["eligible_research"] = db.get_live_tracks_for_research(1, process_run=run, count_only=True)
             if preview:
                 result["coverage"] = preview(conn, run_id)
             return result
 
+        providers = providers_override if providers_override is not None else build_research_providers(
+            config, db, args.limit or 100
+        )
+        if policy is not None:
+            policy.bind(db, providers, args.provider)
         _save(conn, run_id, "hydration", state)
         hydrated = 0
-        while not args.provider and (not args.limit or hydrated < args.limit):
-            amount = min(args.batch_size, args.limit - hydrated) if args.limit else args.batch_size
+        hydration_limit = args.limit
+        if args.limit:
+            next_due, next_streak = _next_research(
+                db, conn, run, policy.enrichment_condition() if policy else "0",
+            )
+            if next_due and next_streak == 0:
+                hydration_limit -= 1
+        while not args.provider and (not args.limit or hydrated < hydration_limit):
+            amount = min(args.batch_size, hydration_limit - hydrated) if args.limit else args.batch_size
             tracks = db.get_live_tracks_for_hydration(amount, process_run=run)
             if not tracks:
                 break
@@ -178,18 +203,18 @@ def run_process(config, db, drive, args, *, drive_factory=None, policy=None,
                 time.sleep(args.cooldown)
 
         _save(conn, run_id, "research", state)
-        providers = providers_override if providers_override is not None else build_research_providers(
-            config, db, args.limit or 100
-        )
-        if policy is not None:
-            policy.bind(db, providers, args.provider)
         researched = 0
+        actual_attempts = 0
+        claimed = hydrated
+        research_started = time.monotonic()
         last = None
-        while not args.limit or researched < args.limit:
+        while True:
             if policy and researched % args.batch_size == 0:
                 policy.new_batch()
             condition = policy.enrichment_condition() if policy else "0"
-            track, streak = _next_research(db, conn, run, condition, bool(args.provider))
+            track, streak = _next_research(
+                db, conn, run, condition, bool(args.provider), bool(args.limit and claimed >= args.limit),
+            )
             if track is None:
                 break
             summary = execute_research_batch(
@@ -197,11 +222,16 @@ def run_process(config, db, drive, args, *, drive_factory=None, policy=None,
                 selected_tracks=[track], policy=policy,
             )
             last = summary
+            already_claimed = conn.execute("""
+                SELECT hydrated FROM process_work WHERE run_id=? AND file_id=?
+            """, (run_id, track.file_id)).fetchone()[0] == run[1]
+            claimed += not already_claimed
             if summary.interrupted:
                 result["status"] = "interrupted"
                 return result
             _checkpoint_track(conn, run, "researched", track)
             researched += 1
+            actual_attempts += summary.attempted
             with conn:
                 conn.execute("""
                     INSERT INTO scheduler_state VALUES ('first_pass', ?)
@@ -214,15 +244,25 @@ def run_process(config, db, drive, args, *, drive_factory=None, policy=None,
                 if args.cooldown:
                     time.sleep(args.cooldown)
 
+        research_elapsed = time.monotonic() - research_started
         _save(conn, run_id, "preview", state)
         if preview:
             result["coverage"] = preview(conn, run_id)
         result.update(hydration_attempted=hydrated, research_selected=researched,
                       elapsed_seconds=round(time.monotonic() - started, 2))
-        next_research, _ = _next_research(db, conn, run, policy.enrichment_condition() if policy else "0")
-        result["work_remaining"] = bool(
-            next_research or db.get_live_tracks_for_hydration(1, process_run=run)
+        eligible_hydration = db.get_live_tracks_for_hydration(1, process_run=run, count_only=True)
+        eligible_research = db.get_live_tracks_for_research(
+            1, process_run=run, count_only=True, only_enrichment=bool(args.provider),
+            enrichment_condition=policy.enrichment_condition() if policy else "0",
         )
+        result["eligible_hydration"] = eligible_hydration
+        result["eligible_research"] = eligible_research
+        result["work_remaining"] = bool(eligible_hydration or eligible_research)
+        if actual_attempts >= 3 and eligible_research:
+            result["research_eta_seconds"] = round(
+                research_elapsed * eligible_research / actual_attempts, 1,
+            )
+            result["eta_basis"] = "Measured research throughput for work due now, excluding future provider deferrals."
         if last:
             result["next_retry_utc"] = last.next_retry_utc
         backlog = conn.execute("""

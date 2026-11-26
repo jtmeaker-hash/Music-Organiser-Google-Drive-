@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Music Vault Manager v2.0.2 — Automated Dependency & Installation Script
+# Music Vault Manager v2.0.3 — Automated Dependency & Installation Script
 # Supports: Debian/Ubuntu (including Termux PRoot) and Native Termux on Android
 # ==============================================================================
 set -euo pipefail
@@ -143,7 +143,7 @@ run_cmd() {
 }
 
 echo "=========================================================="
-echo "    Music Vault Manager v2.0.2 — Environment Installer    "
+echo "    Music Vault Manager v2.0.3 — Environment Installer    "
 echo "=========================================================="
 echo "  Environment: $SELECTED_ENV (${DISTRO_PRETTY:-Termux/POSIX})"
 echo "  Package mgr: $PKG_MGR"
@@ -251,7 +251,7 @@ for mod in ('mutagen', 'requests', 'googleapiclient', 'google.auth', 'google_aut
 fi
 
 echo "=========================================================="
-echo " [✓] Music Vault Manager v2.0.2 setup verified!"
+echo " [✓] Music Vault Manager v2.0.3 setup verified!"
 if [ "$SYSTEM_EDITABLE" -eq 1 ]; then
     echo "     Run status check:   musicvault status"
     echo "     Launch menu:        musicvault"

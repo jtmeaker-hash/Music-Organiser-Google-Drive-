@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from ..db import _utc_iso
 from ..providers.base import canonical_provider_family
+from .genre import SUBGENRE_PARENT
 from .rules import build_track_proposal, field_decision
 
 CAPABILITIES = {
@@ -13,6 +14,8 @@ CAPABILITIES = {
     "audiometa": {"identity", "bpm", "key"},
     "sonovault": {"identity", "bpm", "key", "genre", "subgenre"},
 }
+AUDIT_NAMES = {"musicbrainz": "MusicBrainz", "sonovault": "SonoVault",
+               "audiometa": "AudioMeta", "discogs": "Discogs"}
 DEFAULT_ORDER = ("musicbrainz", "discogs", "audiometa", "sonovault")
 FIELDS = set().union(*CAPABILITIES.values())
 
@@ -86,8 +89,7 @@ class ProviderPolicy:
     def is_required(self, family):
         return family in self.required if self.required is not None else family not in self.fallback
 
-    @staticmethod
-    def needed_fields(track, candidates):
+    def needed_fields(self, track, candidates):
         proposed = build_track_proposal(track.metadata, candidates)
         missing = {field for field in ("bpm", "key", "genre", "subgenre")
                    if field_decision(candidates, field, proposed)[0] != "HIGH"}
@@ -102,6 +104,22 @@ class ProviderPolicy:
             missing.add("label")
         if not verified:
             missing.add("edition")
+        styles = {}
+        for candidate in verified:
+            family = canonical_provider_family(candidate.source_family or candidate.provider)
+            for style in candidate.genre:
+                if SUBGENRE_PARENT.get(style) == proposed["genre"] and proposed["genre"]:
+                    styles.setdefault(style, set()).add(family)
+        if len(styles) == 1 and len(next(iter(styles.values()))) >= 2:
+            missing.discard("subgenre")
+        with closing(self.db._get_connection()) as conn:
+            manual = {field for field, in conn.execute("""
+                SELECT field_name FROM field_decisions WHERE file_id=? AND value!=''
+                AND state IN ('USER_LOCKED','HIGH_LOCKED','ACCEPTED','VERIFIED')
+            """, (track.file_id,))}
+        missing -= manual
+        if {"artist", "title"} <= manual:
+            missing.discard("identity")
         return missing
 
     def ordered(self, calls, needed):
@@ -167,9 +185,19 @@ class ProviderPolicy:
             return "0"
         quoted = ",".join("'" + family + "'" for family in active)
         now = _utc_iso()
-        return f"""EXISTS (SELECT 1 FROM enrichment_work e WHERE e.file_id=tracks.file_id
+        pending = f"""EXISTS (SELECT 1 FROM enrichment_work e WHERE e.file_id=tracks.file_id
             AND e.version=tracks.version AND e.provider IN ({quoted})
             AND (e.due_utc='' OR e.due_utc<='{now}'))"""
+        if self.provider:
+            return pending
+        new_provider = " OR ".join(
+            f"json_extract(provider_calls_json, '$.{AUDIT_NAMES[family]}.status')='not_configured'"
+            for family in active if self.is_required(family)
+        )
+        if new_provider:
+            return f"""({pending} OR (CASE WHEN json_valid(provider_calls_json)
+                         THEN ({new_provider}) ELSE 0 END))"""
+        return pending
 
 
 class RequestMonitor:
@@ -188,10 +216,17 @@ class RequestMonitor:
     def count(self, kind):
         with closing(self.db._get_connection()) as conn, conn:
             self.increment(conn, self.family, kind)
+            if server_wait and (transient or kind == "quota_exhaustion"):
+                conn.execute("""
+                    INSERT INTO provider_server_deadlines VALUES (?, ?)
+                    ON CONFLICT(provider) DO UPDATE SET until_utc=excluded.until_utc
+                """, (self.family, _utc_iso(now + timedelta(seconds=server_wait))))
+            elif clean:
+                conn.execute("DELETE FROM provider_server_deadlines WHERE provider=?", (self.family,))
 
     def observe(self, kind, latency, now, server_wait=None):
         transient = kind in {"rate_limits", "temporary_failures"}
-        clean = kind == "successful_responses"
+        clean = kind in {"successful_responses", "expected_empty_responses"}
         self.batch.append(transient)
         del self.batch[:-100]
         window_size = self.options.get("window", 10)
@@ -232,10 +267,16 @@ class RequestMonitor:
         return wait
 
 
-def provider_report(conn):
+def provider_report(conn, config=None):
     families = {**CAPABILITIES, "wikidata": set()}
     rows = conn.execute("SELECT provider,metric,value FROM provider_metrics")
-    result = {name: {"availability": "DISABLED"} for name in families}
+    enabled = {"musicbrainz", "wikidata"} if config is not None else set()
+    if config and config.provider_terms_cleared:
+        enabled.update(name for name, configured in (
+            ("sonovault", config.sonovault_api_key), ("audiometa", config.audiometa_api_key),
+            ("discogs", config.discogs_token),
+        ) if configured)
+    result = {name: {"availability": "AVAILABLE" if name in enabled else "DISABLED"} for name in families}
     for name, kind, value in rows:
         result.setdefault(name, {})[kind] = value
     now = _utc_iso()
@@ -258,10 +299,19 @@ def provider_report(conn):
                 state = "TEMPORARILY_UNAVAILABLE"
         else:
             state = "AVAILABLE"
+        if config is not None and name not in enabled:
+            state, deadline = "DISABLED", ""
         result.setdefault(name, {}).update(availability=state, next_retry_utc=deadline or "",
                                            reason=row["error_kind"])
+    for family, deadline in conn.execute("SELECT provider,until_utc FROM provider_server_deadlines"):
+        if deadline > now and family in result and result[family]["availability"] != "DISABLED":
+            result[family]["server_retry_until_utc"] = deadline
     for stats in result.values():
         attempts = stats.get("http_attempts", 0)
-        stats["failure_rate"] = (attempts - stats.get("successful_responses", 0)) / attempts if attempts else None
+        clean = stats.get("successful_responses", 0) + stats.get("expected_empty_responses", 0)
+        stats["failure_rate"] = (attempts - clean) / attempts if attempts else None
+        deadline = stats.get("next_retry_utc", "")
+        if deadline and deadline > now:
+            stats["deadline_source"] = "server" if stats.get("server_retry_until_utc") == deadline else "local_hold"
         stats["average_request_latency"] = stats.get("latency_seconds", 0) / attempts if attempts else None
     return result
