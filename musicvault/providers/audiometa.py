@@ -42,6 +42,7 @@ class AudioMetaProvider(BaseProvider):
         db: Optional[Any] = None,
         provider_terms_cleared: bool = False,
         default_delay: float = 0.85,
+        **kwargs: Any,
     ):
         super().__init__(
             "AudioMeta",
@@ -50,9 +51,10 @@ class AudioMetaProvider(BaseProvider):
             contact=contact,
             db=db,
             provider_terms_cleared=provider_terms_cleared,
+            **kwargs,
         )
         self.api_key = (api_key or "").strip() or None
-        self.register_secret(self.api_key)
+        self.register_secret(self.api_key, is_primary_credential=True)
 
     def verify_connectivity(self) -> ProviderCallOutcome:
         """Verify Bearer authentication and endpoint response with a lightweight search probe."""
@@ -86,25 +88,19 @@ class AudioMetaProvider(BaseProvider):
         headers = {"Authorization": f"Bearer {self.api_key}"}
         hits: Dict[str, Dict[str, Any]] = {}
         primary_outcome: Optional[ProviderCallOutcome] = None
+        incomplete_outcome: Optional[ProviderCallOutcome] = None
 
         queries = list(dict.fromkeys(q for q in [f"{artist} {title}".strip(), title, artist] if q.strip()))
         for q in queries[:2]:
-            if not self.can_request():
-                break
             out = self.request_detailed(
                 "https://api.audiometa.io/v1/search",
                 params={"q": q, "type": "track", "limit": 25},
                 headers=headers,
             )
-            if primary_outcome is None or out.status not in (ProviderStatus.OK, ProviderStatus.EMPTY):
+            if primary_outcome is None:
                 primary_outcome = out
             if out.status != ProviderStatus.OK:
-                if out.status in (
-                    ProviderStatus.AUTH_ERROR,
-                    ProviderStatus.QUOTA_EXCEEDED,
-                    ProviderStatus.RATE_LIMITED,
-                    ProviderStatus.UNSUPPORTED_ENDPOINT,
-                ):
+                if out.status != ProviderStatus.EMPTY:
                     return [], out
                 continue
 
@@ -123,12 +119,14 @@ class AudioMetaProvider(BaseProvider):
         candidates: List[Candidate] = []
         for track_id, search_item in list(hits.items())[:2]:
             track_data: Dict[str, Any] = search_item
-            if "audio_features" not in search_item and self.can_request():
+            if "audio_features" not in search_item:
                 detail_url = f"https://api.audiometa.io/v1/tracks/{urllib.parse.quote(track_id, safe='')}"
-                det_out = self.request_detailed(detail_url, headers=headers)
+                det_out = self.request_detailed(detail_url, headers=headers, allow_404_as_empty=True)
                 if det_out.status == ProviderStatus.OK and isinstance(det_out.data, dict):
                     inner = det_out.data.get("data")
                     track_data = inner if isinstance(inner, dict) else det_out.data
+                elif det_out.status != ProviderStatus.EMPTY and incomplete_outcome is None:
+                    incomplete_outcome = det_out
 
             artists = [
                 x.get("name", "") if isinstance(x, dict) else str(x)
@@ -170,6 +168,9 @@ class AudioMetaProvider(BaseProvider):
                         source_family="audiometa",
                     )
                 )
+
+        if incomplete_outcome is not None:
+            return candidates, incomplete_outcome
 
         final_out = primary_outcome or ProviderCallOutcome(provider=self.name, status=ProviderStatus.EMPTY)
         if final_out.status == ProviderStatus.OK and not candidates:

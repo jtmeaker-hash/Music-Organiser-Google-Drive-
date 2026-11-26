@@ -133,6 +133,8 @@ class Track:
     research_next_retry_utc: str = ""
     research_error: str = ""
     provider_calls_json: str = "{}"
+    research_incomplete: bool = False
+    research_deferrals: int = 0
 
 
 @dataclass
@@ -153,6 +155,8 @@ class Candidate:
     is_stale: bool = False
     match_confidence: str = ""
     source_family: str = ""
+    created_utc: str = ""
+    updated_utc: str = ""
 
 
 @dataclass

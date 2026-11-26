@@ -5,10 +5,10 @@ and labels all suggestions explicitly as review-only inferred hints (never catal
 """
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..core.genre import SUBGENRE_PARENT
-from .base import BaseProvider, ProviderStatus
+from .base import BaseProvider, ProviderCallOutcome, ProviderStatus
 
 logger = logging.getLogger("musicvault.research")
 
@@ -64,6 +64,7 @@ class ResearchProvider(BaseProvider):
         db: Optional[Any] = None,
         provider_terms_cleared: bool = False,
         default_delay: float = 1.0,
+        **kwargs: Any,
     ):
         super().__init__(
             "OnlineResearch",
@@ -72,6 +73,7 @@ class ResearchProvider(BaseProvider):
             contact=contact,
             db=db,
             provider_terms_cleared=provider_terms_cleared,
+            **kwargs,
         )
 
     @staticmethod
@@ -124,16 +126,8 @@ class ResearchProvider(BaseProvider):
                 )
         return hits, hints
 
-    def research_track(self, artist: str, title: str) -> Dict[str, Any]:
-        """Query Wikidata entities for track/artist genre hints with strict schema validation."""
-        if not self.can_request():
-            return {
-                "track": f"{artist} - {title}",
-                "hits": [],
-                "genre_hints": [],
-                "status": "BUDGET_REACHED",
-            }
-
+    def research_track_detailed(self, artist: str, title: str) -> Tuple[Dict[str, Any], ProviderCallOutcome]:
+        """Query Wikidata entities with structured ProviderCallOutcome diagnostics."""
         wiki_url = "https://www.wikidata.org/w/api.php"
         params = {
             "action": "wbsearchentities",
@@ -144,21 +138,44 @@ class ResearchProvider(BaseProvider):
         }
 
         out = self.request_detailed(wiki_url, params=params)
-        hits, hints = ([], [])
-        if out.status == ProviderStatus.OK:
-            hits, hints = self._extract_validated_hints(out.data, "wikidata_track")
+        if out.status != ProviderStatus.OK:
+            return {
+                "track": f"{artist} - {title}",
+                "hits": [],
+                "genre_hints": [],
+                "status": "BUDGET_REACHED" if out.status == ProviderStatus.BUDGET_EXHAUSTED else out.status.value,
+            }, out
 
-        if not hints and artist.strip() and self.can_request():
+        hits, hints = self._extract_validated_hints(out.data, "wikidata_track")
+        final_out = out
+
+        if not hints and artist.strip():
             artist_params = dict(params, search=artist.strip())
             art_out = self.request_detailed(wiki_url, params=artist_params)
             if art_out.status == ProviderStatus.OK:
                 a_hits, a_hints = self._extract_validated_hints(art_out.data, "wikidata_artist")
                 hits.extend(a_hits)
                 hints.extend(a_hints)
+            elif art_out.status != ProviderStatus.EMPTY:
+                final_out = art_out
+
+        if final_out.status == ProviderStatus.OK and not hints:
+            final_out = ProviderCallOutcome(
+                provider=self.name,
+                status=ProviderStatus.EMPTY,
+                http_status=final_out.http_status,
+                from_cache=final_out.from_cache,
+                request_made=final_out.request_made,
+            )
 
         return {
             "track": f"{artist} - {title}",
             "hits": hits[:8],
             "genre_hints": hints,
             "status": "REVIEW_ONLY — inferred knowledge-graph hints, not recording verification",
-        }
+        }, final_out
+
+    def research_track(self, artist: str, title: str) -> Dict[str, Any]:
+        """Query Wikidata entities for track/artist genre hints with strict schema validation."""
+        res, _ = self.research_track_detailed(artist, title)
+        return res

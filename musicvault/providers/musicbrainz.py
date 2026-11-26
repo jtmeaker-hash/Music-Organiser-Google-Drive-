@@ -15,6 +15,7 @@ class MusicBrainzProvider(BaseProvider):
 
     ALLOWS_OPEN_PERSISTENT_CACHE = True
     DEFAULT_CACHE_TTL_SECONDS = 7 * 86400
+    MIN_REQUIRED_DELAY_SECONDS = 1.1
 
     def __init__(
         self,
@@ -23,14 +24,18 @@ class MusicBrainzProvider(BaseProvider):
         db: Optional[Any] = None,
         provider_terms_cleared: bool = False,
         default_delay: float = 1.5,
+        **kwargs: Any,
     ):
+        # Enforce MusicBrainz >= 1 req/sec etiquette unconditionally (never allow zero-delay bypass)
+        enforced_delay = max(self.MIN_REQUIRED_DELAY_SECONDS, float(default_delay))
         super().__init__(
             "MusicBrainz",
-            default_delay=max(1.1, float(default_delay)) if default_delay > 0 else 0.0,
+            default_delay=enforced_delay,
             max_requests=max_requests,
             contact=contact,
             db=db,
             provider_terms_cleared=provider_terms_cleared,
+            **kwargs,
         )
 
     def search_detailed(
@@ -39,6 +44,7 @@ class MusicBrainzProvider(BaseProvider):
         base = "https://musicbrainz.org/ws/2/recording"
         hits: Dict[str, Tuple[Dict[str, Any], List[str]]] = {}
         primary_out: Optional[ProviderCallOutcome] = None
+        incomplete_out: Optional[ProviderCallOutcome] = None
 
         queries: List[str] = []
         if isrc and isrc.strip():
@@ -48,14 +54,13 @@ class MusicBrainzProvider(BaseProvider):
         if clean_title and clean_artist:
             queries.append(f'recording:"{clean_title}" AND artist:"{clean_artist}"')
 
-        for q in queries:
-            if not self.can_request():
-                break
+        for idx, q in enumerate(queries):
             out = self.request_detailed(base, params={"query": q, "fmt": "json", "limit": 15})
-            if primary_out is None or out.status != ProviderStatus.OK:
+            if primary_out is None:
                 primary_out = out
             if out.status != ProviderStatus.OK or not isinstance(out.data, dict):
-                if out.status in (ProviderStatus.RATE_LIMITED, ProviderStatus.AUTH_ERROR):
+                if out.status != ProviderStatus.EMPTY:
+                    incomplete_out = out
                     return [], out
                 continue
 
@@ -70,17 +75,23 @@ class MusicBrainzProvider(BaseProvider):
                 rec_title = str(rec.get("title") or "")
                 if match_track(artist, title, rec_title, artists):
                     hits[str(rec["id"])] = (rec, artists)
+            if hits:
+                break
 
         candidates: List[Candidate] = []
         for rec_id, (rec, artists) in list(hits.items())[:3]:
-            if not self.can_request():
-                break
             detail_url = f"{base}/{urllib.parse.quote(rec_id, safe='')}"
             det_out = self.request_detailed(
                 detail_url,
                 params={"fmt": "json", "inc": "isrcs+genres+tags+releases"},
+                allow_404_as_empty=True,
             )
-            detail = det_out.data if (det_out.status == ProviderStatus.OK and isinstance(det_out.data, dict)) else rec
+            if det_out.status == ProviderStatus.OK and isinstance(det_out.data, dict):
+                detail = det_out.data
+            else:
+                if det_out.status != ProviderStatus.EMPTY and incomplete_out is None:
+                    incomplete_out = det_out
+                detail = rec
 
             tags: List[str] = []
             for field_name in ("genres", "tags"):
@@ -107,6 +118,11 @@ class MusicBrainzProvider(BaseProvider):
                     source_family="musicbrainz",
                 )
             )
+            if incomplete_out is not None:
+                break
+
+        if incomplete_out is not None:
+            return candidates, incomplete_out
 
         final_out = primary_out or ProviderCallOutcome(provider=self.name, status=ProviderStatus.EMPTY)
         if final_out.status == ProviderStatus.OK and not candidates:

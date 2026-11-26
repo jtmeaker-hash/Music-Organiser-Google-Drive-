@@ -63,6 +63,7 @@ _REDACTION_PATTERNS = [
     (re.compile(r"\bamsk_[A-Za-z0-9_-]{8,}\b"), "<REDACTED_AUDIOMETA_KEY>"),
     (re.compile(r"\bya29\.[A-Za-z0-9._-]{12,}\b"), "<REDACTED_OAUTH_TOKEN>"),
     (re.compile(r"\b1//[A-Za-z0-9._-]{16,}\b"), "<REDACTED_REFRESH_TOKEN>"),
+    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "<REDACTED_CONTACT>"),
 ]
 
 
@@ -128,12 +129,15 @@ class Config:
         self.save()
 
     def known_secrets(self) -> List[str]:
-        """Return non-empty configured secret values strictly for redaction."""
+        """Return non-empty configured secret and private contact values strictly for redaction."""
         vals = [
             self.sonovault_api_key,
             self.audiometa_api_key,
             self.discogs_token,
         ]
+        raw_contact = (self.get("MUSICBRAINZ_CONTACT") or "").strip()
+        if raw_contact and raw_contact != DEFAULT_CONTACT:
+            vals.append(raw_contact)
         return [v for v in vals if v]
 
     def redact(self, text: Any) -> str:

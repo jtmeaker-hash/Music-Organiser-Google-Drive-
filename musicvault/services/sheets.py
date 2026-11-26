@@ -20,7 +20,7 @@ _VALID_DRIVE_ID_HEADERS = {
 _EXPECTED_FIELD_HEADER_ALIASES = {
     2: {"genre", "parentgenre", "primarygenre"},
     3: {"subgenre", "subgenres", "secondarygenre", "style"},
-    4: {"bpm", "tempo"},
+    4: {"bpm", "tempo", "bpmfull"},
     5: {"key", "camelot", "camelotkey", "musicalkey", "initialkey"},
 }
 _DRIVE_ID_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{10,80}$")
