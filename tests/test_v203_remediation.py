@@ -234,6 +234,23 @@ def test_remediation_2_sonovault_fallback_essential_fields_and_cooldown_deferral
     assert res2["status"] == "completed"
     assert calls == [("am", "City Lights"), ("sono", "City Lights")]
 
+    # Direct post-audit edge-case verification on fallback_needed_fields:
+    pol_direct = ProviderPolicy(cfg)
+    pol_direct.bind(db, {})
+    dummy_t = Track("edge_1", "A - B.flac", metadata=TrackMetadata(artist="A", title="B", duration=180.0, version="v1"))
+    # (a) Single-provider genre (MB ok + DC empty) + AM BPM/key -> still needs 2nd genre family for HIGH routing!
+    cands_single_genre = [
+        Candidate("MusicBrainz", "B", ["A"], duration=180.0, genre=["hardstyle"], verification="Duration supported", source_family="musicbrainz"),
+        Candidate("Audiometa", "B", ["A"], duration=180.0, bpm=150.0, key="8A", verification="Duration supported", source_family="audiometa"),
+    ]
+    assert pol_direct.fallback_needed_fields(dummy_t, cands_single_genre) == {"genre"}
+    # (b) Unresolvable primary genre conflict (MB Hardstyle vs DC Techno) + AM BPM/key -> must NOT waste SonoVault credit!
+    cands_conflict_genre = cands_single_genre + [
+        Candidate("Discogs release", "B", ["A"], duration=180.0, genre=["Techno"], verification="Duration supported", source_family="discogs"),
+    ]
+    assert pol_direct.fallback_needed_fields(dummy_t, cands_conflict_genre) == set()
+    assert pol_direct.reason_to_skip("sonovault", pol_direct.fallback_needed_fields(dummy_t, cands_conflict_genre)) == "sufficient_evidence"
+
 
 def test_remediation_3_process_batch_budget_replenishment_exceeds_250_requests(tmp_path, monkeypatch):
     monkeypatch.setenv("REQUIRED_RESEARCH_PROVIDERS", "musicbrainz")

@@ -196,7 +196,10 @@ class ProviderPolicy:
         """
         Compute unresolved essential fields (`identity`, `genre`, `bpm`, `key`) eligible to trigger
         a fallback provider (such as SonoVault in `SONOVAULT_MODE=fallback`).
-        Missing optional `subgenre` or `label` alone never trigger fallback calls.
+        - Parent-genre routing requires HIGH (2-family) verification on `genre`, whereas `bpm` and
+          `key` have a single primary provider (`AudioMeta`) so MEDIUM (1-family) suffices.
+        - Fields already in cross-provider conflict cannot be promoted by fallback and are skipped.
+        - Missing optional `subgenre` or `label` alone never trigger fallback calls.
         """
         proposed = build_track_proposal(track.metadata, candidates)
         missing = set()
@@ -209,8 +212,19 @@ class ProviderPolicy:
         if not verified:
             missing.add("identity")
         for field in ("genre", "bpm", "key"):
-            level, _ = field_decision(candidates, field, proposed)
-            if level == "LOW":
+            val = proposed.get(field, "")
+            level, reason = field_decision(candidates, field, proposed)
+            rsn_low = (reason or "").lower()
+            already_conflicting = (val == "CONFLICT") or (
+                bool(val)
+                and any(tok in rsn_low for tok in ("contradictory", "conflicting", "disagreement"))
+            )
+            if already_conflicting:
+                continue
+            if field == "genre":
+                if level != "HIGH":
+                    missing.add("genre")
+            elif level == "LOW":
                 missing.add(field)
         manual = self._manual_locked_fields(track.file_id)
         missing -= (manual & ESSENTIAL_FALLBACK_FIELDS)
@@ -239,7 +253,11 @@ class ProviderPolicy:
             entry = provider_audit.get(AUDIT_NAMES[other_fam])
             if p_inst is None and (not isinstance(entry, dict) or entry.get("status") in ("", "not_configured")):
                 continue
-            if isinstance(entry, dict) and entry.get("status") in ("not_configured", "disabled_by_policy"):
+            if isinstance(entry, dict) and entry.get("status") in (
+                "not_configured",
+                "disabled_by_policy",
+                "sufficient_evidence",
+            ):
                 continue
             if not (isinstance(entry, dict) and entry.get("lookup_completed") is True):
                 incomplete.append(other_fam)
