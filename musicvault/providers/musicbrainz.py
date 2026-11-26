@@ -106,6 +106,16 @@ class MusicBrainzProvider(BaseProvider):
             elif isrc_list:
                 matched_isrc = isrc_list[0]
 
+            labels: List[str] = []
+            for rel_item in (detail.get("releases") or []):
+                if not isinstance(rel_item, dict):
+                    continue
+                for li in (rel_item.get("label-info") or []):
+                    if isinstance(li, dict) and isinstance(li.get("label"), dict):
+                        lbl_name = str(li["label"].get("name") or "").strip()
+                        if lbl_name and lbl_name.lower() != "[no label]":
+                            labels.append(lbl_name)
+
             candidates.append(
                 Candidate(
                     provider="MusicBrainz",
@@ -114,6 +124,7 @@ class MusicBrainzProvider(BaseProvider):
                     duration=seconds_from_val(detail.get("length") or rec.get("length")),
                     isrc=matched_isrc,
                     genre=tags,
+                    labels=list(dict.fromkeys(labels)),
                     url=f"https://musicbrainz.org/recording/{rec_id}",
                     source_family="musicbrainz",
                 )

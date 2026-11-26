@@ -78,6 +78,23 @@ SUBGENRE_PARENT: Dict[str, str] = {
     'Dancefloor': 'Drum & Bass'
 }
 
+_SUBGENRE_ALIASES: Dict[str, str] = {
+    **{norm(k): k for k in SUBGENRE_PARENT},
+    'euphorichardstyle': 'Euphoric',
+    'hardtechno': 'Hard Techno',
+    'liquiddnb': 'Liquid',
+    'liquidfunk': 'Liquid',
+    'uptempohardcore': 'Uptempo',
+    'jumpupdnb': 'Jump Up',
+}
+
+
+def canonical_subgenre(style_name: Optional[str]) -> str:
+    """Resolve raw style/tag text case-insensitively to canonical SUBGENRE_PARENT name."""
+    if not style_name:
+        return ""
+    return _SUBGENRE_ALIASES.get(norm(style_name), "")
+
 # Known artist sound profiles (artist -> (Parent Genre, Subgenre))
 ARTIST_PROFILES: Dict[str, Tuple[str, str]] = {
     norm('Act of Rage'): ('Hardstyle', 'Rawstyle'),

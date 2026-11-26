@@ -342,8 +342,19 @@ class Database:
             """CREATE TABLE IF NOT EXISTS enrichment_work (
                 file_id TEXT NOT NULL, version TEXT NOT NULL, provider TEXT NOT NULL,
                 query_key TEXT NOT NULL, reason TEXT NOT NULL, due_utc TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(file_id, version, provider, query_key)
             )""",
+            """CREATE TABLE IF NOT EXISTS scan_folders (
+                scan_id INTEGER NOT NULL,
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                folder_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                visited INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(scan_id, folder_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS scan_folders_pending
+               ON scan_folders(scan_id, visited, sequence)""",
             """CREATE TABLE IF NOT EXISTS provider_metrics (
                 provider TEXT NOT NULL, metric TEXT NOT NULL, value REAL NOT NULL,
                 PRIMARY KEY(provider, metric)
@@ -360,6 +371,9 @@ class Database:
             )""",
         ):
             conn.execute(statement)
+        ew_cols = {r["name"] for r in conn.execute("PRAGMA table_info(enrichment_work)").fetchall()}
+        if ew_cols and "attempts" not in ew_cols:
+            conn.execute("ALTER TABLE enrichment_work ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
 
     def _seed_source_membership(self, conn: sqlite3.Connection) -> None:
         conn.execute("""
@@ -655,6 +669,10 @@ class Database:
             UPDATE tracks
             SET record_origin = 'live_scan',
                 observed_parent_id = parent_id,
+                configured_source_id = CASE
+                    WHEN COALESCE(configured_source_id, '') = '' THEN parent_id
+                    ELSE configured_source_id
+                END,
                 is_live_source = 1,
                 quarantined = 0,
                 quarantine_reason = ''
@@ -914,15 +932,23 @@ class Database:
                 "SELECT * FROM candidates WHERE file_id = ? AND COALESCE(is_stale, 0) = 0", (fid,)
             ).fetchall()
         ]
+        f_decs = [
+            dict(r)
+            for r in conn.execute("SELECT * FROM field_decisions WHERE file_id = ?", (fid,)).fetchall()
+        ]
+        snap = dict(existing_row)
+        if f_decs:
+            snap["_archived_field_decisions"] = f_decs
         conn.execute(
             """
             INSERT INTO evidence_history (
                 file_id, old_version, archived_utc, reason, track_snapshot_json, candidates_json
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (fid, old_ver, _utc_iso(), reason, json.dumps(dict(existing_row)), json.dumps(cands)),
+            (fid, old_ver, _utc_iso(), reason, json.dumps(snap), json.dumps(cands)),
         )
         conn.execute("UPDATE candidates SET is_stale = 1 WHERE file_id = ?", (fid,))
+        conn.execute("DELETE FROM field_decisions WHERE file_id = ? AND state != 'USER_LOCKED'", (fid,))
 
     # --- Checkpoints & Safe Track Persistence ---
 
@@ -1946,11 +1972,44 @@ class Database:
 
     # --- Queries ---
 
+    @staticmethod
+    def _ambiguous_membership_ids(conn: sqlite3.Connection) -> Set[str]:
+        has_rm = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+        ).fetchone()
+        if not has_rm:
+            return set()
+        return {
+            r[0]
+            for r in conn.execute(
+                """
+                SELECT file_id FROM root_membership
+                GROUP BY file_id
+                HAVING COUNT(DISTINCT role) > 1 OR MAX(ambiguous) = 1
+                """
+            ).fetchall()
+        }
+
     def get_track(self, file_id: str) -> Optional[Track]:
         """Fetch a track by its exact Google Drive file ID."""
         with self._get_connection() as conn:
             row = conn.execute("SELECT * FROM tracks WHERE file_id = ?", (file_id,)).fetchone()
-            return self._row_to_track(row) if row else None
+            if not row:
+                return None
+            tr = self._row_to_track(row)
+            has_rm = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+            ).fetchone()
+            if has_rm:
+                amb = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT role) > 1 OR COALESCE(MAX(ambiguous), 0) = 1
+                    FROM root_membership WHERE file_id = ?
+                    """,
+                    (file_id,),
+                ).fetchone()
+                tr.location_ambiguous = bool(amb and amb[0])
+            return tr
 
     def get_all_tracks(self, live_only: bool = False) -> List[Track]:
         """Fetch stored tracks (optionally restricted to live non-quarantined source tracks)."""
@@ -1961,7 +2020,13 @@ class Database:
                 ).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM tracks ORDER BY name ASC, file_id ASC").fetchall()
-            return [self._row_to_track(r) for r in rows]
+            amb_ids = self._ambiguous_membership_ids(conn)
+            tracks_out = []
+            for r in rows:
+                tr = self._row_to_track(r)
+                tr.location_ambiguous = tr.file_id in amb_ids
+                tracks_out.append(tr)
+            return tracks_out
 
     @staticmethod
     def _work_scope(process_run: Optional[Tuple[int, int]], stage: str, claimed_only: bool = False) -> str:
@@ -2469,6 +2534,77 @@ class Database:
                     (new_cd, new_lr, new_st, new_http, new_ek, new_rsn, new_fp, now, fam),
                 )
 
+    def clear_provider_quota_block(self, provider: str) -> int:
+        """
+        Clear a confirmed unknown quota block on `provider`, reset breaker/server deadline rows,
+        reset enrichment attempt counters for `provider`, and re-open non-quarantined tracks that
+        were parked in `unresolved` solely due to `quota_exceeded` on `provider`.
+        """
+        fam = canonical_provider_family(provider)
+        now = _utc_iso()
+        requeued = 0
+        with self._get_connection() as conn:
+            self.set_provider_operational_state(
+                fam,
+                cooldown_until_utc="",
+                last_status="ok",
+                error_kind="",
+                reason="",
+            )
+            has_brk = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_breakers'"
+            ).fetchone()
+            if has_brk:
+                conn.execute("DELETE FROM provider_breakers WHERE provider = ?", (fam,))
+                conn.execute("DELETE FROM provider_server_deadlines WHERE provider = ?", (fam,))
+                conn.execute("UPDATE enrichment_work SET attempts = 0, due_utc = '' WHERE provider = ?", (fam,))
+            rows = conn.execute(
+                """
+                SELECT file_id, provider_calls_json FROM tracks
+                WHERE quarantined = 0 AND research_status = 'unresolved'
+                """
+            ).fetchall()
+            still_blocked = {
+                r["provider"]
+                for r in conn.execute(
+                    "SELECT provider FROM provider_operational_state WHERE last_status IN ('auth_error','quota_exceeded','unsupported_endpoint') AND provider != ?",
+                    (fam,),
+                ).fetchall()
+            }
+            for row in rows:
+                try:
+                    audit = json.loads(row["provider_calls_json"] or "{}")
+                except ValueError:
+                    continue
+                if not isinstance(audit, dict):
+                    continue
+                had_cleared_quota = False
+                other_hard = False
+                for p_key, p_val in audit.items():
+                    if p_key == "_meta" or not isinstance(p_val, dict):
+                        continue
+                    pfam = canonical_provider_family(p_key)
+                    st = str(p_val.get("status") or "").strip().lower()
+                    if pfam == fam and st == "quota_exceeded":
+                        had_cleared_quota = True
+                    elif st in ("auth_error", "unsupported_endpoint") or (st == "quota_exceeded" and pfam in still_blocked):
+                        other_hard = True
+                if had_cleared_quota and not other_hard:
+                    conn.execute(
+                        """
+                        UPDATE tracks
+                        SET research_status = 'retryable_failure',
+                            research_incomplete = 1,
+                            research_next_retry_utc = '',
+                            research_error = ?,
+                            research_last_utc = ?
+                        WHERE file_id = ?
+                        """,
+                        (f"Quota reset confirmed for {fam}; queued for retry", now, row["file_id"]),
+                    )
+                    requeued += 1
+        return requeued
+
     def get_all_provider_operational_states(
         self,
         now_utc: Optional[datetime] = None,
@@ -2478,6 +2614,11 @@ class Database:
         now_dt = _norm_utc(now_utc)
         out: Dict[str, Dict[str, Any]] = {}
         with self._get_connection() as conn:
+            has_pos = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_operational_state'"
+            ).fetchone()
+            if not has_pos:
+                return out
             rows = conn.execute("SELECT * FROM provider_operational_state ORDER BY provider ASC").fetchall()
         for r in rows:
             d = dict(r)
@@ -2593,6 +2734,25 @@ class Database:
 
         with self._get_connection() as conn:
             all_rows = conn.execute("SELECT * FROM tracks ORDER BY file_id ASC").fetchall()
+            has_rm = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+            ).fetchone()
+            active_dest_ids = (
+                {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT DISTINCT file_id FROM root_membership WHERE role = 'destination'"
+                    ).fetchall()
+                }
+                if has_rm
+                else set()
+            )
+            active_hard_quota_fams = {
+                r["provider"]
+                for r in conn.execute(
+                    "SELECT provider FROM provider_operational_state WHERE last_status = 'quota_exceeded'"
+                ).fetchall()
+            }
             cand_counts = {
                 r["file_id"]: int(r["cnt"])
                 for r in conn.execute(
@@ -2614,7 +2774,8 @@ class Database:
         for row in all_rows:
             counts["total_records_inspected"] += 1
             fid = str(row["file_id"] or "")
-            if not bool(row["is_live_source"]) or bool(row["quarantined"]):
+            is_active_member = bool(row["is_live_source"]) or (fid in active_dest_ids)
+            if not is_active_member or bool(row["quarantined"]):
                 counts["excluded_quarantined_or_nonlive"] += 1
                 continue
             r_status = str(row["research_status"] or "pending")
@@ -2714,7 +2875,9 @@ class Database:
 
                 if (
                     st_p in _RECOVERABLE_PROVIDER_STATUSES
+                    or st_p == "deferred_primary_incomplete"
                     or alt_st in (_RECOVERABLE_PROVIDER_STATUSES | {"skipped_cooldown_or_budget"})
+                    or (st_p == "quota_exceeded" and fam not in active_hard_quota_fams)
                     or (p_val.get("lookup_completed") is False and p_val.get("retryable") is True)
                 ):
                     failed_transient_fams.append(fam)
@@ -2878,7 +3041,6 @@ class Database:
                                 research_error = ?,
                                 provider_calls_json = ?
                             WHERE file_id = ?
-                              AND is_live_source = 1
                               AND quarantined = 0
                               AND research_status != 'permanent_unsupported'
                             """,
@@ -3041,12 +3203,34 @@ class Database:
             mig_row = conn.execute(
                 "SELECT * FROM schema_migrations ORDER BY version DESC LIMIT 1"
             ).fetchone()
+            has_rm = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+            ).fetchone()
+            if has_rm:
+                src_mem = conn.execute(
+                    "SELECT COUNT(DISTINCT file_id) FROM root_membership WHERE role = 'source'"
+                ).fetchone()[0]
+                dst_mem = conn.execute(
+                    "SELECT COUNT(DISTINCT file_id) FROM root_membership WHERE role = 'destination'"
+                ).fetchone()[0]
+                uniq_mem = conn.execute(
+                    "SELECT COUNT(DISTINCT file_id) FROM root_membership"
+                ).fetchone()[0]
+                ovl_mem = conn.execute(
+                    "SELECT COUNT(*) FROM (SELECT file_id FROM root_membership GROUP BY file_id HAVING COUNT(DISTINCT role) > 1)"
+                ).fetchone()[0]
+            else:
+                src_mem, dst_mem, uniq_mem, ovl_mem = int(live), 0, int(live), 0
 
             return {
                 "schema_version": int(mig_row["version"]) if mig_row else 1,
                 "last_migration_backup": (mig_row["backup_path"] or "") if mig_row else "",
                 "total_records": int(total),
                 "live_source_tracks": int(live),
+                "source_membership_tracks": int(src_mem),
+                "destination_tracks": int(dst_mem),
+                "unique_library_tracks": int(uniq_mem),
+                "overlapping_root_tracks": int(ovl_mem),
                 "quarantined_records": int(quarantined),
                 "checkpoint_only_records": int(checkpoint_only),
                 "stale_live_tracks": int(stale),

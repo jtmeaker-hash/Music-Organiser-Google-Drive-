@@ -38,7 +38,8 @@ def main_menu(config: Config, db: Database) -> None:
             print("=" * width)
             print(f"  Env:       {env_info.short_label()}")
             print(
-                f"  Inventory: {inv['live_source_tracks']} live | "
+                f"  Inventory: {inv['live_source_tracks']} source | "
+                f"{inv.get('destination_tracks', 0)} vault | "
                 f"{inv['live_ready_identity']} ready | "
                 f"{inv['quarantined_records']} quarantined"
             )

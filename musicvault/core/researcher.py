@@ -480,7 +480,8 @@ def execute_research_batch(
                     remaining_calls = active_calls
                 while remaining_calls:
                     if policy is not None:
-                        needed = policy.needed_fields(t, stored + verify(track_candidates))
+                        combined_so_far = stored + verify(track_candidates)
+                        needed = policy.needed_fields(t, combined_so_far)
                         remaining_calls = policy.ordered(remaining_calls, needed)
                     p_name, p_inst, call_fn = remaining_calls.pop(0)
                     if p_inst is None:
@@ -528,7 +529,12 @@ def execute_research_batch(
 
                     if policy is not None:
                         family = canonical_provider_family(p_name)
-                        skip = policy.reason_to_skip(family, needed)
+                        effective_needed = (
+                            policy.fallback_needed_fields(t, combined_so_far)
+                            if policy.is_fallback_only(family)
+                            else needed
+                        )
+                        skip = policy.reason_to_skip(family, effective_needed)
                         if skip:
                             provider_audit[p_name] = {
                                 "status": skip, "lookup_completed": False, "actual_calls": 0,
@@ -542,8 +548,49 @@ def execute_research_batch(
                                     hard_blocked_incomplete_count += 1
                                 continue
                             policy.checkpoint(t, p_name, provider_audit[p_name])
-                            if skip == "terms_hold":
+                            if skip == "disabled_by_policy" and policy.required is not None and policy.is_required(family):
                                 configured_providers += 1
+                                hard_blocked_incomplete_count += 1
+                                hard_blocked_without_call += 1
+                            continue
+
+                        incomplete_primaries = policy.primary_incomplete_for_fallback(
+                            family, effective_needed, provider_audit
+                        )
+                        if incomplete_primaries:
+                            from .provider_policy import AUDIT_NAMES as _AUDIT_NAMES
+                            prim_deadlines = [
+                                str(provider_audit.get(_AUDIT_NAMES[pf], {}).get("retry_until_utc") or "").strip()
+                                for pf in incomplete_primaries
+                            ]
+                            prim_deadlines = [d for d in prim_deadlines if d]
+                            defer_until = min(prim_deadlines) if prim_deadlines else ""
+                            prim_retryable = bool(
+                                defer_until
+                                or any(
+                                    provider_audit.get(_AUDIT_NAMES[pf], {}).get("retryable")
+                                    for pf in incomplete_primaries
+                                )
+                            )
+                            provider_audit[p_name] = {
+                                "status": "deferred_primary_incomplete",
+                                "waiting_on": incomplete_primaries,
+                                "lookup_completed": False,
+                                "retryable": prim_retryable,
+                                "retry_until_utc": defer_until,
+                                "actual_calls": 0,
+                                "cache_hits": 0,
+                                "skipped_calls": 1,
+                                "request_made": False,
+                                "query_artist": artist,
+                                "query_title": title,
+                            }
+                            policy.checkpoint(t, p_name, provider_audit[p_name])
+                            configured_providers += 1
+                            if prim_retryable:
+                                retryable_incomplete_count += 1
+                                cooldown_deferred_without_call += 1
+                            else:
                                 hard_blocked_incomplete_count += 1
                                 hard_blocked_without_call += 1
                             continue
@@ -710,6 +757,7 @@ def execute_research_batch(
                         p is not None and p.can_request()
                         and (policy is None or (
                             policy.permits(canonical_provider_family(name))
+                            and not policy.is_fallback_only(canonical_provider_family(name))
                             and (not policy.provider or policy.provider == canonical_provider_family(name))
                         ))
                         for name, p in (("SonoVault", sono), ("AudioMeta", am), ("Discogs", dc), ("MusicBrainz", mb))

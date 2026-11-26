@@ -135,6 +135,7 @@ class Track:
     provider_calls_json: str = "{}"
     research_incomplete: bool = False
     research_deferrals: int = 0
+    location_ambiguous: bool = False
 
 
 @dataclass

@@ -47,9 +47,67 @@ class DriveService:
             self._auth_session = AuthorizedSession(self.credentials)
         return self._auth_session
 
-    def scan_inventory(self, root_folder_id: str, counters: Optional[Dict[str, int]] = None) -> Iterator[Dict[str, Any]]:
+    def _enumerate_single_folder(
+        self, folder_id: str, folder_path: List[str], corpus: Dict[str, Any]
+    ) -> tuple[List[Dict[str, Any]], List[tuple[str, str]], int, int]:
+        """Enumerate all pages of a single Drive folder before committing its completion."""
+        page_token = None
+        tokens = set()
+        audio_items: List[Dict[str, Any]] = []
+        child_folders: List[tuple[str, str]] = []
+        shortcuts = 0
+        unsupported = 0
+
+        while True:
+            resp = self.service.files().list(
+                q=f"'{folder_id}' in parents and trashed = false",
+                fields="nextPageToken,incompleteSearch,files(id,name,mimeType,size,md5Checksum,modifiedTime,parents)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                **corpus,
+                pageSize=1000,
+                pageToken=page_token,
+            ).execute(num_retries=3)
+
+            if resp.get("incompleteSearch"):
+                raise RuntimeError("Drive reported an incomplete folder listing.")
+            for item in resp.get("files", []):
+                mime = item.get("mimeType", "")
+                if mime == "application/vnd.google-apps.folder":
+                    child_folders.append(
+                        (item["id"], json.dumps([*folder_path, item.get("name", "")]))
+                    )
+                elif mime == "application/vnd.google-apps.shortcut":
+                    shortcuts += 1
+                else:
+                    ext = Path(item.get("name", "")).suffix.lower()
+                    if ext in SUPPORTED_AUDIO_EXTENSIONS:
+                        item["scanned_parent"] = folder_id
+                        item["scanned_path"] = [*folder_path, item.get("name", "")]
+                        audio_items.append(item)
+                    else:
+                        unsupported += 1
+
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+            if page_token in tokens:
+                raise RuntimeError("Drive repeated a pagination token.")
+            tokens.add(page_token)
+
+        return audio_items, child_folders, shortcuts, unsupported
+
+    def scan_inventory(
+        self,
+        root_folder_id: str,
+        counters: Optional[Dict[str, int]] = None,
+        db: Optional[Any] = None,
+        scan_id: Optional[int] = None,
+    ) -> Iterator[Dict[str, Any]]:
         """
         Recursively scan folder for supported audio files (read-only metadata list).
+        When `db` and `scan_id` are supplied, checkpoints completed folders in SQLite `scan_folders`
+        so interrupted scans resume without re-listing already-completed folders.
         Yields file dicts: id, name, mimeType, size, md5Checksum, modifiedTime, parents, scanned_parent.
         """
         counters = counters if counters is not None else {}
@@ -60,6 +118,44 @@ class DriveService:
             raise RuntimeError("Configured inventory root is not an accessible folder.")
         drive_id = root.get("driveId")
         corpus = {"corpora": "drive", "driveId": drive_id} if drive_id else {}
+
+        if db is not None and scan_id is not None:
+            with closing(db._get_connection()) as folders:
+                with folders:
+                    folders.execute(
+                        "INSERT OR IGNORE INTO scan_folders(scan_id, folder_id, path, visited) VALUES (?, ?, '[]', 0)",
+                        (int(scan_id), root_folder_id),
+                    )
+                while True:
+                    next_folder = folders.execute(
+                        """
+                        SELECT sequence, folder_id, path FROM scan_folders
+                        WHERE scan_id = ? AND visited = 0 ORDER BY sequence LIMIT 1
+                        """,
+                        (int(scan_id),),
+                    ).fetchone()
+                    if next_folder is None:
+                        break
+                    sequence, folder_id, path = next_folder["sequence"], next_folder["folder_id"], next_folder["path"]
+                    folder_path = json.loads(path)
+                    audio_items, child_folders, sc_cnt, un_cnt = self._enumerate_single_folder(
+                        folder_id, folder_path, corpus
+                    )
+                    for item in audio_items:
+                        yield item
+                    if sc_cnt:
+                        counters["shortcuts"] = counters.get("shortcuts", 0) + sc_cnt
+                    if un_cnt:
+                        counters["unsupported"] = counters.get("unsupported", 0) + un_cnt
+                    with folders:
+                        for child_id, child_path in child_folders:
+                            folders.execute(
+                                "INSERT OR IGNORE INTO scan_folders(scan_id, folder_id, path, visited) VALUES (?, ?, ?, 0)",
+                                (int(scan_id), child_id, child_path),
+                            )
+                        folders.execute("UPDATE scan_folders SET visited = 1 WHERE sequence = ?", (sequence,))
+            return
+
         # Keep the traversal frontier on disk so wide folder trees do not
         # accumulate in memory alongside a page of Drive results.
         with closing(sqlite3.connect("")) as folders:
@@ -78,43 +174,20 @@ class DriveService:
                 sequence, folder_id, path = next_folder
                 folders.execute("UPDATE pending SET visited=1 WHERE sequence=?", (sequence,))
                 folder_path = json.loads(path)
-                page_token = None
-                tokens = set()
-                while True:
-                    resp = self.service.files().list(
-                        q=f"'{folder_id}' in parents and trashed = false",
-                        fields="nextPageToken,incompleteSearch,files(id,name,mimeType,size,md5Checksum,modifiedTime,parents)",
-                        supportsAllDrives=True, includeItemsFromAllDrives=True, **corpus,
-                        pageSize=1000,
-                        pageToken=page_token,
-                    ).execute(num_retries=3)
-
-                    if resp.get("incompleteSearch"):
-                        raise RuntimeError("Drive reported an incomplete folder listing.")
-                    for item in resp.get("files", []):
-                        mime = item.get("mimeType", "")
-                        if mime == "application/vnd.google-apps.folder":
-                            folders.execute(
-                                "INSERT OR IGNORE INTO pending(folder_id,path) VALUES (?,?)",
-                                (item["id"], json.dumps([*folder_path, item.get("name", "")])),
-                            )
-                        elif mime == "application/vnd.google-apps.shortcut":
-                            counters["shortcuts"] = counters.get("shortcuts", 0) + 1
-                        else:
-                            ext = Path(item.get("name", "")).suffix.lower()
-                            if ext in SUPPORTED_AUDIO_EXTENSIONS:
-                                item["scanned_parent"] = folder_id
-                                item["scanned_path"] = [*folder_path, item.get("name", "")]
-                                yield item
-                            else:
-                                counters["unsupported"] = counters.get("unsupported", 0) + 1
-
-                    page_token = resp.get("nextPageToken")
-                    if not page_token:
-                        break
-                    if page_token in tokens:
-                        raise RuntimeError("Drive repeated a pagination token.")
-                    tokens.add(page_token)
+                audio_items, child_folders, sc_cnt, un_cnt = self._enumerate_single_folder(
+                    folder_id, folder_path, corpus
+                )
+                if sc_cnt:
+                    counters["shortcuts"] = counters.get("shortcuts", 0) + sc_cnt
+                if un_cnt:
+                    counters["unsupported"] = counters.get("unsupported", 0) + un_cnt
+                for child_id, child_path in child_folders:
+                    folders.execute(
+                        "INSERT OR IGNORE INTO pending(folder_id,path) VALUES (?,?)",
+                        (child_id, child_path),
+                    )
+                for item in audio_items:
+                    yield item
 
     def open_range_reader(
         self,
@@ -212,15 +285,28 @@ class DriveService:
                 _, done = downloader.next_chunk(num_retries=3)
 
     def get_children_folders(self, parent_id: str) -> Dict[str, List[str]]:
-        """Return map of folder name -> list of folder IDs under parent (read-only)."""
+        """Return map of folder name -> list of folder IDs under parent (read-only, shared-drive aware)."""
         found: Dict[str, List[str]] = {}
+        corpus: Dict[str, Any] = {}
+        files_api = self.service.files()
+        if hasattr(files_api, "get"):
+            try:
+                root = files_api.get(
+                    fileId=parent_id, fields="id,driveId,trashed", supportsAllDrives=True
+                ).execute(num_retries=3)
+                if isinstance(root, dict) and root.get("driveId"):
+                    corpus = {"corpora": "drive", "driveId": root["driveId"]}
+            except Exception:
+                corpus = {}
         token = None
         tokens = set()
         while True:
-            resp = self.service.files().list(
+            resp = files_api.list(
                 q=f"'{parent_id}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'",
                 fields="nextPageToken,incompleteSearch,files(id,name)",
-                supportsAllDrives=True, includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                **corpus,
                 pageSize=1000,
                 pageToken=token,
             ).execute(num_retries=3)
@@ -244,6 +330,7 @@ class DriveService:
         return self.service.files().get(
             fileId=file_id,
             fields="id, name, parents, mimeType, trashed",
+            supportsAllDrives=True,
         ).execute()
 
     def move_file(

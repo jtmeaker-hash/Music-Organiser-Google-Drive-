@@ -104,6 +104,12 @@ def run_status(
         print(f"  Migration bak:  {inv['last_migration_backup']}")
     print(f"  Total records:  {inv['total_records']}")
     print(f"    Live source:  {inv['live_source_tracks']} (ready artist+title: {inv['live_ready_identity']}, missing: {inv['live_missing_identity']})")
+    if inv.get("destination_tracks", 0) or inv.get("overlapping_root_tracks", 0):
+        print(
+            f"    Vault dest:   {inv.get('destination_tracks', 0)} | "
+            f"Unique union: {inv.get('unique_library_tracks', 0)} | "
+            f"Overlaps: {inv.get('overlapping_root_tracks', 0)}"
+        )
     print(f"    Quarantined:  {inv['quarantined_records']} (checkpoint-only: {inv['checkpoint_only_records']})")
     print(f"    Stale files:  {inv['stale_live_tracks']} | Unresolved conflicts: {inv['unresolved_conflicts']}")
     print(f"  Hydration:      {inv['hydration_status_counts'] or {'none': 0}}")
@@ -136,6 +142,9 @@ def run_status(
             "schema_version": inv["schema_version"],
             "total_records": inv["total_records"],
             "live_source_tracks": inv["live_source_tracks"],
+            "destination_tracks": inv.get("destination_tracks", 0),
+            "unique_library_tracks": inv.get("unique_library_tracks", 0),
+            "overlapping_root_tracks": inv.get("overlapping_root_tracks", 0),
             "quarantined_records": inv["quarantined_records"],
             "live_ready_identity": inv["live_ready_identity"],
             "live_missing_identity": inv["live_missing_identity"],

@@ -221,8 +221,8 @@ def dispatch(args: argparse.Namespace, config: Config, db: Database) -> int:
             if state.get("last_status") != "quota_exceeded" or state.get("cooldown_until_utc"):
                 print("No unknown quota block to clear for this provider.")
                 return 1
-            db.set_provider_operational_state(family, last_status="ok", cooldown_until_utc="")
-            print(f"Cleared the confirmed reset for {family}.")
+            requeued = db.clear_provider_quota_block(family)
+            print(f"Cleared the confirmed reset for {family} ({requeued} blocked track(s) re-opened).")
             return 0
         elif args.command == "process":
             return run_process_cli(args, config, db)

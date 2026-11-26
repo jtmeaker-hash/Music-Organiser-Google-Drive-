@@ -279,6 +279,12 @@ def evaluate_live_preview(
             )
             continue
 
+        if getattr(t, "location_ambiguous", False):
+            summary.rows.append(
+                _make_hold_row(None, empty_existing, {}, "AMBIGUOUS_OVERLAPPING_ROOT_MEMBERSHIP")
+            )
+            continue
+
         obs_parent = (t.observed_parent_id or t.parent_id or "").strip()
         if not obs_parent:
             summary.rows.append(_make_hold_row(None, empty_existing, {}, "MISSING_DRIVE_PARENT"))

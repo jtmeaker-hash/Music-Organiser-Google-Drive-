@@ -142,18 +142,27 @@ def validate_and_index_tracks_sheet(
     )
 
 
+def _col_letter(index_1_based: int) -> str:
+    result = ""
+    idx = max(1, int(index_1_based))
+    while idx:
+        idx, rem = divmod(idx - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
 class SheetsService:
     """Wrapper around Google Sheets v4 API."""
 
     def __init__(self, credentials: Credentials):
         self.service = build("sheets", "v4", credentials=credentials, requestBuilder=read_only_request)
 
-    def fetch_header_row(self, spreadsheet_id: str, range_name: str = "Tracks!A1:AA1") -> List[Any]:
-        """Fetch header row A1:AA1 from master spreadsheet (read-only)."""
+    def fetch_header_row(self, spreadsheet_id: str, range_name: str = "Tracks!1:1") -> List[Any]:
+        """Fetch header row from master spreadsheet (read-only)."""
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=range_name,
-        ).execute()
+        ).execute(num_retries=3)
         vals = resp.get("values", [[]])
         return vals[0] if vals else []
 
@@ -162,15 +171,15 @@ class SheetsService:
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=range_name,
-        ).execute()
+        ).execute(num_retries=3)
         return resp.get("values", [])
 
-    def iter_tracks_rows(self, spreadsheet_id: str, last_column: str, batch_size: int = 200):
+    def iter_tracks_rows(self, spreadsheet_id: str, last_column: str, batch_size: int = 1000):
         """Yield bounded pages using the declared grid bounds, including gaps."""
         metadata = self.service.spreadsheets().get(
             spreadsheetId=spreadsheet_id,
             fields="sheets(properties(title,gridProperties(rowCount)))",
-        ).execute()
+        ).execute(num_retries=3)
         tracks = next((s["properties"] for s in metadata.get("sheets", [])
                        if s.get("properties", {}).get("title") == "Tracks"), None)
         if not tracks:
@@ -183,8 +192,9 @@ class SheetsService:
 
     def load_verified_index(self, spreadsheet_id: str) -> VerifiedSheetIndex:
         """Fetch headers + rows (read-only) and validate schema, duplicate IDs, and missing IDs."""
-        header_row = self.fetch_header_row(spreadsheet_id)
-        data_rows = self.fetch_master_rows(spreadsheet_id)
+        header_row = self.fetch_header_row(spreadsheet_id, "Tracks!1:1")
+        last_col = _col_letter(max(27, len(header_row)))
+        data_rows = self.fetch_master_rows(spreadsheet_id, f"Tracks!A2:{last_col}")
         return validate_and_index_tracks_sheet(header_row, data_rows)
 
     def fetch_row(self, spreadsheet_id: str, row_num: int) -> List[Any]:
@@ -192,7 +202,7 @@ class SheetsService:
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=f"Tracks!A{row_num}:AA{row_num}",
-        ).execute()
+        ).execute(num_retries=3)
         vals = resp.get("values", [[]])
         return vals[0] if vals else []
 
@@ -201,7 +211,7 @@ class SheetsService:
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range="Tracks!Q1:AA1",
-        ).execute()
+        ).execute(num_retries=3)
         header = resp.get("values", [[]])[0]
         header = header + [""] * (len(EXTRA_HEADERS) - len(header))
         return not any(v and v != expected for v, expected in zip(header, EXTRA_HEADERS))
