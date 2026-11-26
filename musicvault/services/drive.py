@@ -13,6 +13,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
+from .read_only import read_only_request
+
 from .range_reader import (
     BudgetExceededError,
     ByteBudgetTracker,
@@ -35,7 +37,7 @@ class DriveService:
 
     def __init__(self, credentials: Credentials):
         self.credentials = credentials
-        self.service = build("drive", "v3", credentials=credentials)
+        self.service = build("drive", "v3", credentials=credentials, requestBuilder=read_only_request)
         self._auth_session: Optional[AuthorizedSession] = None
 
     def _get_auth_session(self) -> AuthorizedSession:
@@ -43,42 +45,62 @@ class DriveService:
             self._auth_session = AuthorizedSession(self.credentials)
         return self._auth_session
 
-    def scan_inventory(self, root_folder_id: str) -> Iterator[Dict[str, Any]]:
+    def scan_inventory(self, root_folder_id: str, counters: Optional[Dict[str, int]] = None) -> Iterator[Dict[str, Any]]:
         """
         Recursively scan folder for supported audio files (read-only metadata list).
         Yields file dicts: id, name, mimeType, size, md5Checksum, modifiedTime, parents, scanned_parent.
         """
-        queue = deque([root_folder_id])
+        counters = counters if counters is not None else {}
+        root = self.service.files().get(
+            fileId=root_folder_id, fields="id,mimeType,driveId,trashed", supportsAllDrives=True,
+        ).execute(num_retries=3)
+        if root.get("trashed") or root.get("mimeType") != "application/vnd.google-apps.folder":
+            raise RuntimeError("Configured inventory root is not an accessible folder.")
+        drive_id = root.get("driveId")
+        corpus = {"corpora": "drive", "driveId": drive_id} if drive_id else {}
+        queue = deque([(root_folder_id, ())])
         seen_folders = set()
 
         while queue:
-            folder_id = queue.popleft()
+            folder_id, folder_path = queue.popleft()
             if folder_id in seen_folders:
                 continue
             seen_folders.add(folder_id)
 
             page_token = None
+            tokens = set()
             while True:
                 resp = self.service.files().list(
                     q=f"'{folder_id}' in parents and trashed = false",
-                    fields="nextPageToken, files(id, name, mimeType, size, md5Checksum, modifiedTime, parents)",
+                    fields="nextPageToken,incompleteSearch,files(id,name,mimeType,size,md5Checksum,modifiedTime,parents)",
+                    supportsAllDrives=True, includeItemsFromAllDrives=True, **corpus,
                     pageSize=1000,
                     pageToken=page_token,
                 ).execute(num_retries=3)
 
+                if resp.get("incompleteSearch"):
+                    raise RuntimeError("Drive reported an incomplete folder listing.")
                 for item in resp.get("files", []):
                     mime = item.get("mimeType", "")
                     if mime == "application/vnd.google-apps.folder":
-                        queue.append(item["id"])
+                        queue.append((item["id"], (*folder_path, item.get("name", ""))))
+                    elif mime == "application/vnd.google-apps.shortcut":
+                        counters["shortcuts"] = counters.get("shortcuts", 0) + 1
                     else:
                         ext = Path(item.get("name", "")).suffix.lower()
                         if ext in SUPPORTED_AUDIO_EXTENSIONS:
                             item["scanned_parent"] = folder_id
+                            item["scanned_path"] = [*folder_path, item.get("name", "")]
                             yield item
+                        else:
+                            counters["unsupported"] = counters.get("unsupported", 0) + 1
 
                 page_token = resp.get("nextPageToken")
                 if not page_token:
                     break
+                if page_token in tokens:
+                    raise RuntimeError("Drive repeated a pagination token.")
+                tokens.add(page_token)
 
     def open_range_reader(
         self,
@@ -194,27 +216,7 @@ class DriveService:
         return found
 
     def ensure_folder(self, parent_id: str, folder_name: str, allow_live_writes: bool = False) -> str:
-        """
-        Ensure folder exists under parent (DISABLED in v2.0.1 read-only corrective build).
-        """
-        if not allow_live_writes:
-            raise RuntimeError(
-                "Live Google Drive folder creation is disabled in Music Vault v2.0.1 (read-only corrective build)."
-            )
-        folders = self.get_children_folders(parent_id)
-        ids = folders.get(folder_name, [])
-        if len(ids) > 1:
-            raise RuntimeError(f"Ambiguous duplicate folder detected on Google Drive: '{folder_name}'")
-        if ids:
-            return ids[0]
-
-        meta = {
-            "name": folder_name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [parent_id],
-        }
-        res = self.service.files().create(body=meta, fields="id").execute()
-        return res["id"]
+        raise RuntimeError("Live Google Drive folder creation is disabled in Music Vault v2.0.1 and later.")
 
     def inspect_file(self, file_id: str) -> Dict[str, Any]:
         """Fetch file metadata for pre-flight verification (read-only)."""
@@ -226,16 +228,4 @@ class DriveService:
     def move_file(
         self, file_id: str, new_parent_id: str, old_parent_id: str, allow_live_writes: bool = False
     ) -> Dict[str, Any]:
-        """
-        Move file on Google Drive by updating parents (DISABLED in v2.0.1 read-only corrective build).
-        """
-        if not allow_live_writes:
-            raise RuntimeError(
-                "Live Google Drive file moves are disabled in Music Vault v2.0.1 (read-only corrective build)."
-            )
-        return self.service.files().update(
-            fileId=file_id,
-            addParents=new_parent_id,
-            removeParents=old_parent_id,
-            fields="id, parents",
-        ).execute()
+        raise RuntimeError("Live Google Drive file moves are disabled in Music Vault v2.0.1 and later.")

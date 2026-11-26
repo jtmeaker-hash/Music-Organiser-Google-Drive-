@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+from .read_only import read_only_request
+
 from ..core.matcher import norm
 from ..core.rules import COL, EXTRA_HEADERS, FIELDS, parse_lock_states
 
@@ -165,7 +167,7 @@ class SheetsService:
     """Wrapper around Google Sheets v4 API."""
 
     def __init__(self, credentials: Credentials):
-        self.service = build("sheets", "v4", credentials=credentials)
+        self.service = build("sheets", "v4", credentials=credentials, requestBuilder=read_only_request)
 
     def fetch_header_row(self, spreadsheet_id: str, range_name: str = "Tracks!A1:AA1") -> List[Any]:
         """Fetch header row A1:AA1 from master spreadsheet (read-only)."""
@@ -234,66 +236,4 @@ class SheetsService:
         updates: List[Tuple[int, List[Any], List[Any]]],
         allow_live_writes: bool = False,
     ) -> int:
-        """
-        Future audited batch writer (DISABLED in Music Vault v2.0.1 read-only corrective build).
-
-        Residual Google Sheets v4 limitation documented for future write reviews:
-        - Pre-write row re-fetch followed by `values.batchUpdate` is NOT atomic across concurrent
-          spreadsheet editors (a narrow TOCTOU window exists).
-        - Fails closed if `allow_live_writes` is False, headers mismatch, lock JSON is malformed,
-          a locked field is touched, or concurrent edits occurred.
-        """
-        if not allow_live_writes:
-            raise RuntimeError(
-                "Live Google Sheets writes are disabled in Music Vault v2.0.1 (read-only corrective build)."
-            )
-
-        if not self.verify_headers(spreadsheet_id):
-            raise RuntimeError("Headers in Q1:AA1 do not match expected review schema.")
-
-        for row_num, old_vals, _ in updates:
-            _, old_lock_err = parse_lock_states(old_vals)
-            if old_lock_err:
-                raise RuntimeError(f"Malformed lock JSON at row {row_num}; refusing write (fail-closed).")
-            current = self.fetch_row(spreadsheet_id, row_num)
-            curr_states, curr_lock_err = parse_lock_states(current)
-            if curr_lock_err:
-                raise RuntimeError(f"Malformed current lock JSON at row {row_num}; refusing write (fail-closed).")
-            curr_padded = [str(x) if x is not None else "" for x in (list(current) + [""] * 27)[:27]]
-            old_padded = [str(x) if x is not None else "" for x in (list(old_vals) + [""] * 27)[:27]]
-            if curr_padded != old_padded:
-                raise RuntimeError(f"Concurrent sheet edit detected at row {row_num}; aborting write.")
-
-        requests_to_send = [{"range": "Tracks!Q1:AA1", "values": [EXTRA_HEADERS]}]
-        col_letters = {2: "C", 3: "D", 4: "E", 5: "F"}
-
-        for row_num, old_vals, new_vals in updates:
-            old_padded = [str(x) if x is not None else "" for x in (list(old_vals) + [""] * 27)[:27]]
-            new_padded = [str(x) if x is not None else "" for x in (list(new_vals) + [""] * 27)[:27]]
-            states, _ = parse_lock_states(old_padded)
-
-            for field_name in FIELDS:
-                col_idx = COL[field_name]
-                f_state = states.get(field_name, {}).get("state", "")
-                if f_state in ("HIGH_LOCKED", "USER_LOCKED"):
-                    continue
-                if not old_padded[col_idx] and new_padded[col_idx]:
-                    col_letter = col_letters[col_idx]
-                    requests_to_send.append(
-                        {"range": f"Tracks!{col_letter}{row_num}", "values": [[new_padded[col_idx]]]}
-                    )
-
-            # Write non-empty review cells individually or preserve existing Q:AA values rather than clearing
-            merged_review = [
-                new_padded[i] if new_padded[i] != "" else old_padded[i]
-                for i in range(16, 27)
-            ]
-            requests_to_send.append({"range": f"Tracks!Q{row_num}:AA{row_num}", "values": [merged_review]})
-
-        if requests_to_send:
-            self.service.spreadsheets().values().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body={"valueInputOption": "RAW", "data": requests_to_send},
-            ).execute()
-
-        return len(requests_to_send)
+        raise RuntimeError("Live Google Sheets writes are disabled in MusicVault.")

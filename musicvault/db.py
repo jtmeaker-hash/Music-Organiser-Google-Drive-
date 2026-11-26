@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import stat
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -14,7 +15,7 @@ from .core.matcher import extract_version_tokens, norm, parse_artists
 from .models import Candidate, Track, TrackMetadata
 from .providers.base import canonical_provider_family
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _AUDIO_EXTENSIONS = (
     ".mp3", ".wav", ".flac", ".aiff", ".aif",
@@ -149,11 +150,12 @@ def _candidate_edition_identity(
 class Database:
     """Manages persistent SQLite operations, verified migrations, caching, and checkpoints."""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, initialize: bool = True):
         self.db_path = Path(db_path)
         self.last_backup_path: Optional[Path] = None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_or_migrate()
+        if initialize:
+            self._init_or_migrate()
 
     def _get_connection(self, isolation_level: Optional[str] = "") -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0, isolation_level=isolation_level)
@@ -314,13 +316,85 @@ class Database:
                 return 1
             return 0
 
+    def _ensure_v3_tables(self, conn: sqlite3.Connection) -> None:
+        for statement in (
+            """CREATE TABLE IF NOT EXISTS root_membership (
+                role TEXT NOT NULL, root_id TEXT NOT NULL, file_id TEXT NOT NULL,
+                parent_id TEXT NOT NULL, path_json TEXT NOT NULL, scan_id INTEGER NOT NULL,
+                ambiguous INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (role, root_id, file_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS root_membership_file
+               ON root_membership(file_id, role, root_id)""",
+            """CREATE TABLE IF NOT EXISTS root_observation (
+                scan_id INTEGER NOT NULL, file_id TEXT NOT NULL, item_json TEXT NOT NULL,
+                ambiguous INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (scan_id, file_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS process_runs (
+                id INTEGER PRIMARY KEY, selection TEXT NOT NULL, phase TEXT NOT NULL,
+                state_json TEXT NOT NULL, updated_utc TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS process_work (
+                run_id INTEGER NOT NULL, file_id TEXT NOT NULL, version TEXT NOT NULL,
+                hydrated INTEGER NOT NULL DEFAULT 0, researched INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (run_id, file_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS enrichment_work (
+                file_id TEXT NOT NULL, version TEXT NOT NULL, provider TEXT NOT NULL,
+                query_key TEXT NOT NULL, reason TEXT NOT NULL, due_utc TEXT NOT NULL,
+                PRIMARY KEY(file_id, version, provider, query_key)
+            )""",
+            """CREATE TABLE IF NOT EXISTS scheduler_state (
+                name TEXT PRIMARY KEY, value INTEGER NOT NULL
+            )""",
+        ):
+            conn.execute(statement)
+
+    def _seed_source_membership(self, conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            INSERT OR IGNORE INTO root_membership
+                (role, root_id, file_id, parent_id, path_json, scan_id)
+            SELECT 'source', configured_source_id, file_id,
+                COALESCE(NULLIF(observed_parent_id, ''), parent_id, ''), '[]', scan_generation
+            FROM tracks WHERE is_live_source = 1 AND quarantined = 0
+                AND COALESCE(configured_source_id, '') != ''
+        """)
+
+    def _migrate_v2_to_v3(self) -> None:
+        conn = self._get_connection(isolation_level=None)
+        try:
+            # A separate reader can take the online backup while this connection
+            # holds the reserved writer lock, including when WAL is active.
+            conn.execute("PRAGMA busy_timeout = 0")
+            conn.execute("BEGIN IMMEDIATE")
+            backup = self.create_verified_backup("pre_v203_migration")
+            self._ensure_auxiliary_tables(conn)
+            self._ensure_v3_tables(conn)
+            self._seed_source_membership(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
+                (SCHEMA_VERSION, _utc_iso(), backup.name, "multi-root inventory and processing"),
+            )
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("COMMIT")
+        except (Exception, KeyboardInterrupt) as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            raise DatabaseMigrationError(f"Schema v3 migration aborted: {exc}") from exc
+        finally:
+            conn.close()
+
     def _init_or_migrate(self) -> None:
         """Initialize fresh v2 database or transactionally migrate v2.0.0 database after backup."""
         current_ver = self.get_schema_version()
-        if current_ver >= SCHEMA_VERSION:
-            # Ensure auxiliary indexes/tables exist idempotently without re-backing-up
-            with self._get_connection() as conn:
-                self._ensure_auxiliary_tables(conn)
+        if current_ver > SCHEMA_VERSION:
+            raise DatabaseMigrationError("Database schema is newer than this MusicVault build.")
+        if current_ver == SCHEMA_VERSION:
+            return
+        if current_ver == 2:
+            self._migrate_v2_to_v3()
             return
 
         if current_ver == 0:
@@ -384,9 +458,10 @@ class Database:
             )
             """)
             self._ensure_auxiliary_tables(conn)
+            self._ensure_v3_tables(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_migrations (version, applied_utc, backup_path, notes) VALUES (?, ?, ?, ?)",
-                (SCHEMA_VERSION, now, "", "initial_v2_schema"),
+                (SCHEMA_VERSION, now, "", "initial_v3_schema"),
             )
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
@@ -651,6 +726,9 @@ class Database:
               AND (TRIM(COALESCE(artist, '')) = '' OR TRIM(COALESCE(title, '')) = '')
               AND hydration_status != 'permanent_unsupported'
             """)
+
+            self._ensure_v3_tables(conn)
+            self._seed_source_membership(conn)
 
             # 6. Backfill candidate content_version and track research_status
             conn.execute("""
@@ -1067,7 +1145,8 @@ class Database:
             return int(cur.lastrowid)
 
     def reconcile_scanned_file(
-        self, scan_id: int, source_folder_id: str, item: Dict[str, Any]
+        self, scan_id: int, source_folder_id: str, item: Dict[str, Any],
+        connection: Optional[sqlite3.Connection] = None,
     ) -> str:
         """
         Reconcile a Drive file item by exact file_id without touching tags on unchanged files,
@@ -1076,7 +1155,7 @@ class Database:
         fid = str(item.get("id") or "").strip()
         now = _utc_iso()
         if not fid:
-            with self._get_connection() as conn:
+            with (nullcontext(connection) if connection is not None else self._get_connection()) as conn:
                 conn.execute(
                     "INSERT INTO audit_log (event_type, file_id, details_json, created_utc) VALUES (?, ?, ?, ?)",
                     ("SCAN_BLANK_FILE_ID", None, json.dumps({"name": item.get("name", "")}), now),
@@ -1092,7 +1171,7 @@ class Database:
         parent = str(item.get("scanned_parent") or (parents[0] if parents else "") or "")
         new_ver = md5 or mod
 
-        with self._get_connection() as conn:
+        with (nullcontext(connection) if connection is not None else self._get_connection()) as conn:
             existing = conn.execute("SELECT * FROM tracks WHERE file_id = ?", (fid,)).fetchone()
 
             if existing is None:

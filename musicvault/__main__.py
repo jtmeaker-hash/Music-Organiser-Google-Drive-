@@ -20,7 +20,8 @@ from .cli.commands import (
 from .cli.menu import main_menu
 from .cli.wizard import run_setup_wizard
 from .config import Config
-from .db import Database, DatabaseMigrationError
+from .db import Database, DatabaseMigrationError, SCHEMA_VERSION
+from .db_lock import database_lock
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
     # backup
     bk_p = subparsers.add_parser("backup", help="Create a verified timestamped SQLite online database backup")
     bk_p.add_argument("--label", type=str, default="manual", help="Short label included in backup filename")
+
+    migration = subparsers.add_parser("migrate", help="Back up and migrate the local database")
+    migration.add_argument("--confirm-stopped", required=True, action="store_true",
+                           help="Confirm older MusicVault processes are stopped")
 
     # scan
     sc_p = subparsers.add_parser("scan", help="Scan Google Drive source folder metadata inventory (read-only)")
@@ -117,11 +122,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     try:
-        db = Database(config.db_path)
-    except DatabaseMigrationError as exc:
-        sys.stderr.write(f"[✗] Database initialization/migration aborted safely: {config.redact(exc)}\n")
+        with database_lock(config.db_path):
+            db = Database(config.db_path, initialize=False)
+            version = db.get_schema_version()
+            if version > SCHEMA_VERSION:
+                raise DatabaseMigrationError("Database schema is newer than this build.")
+            if version and version < SCHEMA_VERSION and args.command not in {"status", "backup", "migrate"}:
+                raise DatabaseMigrationError("Run musicvault migrate --confirm-stopped after shutting down old processes.")
+            if args.command == "status" and version == 1:
+                print("Schema 1 database. Back up and migrate after verifying shutdown.")
+                return 0
+            if not version or args.command == "migrate":
+                db = Database(config.db_path)
+            if args.command == "migrate":
+                print(f"Local schema version {db.get_schema_version()}")
+                if db.last_backup_path:
+                    print(f"Verified backup: {db.last_backup_path}")
+                return 0
+            return dispatch(args, config, db)
+    except (DatabaseMigrationError, OSError, RuntimeError) as exc:
+        sys.stderr.write(f"[✗] {config.redact(exc)}\n")
         return 2
+    except KeyboardInterrupt:
+        return 130
 
+
+def dispatch(args: argparse.Namespace, config: Config, db: Database) -> int:
     try:
         if not args.command:
             main_menu(config, db)
