@@ -2595,6 +2595,7 @@ class Database:
                         UPDATE tracks
                         SET research_status = 'retryable_failure',
                             research_incomplete = 1,
+                            research_attempts = CASE WHEN research_attempts >= 3 THEN 2 ELSE research_attempts END,
                             research_next_retry_utc = '',
                             research_error = ?,
                             research_last_utc = ?

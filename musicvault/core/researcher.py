@@ -634,6 +634,23 @@ def execute_research_batch(
                         and alt_title
                         and prim_out.status in (ProviderStatus.OK, ProviderStatus.EMPTY)
                     ):
+                        if policy is not None and not reuse_empty:
+                            # Persist completed empty primary orientation before starting swapped HTTP call
+                            # so a hard kill during the alternate lookup never replays the primary request.
+                            policy.checkpoint(
+                                t,
+                                p_name,
+                                {
+                                    "status": "in_progress_alternate",
+                                    "lookup_completed": False,
+                                    "retryable": True,
+                                    "request_made": False,
+                                    "query_artist": artist,
+                                    "query_title": title,
+                                    "query_isrc": t.metadata.isrc,
+                                    "primary_query": prim_audit,
+                                },
+                            )
                         alt_cands, alt_out = call_fn(p_inst, alt_artist, alt_title)
                         _record_issue(alt_out)
                         alt_timed_q = _is_timed_quota_outcome(alt_out)

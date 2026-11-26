@@ -875,3 +875,223 @@ def test_remediation_13_cli_pre_migration_status_backup_and_explicit_migrate_wor
     assert inv["live_source_tracks"] == 1
     assert inv["source_membership_tracks"] == 1
 
+
+def test_remediation_14_forced_termination_crash_window_and_mb_search_label_extraction(
+    tmp_path, monkeypatch
+):
+    """
+    Verify Stage 1 / Stage 4 Item 13 interruption & crash-window guarantees without live API calls:
+    1. MusicBrainzProvider.search_detailed() extracts label-info from initial Lucene search releases
+       even when detail recording lookup omits label-info, and caches HTTP 200 sub-requests in SQLite
+       immediately so a mid-track hard kill replays 0 network requests on --resume.
+    2. Ambiguous 'A - B' filename: hard kill during swapped-orientation ('B - A') lookup never replays
+       the already-completed empty primary ('A - B') lookup on --resume, even on uncached providers.
+    3. Hard kill between HTTP response receipt (429 / 200) and policy.checkpoint() preserves durable
+       http_attempts telemetry, server deadlines, and pacing in SQLite, replaying at most the single
+       uncheckpointed uncached request on --resume.
+    """
+    monkeypatch.setenv("SONOVAULT_MODE", "fallback")
+    cfg = Config(tmp_path)
+    cfg.set("DISCOGS_TOKEN", "dc_tok")
+    cfg.set("AUDIOMETA_API_KEY", "am_tok")
+    cfg.set("SONOVAULT_API_KEY", "sv_tok")
+    db = Database(cfg.db_path)
+
+    class OneAmbiguousTrackDrive:
+        def scan_inventory(self, root):
+            if root == cfg.source_folder_id:
+                yield {
+                    "id": "crash_trk_1",
+                    "name": "TrackTitle - RealArtist.flac",
+                    "parents": [root],
+                    "scanned_parent": root,
+                    "md5Checksum": "vc1",
+                }
+            else:
+                return
+                yield
+
+    drive = OneAmbiguousTrackDrive()
+    run_process(cfg, db, drive, _proc_args(scope="source", inventory_only=True))
+    db.update_hydration_result(
+        "crash_trk_1",
+        "success",
+        "vc1",
+        method="filename_hint",
+        metadata=TrackMetadata(
+            version="vc1",
+            artist="TrackTitle",
+            title="RealArtist",
+            duration=195.0,
+            identity_origin="filename_hint",
+            identity_confidence="filename_ambiguous",
+        ),
+    )
+
+    # Real MusicBrainzProvider (open cache allowed) + mocked HTTP wire transport:
+    mb_wire_calls = []
+    mb = MusicBrainzProvider(
+        db=db,
+        default_delay=0.0,
+        clock_mono=lambda: 500.0,
+        clock_utc=lambda: datetime.now(timezone.utc),
+        sleep_fn=lambda _d: None,
+    )
+
+    def _mb_wire(url, params=None, **kw):
+        mb_wire_calls.append((url, dict(params or {})))
+        if url.endswith("/recording"):
+            q = (params or {}).get("query", "")
+            if 'artist:"RealArtist"' in q:
+                # Lucene search includes label-info on releases; detail endpoint below omits label-info!
+                return _http_resp(
+                    json.dumps({
+                        "recordings": [{
+                            "id": "mb-rec-99",
+                            "title": "TrackTitle",
+                            "length": 195000,
+                            "artist-credit": [{"name": "RealArtist"}],
+                            "releases": [{"id": "rel-1", "label-info": [{"label": {"name": "Roughstate"}}]}],
+                        }]
+                    })
+                )
+            return _http_resp('{"recordings": []}')
+        return _http_resp(
+            json.dumps({
+                "id": "mb-rec-99",
+                "title": "TrackTitle",
+                "length": 195000,
+                "genres": [{"name": "hardstyle", "count": 3}],
+                "releases": [{"id": "rel-1"}],  # No label-info on recording inc=releases!
+            })
+        )
+
+    monkeypatch.setattr(mb.session, "get", _mb_wire)
+
+    # Discogs (uncached under PROVIDER_TERMS_CLEARED=False): crashes during swapped-orientation ('RealArtist', 'TrackTitle')!
+    dc_calls = []
+    dc_crash_armed = {"swapped": True}
+
+    class CrashOnSwappedDC:
+        source_family = "discogs"
+        request_monitor = None
+        stats = {"calls": 0}
+        def _now_utc_normalized(self): return datetime.now(timezone.utc)
+        def can_request(self): return True
+        def search_detailed(self, artist, title):
+            dc_calls.append((artist, title))
+            if (artist, title) == ("TrackTitle", "RealArtist"):
+                return [], ProviderCallOutcome("Discogs", ProviderStatus.EMPTY, request_made=True)
+            if dc_crash_armed["swapped"]:
+                dc_crash_armed["swapped"] = False
+                raise KeyboardInterrupt("Simulated kill mid-swapped Discogs query")
+            return [
+                Candidate(
+                    "Discogs release", "TrackTitle", ["RealArtist"], duration=195.0,
+                    genre=["Hardstyle"], labels=["Roughstate"], verification="Duration supported", source_family="discogs",
+                )
+            ], ProviderCallOutcome("Discogs", ProviderStatus.OK, request_made=True)
+
+    # AudioMeta (uncached): crashes AFTER HTTP wire 200 completes inside search_detailed, BEFORE policy.checkpoint()!
+    am_wire_calls = []
+    am_crash_after_wire = {"armed": True}
+    am = AudioMetaProvider(
+        api_key="am_tok",
+        db=db,
+        provider_terms_cleared=False,
+        default_delay=0.0,
+        clock_mono=lambda: 600.0,
+        clock_utc=lambda: datetime.now(timezone.utc),
+        sleep_fn=lambda _d: None,
+    )
+
+    def _am_wire(url, params=None, **kw):
+        am_wire_calls.append((url, dict(params or {})))
+        return _http_resp('{"tracks": []}')
+
+    monkeypatch.setattr(am.session, "get", _am_wire)
+    orig_am_search = am.search_detailed
+
+    def _am_search_crash_post_http(artist, title):
+        cands, out = orig_am_search(artist, title)
+        if (artist, title) == ("RealArtist", "TrackTitle") and am_crash_after_wire["armed"]:
+            am_crash_after_wire["armed"] = False
+            raise KeyboardInterrupt("Simulated hard kill after HTTP response before policy.checkpoint")
+        return cands, out
+
+    monkeypatch.setattr(am, "search_detailed", _am_search_crash_post_http)
+
+    sono_calls = []
+
+    class StubSono:
+        source_family = "sonovault"
+        request_monitor = None
+        stats = {"calls": 0}
+        def _now_utc_normalized(self): return datetime.now(timezone.utc)
+        def can_request(self): return True
+        def search_detailed(self, artist, title, isrc=""):
+            sono_calls.append((artist, title))
+            return [
+                Candidate(
+                    "SonoVault", "TrackTitle", ["RealArtist"], duration=195.0,
+                    bpm=155.0, key="9A", genre=["Hardstyle"], verification="Duration supported", source_family="sonovault",
+                )
+            ], ProviderCallOutcome("SonoVault", ProviderStatus.OK, request_made=True)
+
+    provs = {"mb": mb, "dc": CrashOnSwappedDC(), "am": am, "sono": StubSono()}
+
+    # Run 1: MusicBrainz completes & checkpoints (with 'Roughstate' label extracted!); Discogs primary ('TrackTitle','RealArtist')
+    # completes empty & checkpoints pre-alternate; Discogs swapped ('RealArtist','TrackTitle') raises KeyboardInterrupt!
+    r1 = run_process(cfg, db, drive, _proc_args(scope="source"), policy=ProviderPolicy(cfg), providers_override=provs)
+    assert r1["status"] == "interrupted"
+    assert len(mb_wire_calls) == 3  # 1 empty primary + 1 swapped search + 1 recording detail
+    assert dc_calls == [("TrackTitle", "RealArtist"), ("RealArtist", "TrackTitle")]
+    assert sono_calls == []
+    stored_mb = [c for c in db.get_candidates("crash_trk_1") if c.source_family == "musicbrainz"]
+    assert len(stored_mb) == 1 and stored_mb[0].labels == ["Roughstate"]
+
+    # Run 2 (--resume): MusicBrainz is NOT replayed (0 wire calls); Discogs primary ('TrackTitle','RealArtist') is NOT replayed!
+    # Discogs swapped ('RealArtist','TrackTitle') succeeds; AudioMeta primary completes empty & checkpoints; AudioMeta swapped
+    # completes wire HTTP GET (durably incrementing http_attempts!) then crashes BEFORE policy.checkpoint()!
+    mb_wire_calls.clear()
+    dc_calls.clear()
+    r2 = run_process(cfg, db, drive, _proc_args(scope="source", resume=True), policy=ProviderPolicy(cfg), providers_override=provs)
+    assert r2["status"] == "interrupted"
+    assert mb_wire_calls == []  # Completed checkpoint never replayed!
+    assert dc_calls == [("RealArtist", "TrackTitle")]  # Pre-alternate checkpoint prevented primary replay!
+    assert len(am_wire_calls) == 4  # 2 primary ('A B', 'B') + 2 swapped ('B A', 'A') wire calls
+    with closing(db._get_connection()) as conn:
+        am_attempts_after_crash = conn.execute(
+            "SELECT value FROM provider_metrics WHERE provider='audiometa' AND metric='http_attempts'"
+        ).fetchone()[0]
+    assert am_attempts_after_crash == 4  # Durable wire-level quota accounting persisted despite crash before checkpoint!
+
+    # Run 3 (--resume in fresh provider instances simulating real OS restart after SIGKILL, so RAM _session_cache is empty!):
+    # MusicBrainz and Discogs are NOT replayed (0 calls); AudioMeta primary is NOT replayed (SQLite pre-alternate
+    # checkpoint saved its 2 wire calls!), so ONLY the 1 uncheckpointed swapped AudioMeta lookup (2 wire calls) replays,
+    # then SonoVault fallback runs cleanly!
+    dc_calls.clear()
+    am_wire_calls.clear()
+    mb_restarted = MusicBrainzProvider(
+        db=db, default_delay=0.0, clock_mono=lambda: 700.0,
+        clock_utc=lambda: datetime.now(timezone.utc), sleep_fn=lambda _d: None,
+    )
+    monkeypatch.setattr(mb_restarted.session, "get", _mb_wire)
+    am_restarted = AudioMetaProvider(
+        api_key="am_tok", db=db, provider_terms_cleared=False, default_delay=0.0,
+        clock_mono=lambda: 700.0, clock_utc=lambda: datetime.now(timezone.utc), sleep_fn=lambda _d: None,
+    )
+    monkeypatch.setattr(am_restarted.session, "get", _am_wire)
+    provs_restarted = {"mb": mb_restarted, "dc": CrashOnSwappedDC(), "am": am_restarted, "sono": StubSono()}
+
+    r3 = run_process(
+        cfg, db, drive, _proc_args(scope="source", resume=True),
+        policy=ProviderPolicy(cfg), providers_override=provs_restarted,
+    )
+    assert r3["status"] == "completed"
+    assert mb_wire_calls == []
+    assert dc_calls == []
+    assert len(am_wire_calls) == 2  # Residual crash window strictly bounded to the single in-flight swapped lookup!
+    assert len(sono_calls) >= 1
+
+

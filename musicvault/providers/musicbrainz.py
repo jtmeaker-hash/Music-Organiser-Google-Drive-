@@ -107,7 +107,7 @@ class MusicBrainzProvider(BaseProvider):
                 matched_isrc = isrc_list[0]
 
             labels: List[str] = []
-            for rel_item in (detail.get("releases") or []):
+            for rel_item in list(detail.get("releases") or []) + list(rec.get("releases") or []):
                 if not isinstance(rel_item, dict):
                     continue
                 for li in (rel_item.get("label-info") or []):

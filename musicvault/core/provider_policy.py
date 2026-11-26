@@ -335,7 +335,8 @@ class ProviderPolicy:
             next_attempts = prev_attempts + (1 if consume_attempt else 0)
             query_key = (
                 "alternate"
-                if (audit.get("primary_query") or {}).get("status") == "empty" and audit.get("alternate_query")
+                if (audit.get("primary_query") or {}).get("status") in ("ok", "empty")
+                and (audit.get("alternate_query") or status == "in_progress_alternate")
                 else "primary"
             )
             conn.execute(
