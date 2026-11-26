@@ -141,6 +141,71 @@ class ResearchRunSummary:
     actionable_issues: List[str] = field(default_factory=list)
 
 
+def build_research_providers(config, db, limit, clock_utc=None, clock_mono=None, sleep_fn=None):
+    terms_ok = config.provider_terms_cleared
+    clock_kwargs: Dict[str, Any] = {}
+    if clock_utc is not None:
+        clock_kwargs["clock_utc"] = clock_utc
+    if clock_mono is not None:
+        clock_kwargs["clock_mono"] = clock_mono
+    if sleep_fn is not None:
+        clock_kwargs["sleep_fn"] = sleep_fn
+
+    scaled_req_cap = min(250, max(30, int(limit) * 5))
+    sono = (
+        SonoVaultProvider(
+            api_key=config.sonovault_api_key,
+            contact=config.contact,
+            max_requests=min(200, max(25, int(limit) * 3)),
+            db=db,
+            provider_terms_cleared=terms_ok,
+            **clock_kwargs,
+        )
+        if config.sonovault_api_key
+        else None
+    )
+    am = (
+        AudioMetaProvider(
+            api_key=config.audiometa_api_key,
+            contact=config.contact,
+            max_requests=scaled_req_cap,
+            db=db,
+            provider_terms_cleared=terms_ok,
+            **clock_kwargs,
+        )
+        if config.audiometa_api_key
+        else None
+    )
+    dc = (
+        DiscogsProvider(
+            token=config.discogs_token,
+            contact=config.contact,
+            max_requests=min(250, max(40, int(limit) * 4)),
+            db=db,
+            provider_terms_cleared=terms_ok,
+            **clock_kwargs,
+        )
+        if config.discogs_token
+        else None
+    )
+    mb = MusicBrainzProvider(
+        contact=config.contact,
+        max_requests=scaled_req_cap,
+        db=db,
+        provider_terms_cleared=terms_ok,
+        **clock_kwargs,
+    )
+    wiki = ResearchProvider(
+        contact=config.contact,
+        max_requests=min(100, max(15, int(limit) * 2)),
+        db=db,
+        provider_terms_cleared=terms_ok,
+        **clock_kwargs,
+    )
+
+    return {"sono": sono, "am": am, "dc": dc, "mb": mb, "wiki": wiki}
+
+
 def execute_research_batch(
     config: Config,
     db: Database,
@@ -153,6 +218,8 @@ def execute_research_batch(
     clock_utc: Optional[Callable[[], datetime]] = None,
     clock_mono: Optional[Callable[[], float]] = None,
     sleep_fn: Optional[Callable[[float], None]] = None,
+    selected_tracks: Optional[List[Track]] = None,
+    policy: Optional[Any] = None,
 ) -> ResearchRunSummary:
     """
     Execute bounded metadata research on up to `limit` actually attempted live tracks.
@@ -163,47 +230,53 @@ def execute_research_batch(
     cur_utc = _norm_utc(now_fn())
 
     summary = ResearchRunSummary()
-    inv = db.get_inventory_summary()
-    summary.live_total = inv["live_source_tracks"]
-    summary.quarantined_excluded = inv["quarantined_records"]
-    summary.stale_excluded = inv["stale_live_tracks"]
+    if selected_tracks is None:
+        inv = db.get_inventory_summary()
+        summary.live_total = inv["live_source_tracks"]
+        summary.quarantined_excluded = inv["quarantined_records"]
+        summary.stale_excluded = inv["stale_live_tracks"]
 
-    all_live = db.get_all_tracks(live_only=True)
-    for t in all_live:
-        if t.content_stale:
-            continue
-        has_full_id = bool(t.metadata.artist.strip() and t.metadata.title.strip())
-        if not has_full_id:
-            if t.metadata.identity_confidence == "title_only" or t.metadata.filename_title_hint:
-                summary.deferred_title_only += 1
-            else:
-                summary.deferred_missing_identity += 1
-        elif (
-            t.research_status in ("success", "partial", "no_match")
-            and not t.research_incomplete
-            and (not t.research_version or t.research_version == t.metadata.version)
-        ):
-            summary.already_completed += 1
+        all_live = db.get_all_tracks(live_only=True)
+        for t in all_live:
+            if t.content_stale:
+                continue
+            has_full_id = bool(t.metadata.artist.strip() and t.metadata.title.strip())
+            if not has_full_id:
+                if t.metadata.identity_confidence == "title_only" or t.metadata.filename_title_hint:
+                    summary.deferred_title_only += 1
+                else:
+                    summary.deferred_missing_identity += 1
+            elif (
+                t.research_status in ("success", "partial", "no_match")
+                and not t.research_incomplete
+                and (not t.research_version or t.research_version == t.metadata.version)
+            ):
+                summary.already_completed += 1
 
-    q_diag = db.get_research_queue_diagnostics(
-        include_title_only=include_title_only,
-        now_utc=cur_utc,
-    )
-    summary.deferred_retry_not_due = q_diag["deferred_retry_not_due"]
-    summary.exhausted_retry_limit = q_diag["exhausted_retry_limit"]
-    summary.next_retry_utc = q_diag["earliest_next_retry_utc"]
-    for p_fam, p_state in (q_diag.get("active_provider_cooldowns") or {}).items():
-        cd_u = str(p_state.get("cooldown_until_utc") or "")
-        if cd_u:
-            summary.provider_cooldowns[p_fam] = cd_u
+        q_diag = db.get_research_queue_diagnostics(
+            include_title_only=include_title_only,
+            now_utc=cur_utc,
+        )
+        summary.deferred_retry_not_due = q_diag["deferred_retry_not_due"]
+        summary.exhausted_retry_limit = q_diag["exhausted_retry_limit"]
+        summary.next_retry_utc = q_diag["earliest_next_retry_utc"]
+        for p_fam, p_state in (q_diag.get("active_provider_cooldowns") or {}).items():
+            cd_u = str(p_state.get("cooldown_until_utc") or "")
+            if cd_u:
+                summary.provider_cooldowns[p_fam] = cd_u
 
-    queue = db.get_live_tracks_for_research(
-        limit=max(1, int(limit)),
-        force_refresh=force_refresh,
-        include_title_only=include_title_only,
-        now_utc=cur_utc,
-    )
-    summary.eligible_queue_size = len(queue)
+        queue = db.get_live_tracks_for_research(
+            limit=max(1, int(limit)),
+            force_refresh=force_refresh,
+            include_title_only=include_title_only,
+            now_utc=cur_utc,
+        )
+        summary.eligible_queue_size = len(queue)
+
+    else:
+        q_diag = {"unresolved_blocked": 0}
+        queue = selected_tracks
+        summary.live_total = summary.eligible_queue_size = len(queue)
 
     if not queue:
         if summary.live_total == 0:
@@ -240,73 +313,10 @@ def execute_research_batch(
             summary.no_work_reason = "No eligible tracks due for research or retry."
         return summary
 
-    terms_ok = config.provider_terms_cleared
-    clock_kwargs: Dict[str, Any] = {}
-    if clock_utc is not None:
-        clock_kwargs["clock_utc"] = clock_utc
-    if clock_mono is not None:
-        clock_kwargs["clock_mono"] = clock_mono
-    if sleep_fn is not None:
-        clock_kwargs["sleep_fn"] = sleep_fn
-
-    if providers_override is not None:
-        sono = providers_override.get("sono")
-        am = providers_override.get("am")
-        dc = providers_override.get("dc")
-        mb = providers_override.get("mb")
-        wiki = providers_override.get("wiki")
-    else:
-        scaled_req_cap = min(250, max(30, int(limit) * 5))
-        sono = (
-            SonoVaultProvider(
-                api_key=config.sonovault_api_key,
-                contact=config.contact,
-                max_requests=min(200, max(25, int(limit) * 3)),
-                db=db,
-                provider_terms_cleared=terms_ok,
-                **clock_kwargs,
-            )
-            if config.sonovault_api_key
-            else None
-        )
-        am = (
-            AudioMetaProvider(
-                api_key=config.audiometa_api_key,
-                contact=config.contact,
-                max_requests=scaled_req_cap,
-                db=db,
-                provider_terms_cleared=terms_ok,
-                **clock_kwargs,
-            )
-            if config.audiometa_api_key
-            else None
-        )
-        dc = (
-            DiscogsProvider(
-                token=config.discogs_token,
-                contact=config.contact,
-                max_requests=min(250, max(40, int(limit) * 4)),
-                db=db,
-                provider_terms_cleared=terms_ok,
-                **clock_kwargs,
-            )
-            if config.discogs_token
-            else None
-        )
-        mb = MusicBrainzProvider(
-            contact=config.contact,
-            max_requests=scaled_req_cap,
-            db=db,
-            provider_terms_cleared=terms_ok,
-            **clock_kwargs,
-        )
-        wiki = ResearchProvider(
-            contact=config.contact,
-            max_requests=min(100, max(15, int(limit) * 2)),
-            db=db,
-            provider_terms_cleared=terms_ok,
-            **clock_kwargs,
-        )
+    providers = providers_override if providers_override is not None else build_research_providers(
+        config, db, limit, clock_utc, clock_mono, sleep_fn
+    )
+    sono, am, dc, mb, wiki = (providers.get(key) for key in ("sono", "am", "dc", "mb", "wiki"))
 
     seen_issue_keys = set()
     observed_retry_deadlines: List[str] = []

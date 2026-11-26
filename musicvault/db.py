@@ -1951,6 +1951,17 @@ class Database:
                 rows = conn.execute("SELECT * FROM tracks ORDER BY name ASC, file_id ASC").fetchall()
             return [self._row_to_track(r) for r in rows]
 
+    @staticmethod
+    def _work_scope(process_run: Optional[Tuple[int, int]], stage: str) -> str:
+        if process_run is None:
+            return "is_live_source = 1"
+        run_id, epoch = map(int, process_run)
+        return f"""EXISTS (
+            SELECT 1 FROM process_work w
+            WHERE w.run_id={run_id} AND w.file_id=tracks.file_id
+              AND w.version=tracks.version AND w.{stage} != {epoch}
+        )"""
+
     def get_live_tracks_for_hydration(
         self,
         limit: int,
@@ -1958,6 +1969,7 @@ class Database:
         max_attempts: int = 4,
         force_rehydrate: bool = False,
         use_sheet_uninspected: bool = False,
+        process_run: Optional[Tuple[int, int]] = None,
     ) -> List[Track]:
         """
         Select live source tracks needing metadata hydration or retry.
@@ -1965,12 +1977,13 @@ class Database:
         file version unless force_rehydrate=True or sheet identity lookup is newly requested.
         """
         now = _utc_iso()
+        live_clause = self._work_scope(process_run, "hydrated")
         with self._get_connection() as conn:
             if force_rehydrate:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM tracks
-                    WHERE is_live_source = 1
+                    WHERE {live_clause}
                       AND quarantined = 0
                       AND hydration_status != 'permanent_unsupported'
                     ORDER BY content_stale DESC, hydration_attempts ASC, file_id ASC
@@ -1999,7 +2012,7 @@ class Database:
             rows = conn.execute(
                 f"""
                 SELECT * FROM tracks
-                WHERE is_live_source = 1
+                WHERE {live_clause}
                   AND quarantined = 0
                   AND hydration_status != 'permanent_unsupported'
                   AND (
@@ -2034,12 +2047,19 @@ class Database:
         include_title_only: bool = False,
         max_attempts: int = 3,
         now_utc: Optional[datetime] = None,
+        process_run: Optional[Tuple[int, int]] = None,
+        queue_class: str = "",
+        enrichment_condition: str = "0",
     ) -> List[Track]:
         """
         Select next batch of live, non-stale tracks with searchable identity for online research.
         Includes pending tracks, version-changed tracks, due retryable_failure tracks, and
         incomplete tracks (research_incomplete=1) whose retry deadline has arrived.
         """
+        live_clause = self._work_scope(process_run, "researched")
+        first_pass = "(research_status = 'pending' AND research_attempts = 0 AND research_deferrals = 0 AND research_last_utc = '')"
+        queue_filter = {"first": first_pass, "retry": f"NOT {first_pass}"}.get(queue_class, "1")
+        retry_order = "COALESCE(NULLIF(research_last_utc, ''), research_next_retry_utc), " if queue_class == "retry" else ""
         now_dt = _norm_utc(now_utc)
         now = _utc_iso(now_dt)
         with self._get_connection() as conn:
@@ -2079,13 +2099,14 @@ class Database:
             rows = conn.execute(
                 f"""
                 SELECT * FROM tracks
-                WHERE is_live_source = 1
+                WHERE {live_clause}
                   AND quarantined = 0
                   AND content_stale = 0
                   AND {identity_clause}
-                  AND {status_clause}
+                  AND ({status_clause} OR ({enrichment_condition}))
+                  AND ({queue_filter})
                 ORDER BY
-                    CASE WHEN research_status = 'pending' THEN 0 ELSE 1 END ASC,
+                    {retry_order}CASE WHEN research_status = 'pending' THEN 0 ELSE 1 END ASC,
                     research_attempts ASC,
                     COALESCE(research_deferrals, 0) ASC,
                     file_id ASC

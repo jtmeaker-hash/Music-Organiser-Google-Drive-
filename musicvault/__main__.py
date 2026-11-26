@@ -3,6 +3,7 @@ Package CLI entrypoint for Music Vault Manager v2.0.2.
 """
 import argparse
 import sys
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from typing import List, Optional
 
@@ -19,7 +20,11 @@ from .cli.commands import (
 )
 from .cli.menu import main_menu
 from .cli.wizard import run_setup_wizard
+from .auth import GoogleAuthManager
 from .config import Config
+from .core.process import run_process, snapshot_database
+from .services.drive import DriveService
+from .cli.formatting import export_safe_csv, export_safe_json
 from .db import Database, DatabaseMigrationError, SCHEMA_VERSION
 from .db_lock import database_lock
 
@@ -53,6 +58,21 @@ def build_parser() -> argparse.ArgumentParser:
     sc_p.add_argument("--max-mib", type=float, default=32.0, help="Byte budget in MiB when --hydrate is enabled (default: 32)")
     sc_p.add_argument("--allow-full-download", action="store_true", help="Explicitly opt in to bounded temp file download on Range fallback")
     sc_p.add_argument("--verbose", action="store_true", help="Show full Drive IDs")
+
+    process = subparsers.add_parser("process", help="Run the resumable read-only library pipeline")
+    process.add_argument("--scope", choices=("source", "destination", "all"), default="all")
+    process.add_argument("--limit", type=int, default=0)
+    process.add_argument("--batch-size", type=int, default=10)
+    process.add_argument("--cooldown", type=float, default=0)
+    process.add_argument("--concurrency", type=int, choices=range(1, 5), default=1)
+    process.add_argument("--resume", action="store_true")
+    process.add_argument("--inventory-only", action="store_true")
+    process.add_argument("--dry-run", action="store_true")
+    process.add_argument("--file-id", action="append", default=[])
+    process.add_argument("--provider", default="", help="Resume enrichment for one provider family")
+    process.add_argument("--verbose", action="store_true", help="Include full file IDs in local exports")
+    process.add_argument("--export-json", default="")
+    process.add_argument("--export-csv", default="")
 
     # hydrate
     hy_p = subparsers.add_parser("hydrate", help="Hydrate audio tags & duration via bounded HTTP Range reads")
@@ -115,6 +135,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     """CLI entrypoint."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "process":
+        if args.limit < 0 or args.batch_size < 1 or not 0 <= args.cooldown < float("inf"):
+            parser.error("process requires a non-negative limit and cooldown and a positive batch size")
+        if args.provider and not args.resume:
+            parser.error("--provider requires --resume")
+        if args.dry_run and args.resume:
+            parser.error("--dry-run starts a disposable run")
     config = Config()
 
     if args.command == "setup":
@@ -122,6 +149,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     try:
+        if args.command == "process" and args.dry_run:
+            with TemporaryDirectory(prefix="musicvault-dry-run-") as directory:
+                target = Path(directory) / "library.db"
+                snapshot_database(config.db_path, target)
+                return run_process_cli(args, config, Database(target))
         with database_lock(config.db_path):
             db = Database(config.db_path, initialize=False)
             version = db.get_schema_version()
@@ -140,17 +172,38 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(f"Verified backup: {db.last_backup_path}")
                 return 0
             return dispatch(args, config, db)
-    except (DatabaseMigrationError, OSError, RuntimeError) as exc:
+    except (DatabaseMigrationError, OSError, RuntimeError, ValueError) as exc:
         sys.stderr.write(f"[✗] {config.redact(exc)}\n")
         return 2
     except KeyboardInterrupt:
         return 130
 
 
+def run_process_cli(args, config, db):
+    creds = GoogleAuthManager(config).get_credentials(
+        allow_interactive=not args.dry_run, persist_refresh=not args.dry_run,
+    )
+    if not creds:
+        print("Google authentication is required to read Drive inventory.")
+        return 2
+    result = run_process(config, db, DriveService(creds), args,
+                         drive_factory=lambda: DriveService(creds))
+    print(config.redact(result))
+    if args.export_json:
+        export_safe_json(Path(args.export_json), result, config.known_secrets())
+    if args.export_csv:
+        rows = [{"role": role, **info} for role, info in result["roots"].items()]
+        fields = list(dict.fromkeys(key for row in rows for key in row))
+        export_safe_csv(Path(args.export_csv), fields, rows, config.known_secrets())
+    return {"failed": 1, "interrupted": 130}.get(result["status"], 0)
+
+
 def dispatch(args: argparse.Namespace, config: Config, db: Database) -> int:
     try:
         if not args.command:
             main_menu(config, db)
+        elif args.command == "process":
+            return run_process_cli(args, config, db)
         elif args.command == "status":
             run_status(
                 config,
