@@ -1,25 +1,33 @@
 """
-Parent genre classification, alias normalization, and taxonomy management.
+Parent genre classification, granular subgenre taxonomy, placeholder detection, and alias normalization.
 """
-import re
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .matcher import norm, parse_artists
 from ..models import Candidate, TrackMetadata
+from .matcher import norm, parse_artists
 
 # Canonical parent genres and common aliases
 ALIASES_PARENT: Dict[str, str] = {
     'hardstyle': 'Hardstyle',
     'rawstyle': 'Hardstyle',
+    'rawphoric': 'Hardstyle',
     'euphorichardstyle': 'Hardstyle',
     'xtraraw': 'Hardstyle',
     'frenchcore': 'Hardstyle',
     'uptempo': 'Hardstyle',
     'reversebass': 'Hardstyle',
+    'slowtempohardstyle': 'Hardstyle',
+    'mainstreamhardstyle': 'Hardstyle',
+    'mainstreamfestivalhardstyle': 'Hardstyle',
     'hardcore': 'Hardcore',
+    'uptempohardcore': 'Hardcore',
+    'gabber': 'Hardcore',
+    'mainstreamhardcore': 'Hardcore',
     'techno': 'Techno',
     'hypertechno': 'Techno',
     'hardtechno': 'Techno',
+    'industrialtechno': 'Techno',
+    'acidtechno': 'Techno',
     'trance': 'Trance',
     'drumandbass': 'Drum & Bass',
     'drumbass': 'Drum & Bass',
@@ -33,12 +41,28 @@ ALIASES_PARENT: Dict[str, str] = {
     'hiphop': 'Hip-Hop',
     'hiphoprap': 'Hip-Hop',
     'rap': 'Hip-Hop',
+    'phonk': 'Hip-Hop',
     'house': 'House',
+    'progressivehouse': 'House',
+    'basshouse': 'House',
+    'slaphouse': 'House',
+    'techhouse': 'House',
+    'futurehouse': 'House',
+    'tropicalhouse': 'House',
     'ukgarage': 'UK Garage',
     'garage': 'UK Garage',
     'dubstep': 'Dubstep',
+    'dubstepandbass': 'Dubstep',
+    'dubstepbass': 'Dubstep',
     'pop': 'Pop',
+    'popandalternative': 'Pop',
+    'popalternative': 'Pop',
     'rock': 'Rock',
+    'poppunk': 'Rock',
+    'alternativerock': 'Rock',
+    'country': 'Country',
+    'contemporarycountry': 'Country',
+    'hardbounce': 'Hard Bounce',
     'reggae': 'Reggae',
     'jungle': 'Jungle',
     'bassline': 'Bassline',
@@ -53,39 +77,83 @@ ALIASES_PARENT: Dict[str, str] = {
     'electro': 'Electro',
     'trap': 'Trap',
     'rnb': 'R&B',
-    'rhythmandblues': 'R&B'
+    'rhythmandblues': 'R&B',
 }
 
 # Generic non-informative tags to ignore during parent classification
 GENERIC_TAGS: Set[str] = {
     'electronic', 'edm', 'dance', 'music', 'unknown', 'other',
-    'various', 'harddance', 'club', 'all'
+    'various', 'harddance', 'club', 'all', 'unclassified', 'needsreview', 'pending',
 }
 
-# Subgenre to parent mapping (preserved for future re-enabling)
+SHEET_GENRE_PLACEHOLDERS: Set[str] = {
+    'unclassified', 'needsreview', 'pending', 'unknown', 'tbd', 'none', 'na',
+}
+
+UMBRELLA_CLUB_GENRES: Set[str] = {
+    'danceclub', 'danceandclub',
+}
+
+SHEET_SUBGENRE_PLACEHOLDERS: Set[str] = {
+    'needsreview', 'subgenrepending', 'pending', 'unclassified', 'unknown', 'tbd', 'none', 'na',
+}
+
+# Approved granular subgenre -> parent genre taxonomy
 SUBGENRE_PARENT: Dict[str, str] = {
     'Euphoric': 'Hardstyle',
     'Rawstyle': 'Hardstyle',
+    'Rawphoric': 'Hardstyle',
     'Xtra Raw': 'Hardstyle',
     'Reverse Bass': 'Hardstyle',
+    'Slowtempo': 'Hardstyle',
+    'Mainstream Hardstyle': 'Hardstyle',
     'Frenchcore': 'Hardcore',
     'Uptempo': 'Hardcore',
+    'Gabber': 'Hardcore',
+    'Mainstream Hardcore': 'Hardcore',
     'Hypertechno': 'Techno',
     'Hard Techno': 'Techno',
+    'Industrial Techno': 'Techno',
+    'Acid Techno': 'Techno',
     'Jump Up': 'Drum & Bass',
     'Liquid': 'Drum & Bass',
     'Neurofunk': 'Drum & Bass',
-    'Dancefloor': 'Drum & Bass'
+    'Dancefloor': 'Drum & Bass',
+    'Progressive House': 'House',
+    'Bass House': 'House',
+    'Slap House': 'House',
+    'Tech House': 'House',
+    'Future House': 'House',
+    'Tropical House': 'House',
+    'Pop Punk': 'Rock',
+    'Alternative Rock': 'Rock',
+    'Phonk': 'Hip-Hop',
+    'Melodic Rap': 'Hip-Hop',
 }
 
 _SUBGENRE_ALIASES: Dict[str, str] = {
     **{norm(k): k for k in SUBGENRE_PARENT},
     'euphorichardstyle': 'Euphoric',
+    'euphoricclassic': 'Euphoric',
+    'melodichardstyle': 'Euphoric',
+    'rawstylemodern': 'Rawstyle',
+    'rawstylerawphoric': 'Rawphoric',
+    'extraraw': 'Xtra Raw',
+    'classicreversebass': 'Reverse Bass',
+    'slowtempohardstyle': 'Slowtempo',
+    'mainstreamfestival': 'Mainstream Hardstyle',
+    'mainstreamfestivalhardstyle': 'Mainstream Hardstyle',
+    'festivalhardstyle': 'Mainstream Hardstyle',
     'hardtechno': 'Hard Techno',
+    'hardtechnorave': 'Hard Techno',
+    'schranz': 'Hard Techno',
+    'hardtechnoindustrial': 'Industrial Techno',
     'liquiddnb': 'Liquid',
     'liquidfunk': 'Liquid',
     'uptempohardcore': 'Uptempo',
+    'gabbermainstreamhardcore': 'Mainstream Hardcore',
     'jumpupdnb': 'Jump Up',
+    'dancefloordnb': 'Dancefloor',
 }
 
 
@@ -95,7 +163,31 @@ def canonical_subgenre(style_name: Optional[str]) -> str:
         return ""
     return _SUBGENRE_ALIASES.get(norm(style_name), "")
 
-# Known artist sound profiles (artist -> (Parent Genre, Subgenre))
+
+def is_genre_placeholder(raw_genre: Any) -> bool:
+    """Return True when a spreadsheet Genre cell contains a non-evidence placeholder (e.g. Unclassified)."""
+    n = norm(raw_genre)
+    return bool(n and n in SHEET_GENRE_PLACEHOLDERS)
+
+
+def is_umbrella_club_genre(raw_genre: Any) -> bool:
+    """Return True when a spreadsheet Genre cell holds an umbrella Dance/Club bucket."""
+    return norm(raw_genre) in UMBRELLA_CLUB_GENRES
+
+
+def is_subgenre_placeholder(raw_subgenre: Any) -> bool:
+    """Return True when a spreadsheet Subgenre cell holds a review/pending placeholder."""
+    s = str(raw_subgenre or "").strip()
+    if not s:
+        return False
+    n = norm(s)
+    if n in SHEET_SUBGENRE_PLACEHOLDERS:
+        return True
+    s_low = s.casefold()
+    return s_low.endswith("subgenre pending") or s_low.endswith("(review)")
+
+
+# Known artist sound profiles (artist -> (Parent Genre, Subgenre)) — LOW review hints only, never sole inference
 ARTIST_PROFILES: Dict[str, Tuple[str, str]] = {
     norm('Act of Rage'): ('Hardstyle', 'Rawstyle'),
     norm('Wasted Penguinz'): ('Hardstyle', 'Euphoric'),
@@ -111,14 +203,16 @@ ARTIST_PROFILES: Dict[str, Tuple[str, str]] = {
     norm('Dr. Peacock'): ('Hardstyle', 'Frenchcore'),
     norm('Da Tweekaz'): ('Hardstyle', 'Euphoric'),
     norm('Luude'): ('Drum & Bass', ''),
-    norm('Basstripper'): ('Drum & Bass', 'Jump Up')
+    norm('Basstripper'): ('Drum & Bass', 'Jump Up'),
 }
 
-# Known label profiles
+# Known label profiles — LOW review hints unless recording-verified catalogue genre is present
 LABEL_PROFILES: Dict[str, Tuple[str, str]] = {
     norm('Minus is More'): ('Hardstyle', 'Rawstyle'),
     norm('Scantraxx'): ('Hardstyle', ''),
-    norm('Dirty Workz'): ('Hardstyle', '')
+    norm('Dirty Workz'): ('Hardstyle', ''),
+    norm('Roughstate'): ('Hardstyle', 'Rawstyle'),
+    norm('Art of Creation'): ('Hardstyle', 'Euphoric'),
 }
 
 
@@ -132,10 +226,23 @@ def canonical_genre(genre_name: Optional[str]) -> str:
 def decide_genre(existing_genre: str, evidence_genres: List[str], locked: bool = False) -> Tuple[str, str]:
     """
     Decide parent genre based on existing spreadsheet value vs fresh catalogue evidence.
+    - Treats placeholders ('Unclassified', 'Needs Review') as empty.
+    - Allows umbrella 'Dance / Club' / 'Dance & Club' upgrade to 'Hardstyle' ONLY when
+      recording-supported catalogue evidence unanimously identifies 'Hardstyle' without conflict.
     Returns: (genre, status_reason)
     """
-    g = canonical_genre(existing_genre)
     votes = set(evidence_genres) - {''}
+
+    if is_umbrella_club_genre(existing_genre):
+        if locked:
+            return '', 'USER_LOCKED'
+        if len(votes) > 1:
+            return '', 'CONFLICT'
+        if votes == {'Hardstyle'}:
+            return 'Hardstyle', 'UMBRELLA_DANCE_CLUB_TO_HARDSTYLE'
+        return '', 'UMBRELLA_DANCE_CLUB_HOLD'
+
+    g = '' if is_genre_placeholder(existing_genre) else canonical_genre(existing_genre)
 
     if locked and g:
         return g, 'USER_LOCKED_DISCREPANCY' if (votes - {g}) else 'USER_LOCKED'
@@ -153,11 +260,15 @@ def decide_genre(existing_genre: str, evidence_genres: List[str], locked: bool =
     return '', 'UNKNOWN'
 
 
-def classify_track_genres(meta: TrackMetadata, candidates: List[Candidate],
-                          enable_subgenres: bool = False) -> Dict[str, Any]:
+def classify_track_genres(
+    meta: TrackMetadata,
+    candidates: List[Candidate],
+    enable_subgenres: bool = False,
+) -> Dict[str, Any]:
     """
     Perform weighted evidence classification across candidates, artist, and label profiles.
-    Parent genre classification is prioritized; subgenre classification can be toggled.
+    Note: Artist/label profile votes alone never reach MEDIUM or HIGH in `field_decision` —
+    they serve strictly as LOW-confidence review hints and conflict cross-checks.
     """
     votes: Dict[str, Dict[str, int]] = {}
     subs: Dict[str, Dict[str, int]] = {}
@@ -165,14 +276,15 @@ def classify_track_genres(meta: TrackMetadata, candidates: List[Candidate],
 
     def add_vote(raw_g: str, category: str, weight: int) -> None:
         raw_clean = raw_g.strip()
-        canon = canonical_genre(raw_clean)
+        canon_sub = canonical_subgenre(raw_clean)
+        canon = canonical_genre(raw_clean) or (SUBGENRE_PARENT.get(canon_sub, "") if canon_sub else "")
         if not canon:
             if norm(raw_clean) not in GENERIC_TAGS:
                 unmapped_tags.add(raw_clean)
             return
         votes.setdefault(canon, {})[category] = weight
-        if raw_clean in SUBGENRE_PARENT:
-            subs.setdefault(raw_clean, {})[category] = weight
+        if canon_sub and SUBGENRE_PARENT.get(canon_sub) == canon:
+            subs.setdefault(canon_sub, {})[category] = weight
 
     for c in candidates:
         v = (c.verification or "").lower()
@@ -180,7 +292,6 @@ def classify_track_genres(meta: TrackMetadata, candidates: List[Candidate],
             continue
         p = c.provider
         if 'wikidata' in p.lower() or 'inferred' in v:
-            # Knowledge-graph hints are surfaced separately for human review, not weighted as catalogue votes
             continue
         if p == 'Discogs release':
             cat, w = 'release', 25
@@ -201,7 +312,6 @@ def classify_track_genres(meta: TrackMetadata, candidates: List[Candidate],
                 if sub and enable_subgenres:
                     add_vote(sub, 'label', 10)
 
-    # Artist profile influence
     parsed = set(parse_artists(meta.artist))
     if meta.identity_origin == 'filename fallback' and meta.title:
         parsed.update(parse_artists(meta.title))
@@ -221,13 +331,13 @@ def classify_track_genres(meta: TrackMetadata, candidates: List[Candidate],
             'genre_confidence': 'missing',
             'subgenre_confidence': 'missing',
             'genre_scores': '',
-            'unmapped_tags': sorted(unmapped_tags)
+            'unmapped_tags': sorted(unmapped_tags),
         }
 
     score, top_genre = ranked[0]
     conflict = len(ranked) > 1 and (
-        score - ranked[1][0] < 15 or
-        ('catalogue' in votes[ranked[1][1]] and 'artist' in votes[top_genre])
+        score - ranked[1][0] < 15
+        or ('catalogue' in votes[ranked[1][1]] and 'artist' in votes[top_genre])
     )
 
     chosen_sub = ""
@@ -235,7 +345,7 @@ def classify_track_genres(meta: TrackMetadata, candidates: List[Candidate],
     if enable_subgenres:
         eligible = sorted(
             ((sum(v.values()), s) for s, v in subs.items() if SUBGENRE_PARENT.get(s) == top_genre),
-            reverse=True
+            reverse=True,
         )
         if eligible and (len(eligible) == 1 or eligible[0][0] > eligible[1][0]):
             chosen_sub = eligible[0][1]
@@ -253,5 +363,5 @@ def classify_track_genres(meta: TrackMetadata, candidates: List[Candidate],
         'genre_confidence': status,
         'subgenre_confidence': sub_confidence,
         'genre_scores': '; '.join(f'{g}:{s}' for s, g in ranked),
-        'unmapped_tags': sorted(unmapped_tags)
+        'unmapped_tags': sorted(unmapped_tags),
     }

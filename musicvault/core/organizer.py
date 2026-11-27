@@ -12,7 +12,13 @@ from ..models import Candidate, MovePlanItem, RoutingConfidence, Track
 from ..providers.base import canonical_provider_family
 from .genre import GENERIC_TAGS, SUBGENRE_PARENT, canonical_genre, classify_track_genres, decide_genre
 from .matcher import norm
-from .rules import build_track_proposal, load_existing_states, parse_lock_states, planned_row
+from .rules import (
+    build_track_proposal,
+    inspect_sheet_row_semantics,
+    load_existing_states,
+    parse_lock_states,
+    planned_row,
+)
 
 
 # Strict parent-only spelling aliases for Vault folder matching (never maps subgenres like Rawstyle/Jump Up!)
@@ -32,8 +38,15 @@ _PARENT_FOLDER_SPELLING_ALIASES: Dict[str, str] = {
     "ukgarage": "UK Garage",
     "garage": "UK Garage",
     "dubstep": "Dubstep",
+    "dubstepandbass": "Dubstep",
+    "dubstepbass": "Dubstep",
     "pop": "Pop",
+    "popandalternative": "Pop",
+    "popalternative": "Pop",
     "rock": "Rock",
+    "country": "Country",
+    "contemporarycountry": "Country",
+    "hardbounce": "Hard Bounce",
     "reggae": "Reggae",
     "jungle": "Jungle",
     "bassline": "Bassline",
@@ -383,10 +396,15 @@ def evaluate_live_preview(
 
         gs = states.get("genre", {}).get("state", "")
         ss = states.get("subgenre", {}).get("state", "")
-        if gs in ("CONFLICT", "LOW_CONFLICT", "REJECTED") or ss in ("CONFLICT", "LOW_CONFLICT", "REJECTED"):
+        sem = inspect_sheet_row_semantics(old_row)
+        if (
+            gs in ("CONFLICT", "LOW_CONFLICT", "REJECTED", "REVIEW_HOLD")
+            or ss in ("CONFLICT", "LOW_CONFLICT", "REJECTED")
+            or any(fl in sem["row_flags"] for fl in ("potential_duplicate_hold", "keep_in_source_hold", "human_genre_conflict_hold"))
+        ):
             summary.conflict_holds += 1
             summary.rows.append(
-                _make_hold_row(row_num, existing_vals, f_decisions, "METADATA_LOCK_CONFLICT", star_val=new_row[16] or "★")
+                _make_hold_row(row_num, existing_vals, f_decisions, "METADATA_OR_HUMAN_REVIEW_HOLD", star_val=new_row[16] or "★")
             )
             continue
 

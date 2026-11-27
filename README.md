@@ -1,8 +1,8 @@
-# Music Vault Manager (`v2.0.3` — Full-Library Inventory & Resumable Read-Only Processing)
+# Music Vault Manager (`v2.0.4` — Full-Vault Inventory & Spreadsheet Intelligence)
 
-## MusicVault 2.0.3
+## MusicVault 2.0.4
 
-MusicVault inventories the configured source and destination vault by exact Drive file ID, with folder-level resume checkpoints and atomic per-root publication. Unified processing (`musicvault process`) resumes bounded hydration, field-aware research with SonoVault quota protection, reconciliation, and local coverage/Sheets/routing previews. Destination files are eligible for research without becoming move-eligible. All Google Drive and Google Sheets mutations remain unconditionally blocked at the service request boundary.
+MusicVault inventories the configured source and destination vault by exact Drive file ID, with folder-level resume checkpoints and atomic per-root publication. Unified processing (`musicvault process`) resumes bounded hydration, field-aware research with SonoVault quota protection, spreadsheet lock/placeholder/provenance reconciliation (honoring `Processing Status`, `Analysis Confidence`, and `Notes / Override` in `L/M/P` alongside `Q:AA`), recording-verified granular subgenre classification (`Euphoric`, `Rawstyle`, `Slowtempo`, etc.), evidence-backed `Dance/Club` $\to$ `Hardstyle` upgrades, integer BPM clustering with corroborated octave reconciliation, and local coverage/Sheets/routing previews. All Google Drive and Google Sheets mutations remain unconditionally blocked at the service request boundary.
 
 - Use `musicvault process --scope all --inventory-only --dry-run` to preview inventory.
 - Use `musicvault process --scope all` for unified processing and add `--resume` to continue a paused or interrupted run.

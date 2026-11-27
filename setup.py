@@ -5,7 +5,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="musicvault",
-    version="2.0.3",
+    version="2.0.4",
     description="Standalone Audio Library & Metadata Organizer for Termux on Android",
     author="Jacob Tyler Meaker",
     author_email="jtmeaker@gmail.com",

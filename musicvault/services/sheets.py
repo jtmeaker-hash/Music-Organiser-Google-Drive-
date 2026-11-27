@@ -59,6 +59,9 @@ def resolve_tracks_headers(header_row: List[Any]) -> VerifiedSheetIndex:
         14: _VALID_DRIVE_ID_HEADERS,
         0: {"title", "tracktitle", "songtitle"},
         1: {"artist", "artists", "primaryartist"},
+        11: {"processingstatus", "status"},
+        12: {"analysisconfidence", "confidence"},
+        15: {"notesoverride", "notes", "override", "manualoverride"},
     }
     for canonical, accepted in aliases.items():
         matches = [i for i, label in enumerate(normalized) if label in accepted and not 16 <= i <= 26]
@@ -66,7 +69,7 @@ def resolve_tracks_headers(header_row: List[Any]) -> VerifiedSheetIndex:
             return VerifiedSheetIndex(False, f"INCOMPATIBLE_HEADERS: ambiguous aliases for field {canonical}", headers)
         if matches:
             columns[canonical] = matches[0]
-        elif canonical >= 2:
+        elif canonical in (2, 3, 4, 5, 14):
             if normalized[canonical]:
                 return VerifiedSheetIndex(False, f"INCOMPATIBLE_HEADERS: missing field at column {canonical + 1}", headers)
             columns[canonical] = canonical

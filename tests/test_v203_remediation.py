@@ -424,7 +424,8 @@ def test_remediation_5_terms_cleared_false_in_session_visibility_cache_gate_and_
     assert rep["fields"]["source"]["bpm"]["verified"] == 1
     assert rep["fields"]["source"]["bpm"]["terms_hold"] == 1
     row = json.loads(exp.read_text())["rows"][0]
-    assert row["fields"]["bpm"]["value"] == "150.0"
+    assert row["fields"]["bpm"]["value"] == "150"
+    assert len(row["fields"]["bpm"]["raw_measurements"]) == 2
     assert row["fields"]["bpm"]["proposed"] == ""
     assert row["fields"]["bpm"]["terms_hold"] is True
 

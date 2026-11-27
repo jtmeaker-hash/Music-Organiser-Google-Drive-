@@ -5,6 +5,8 @@ on:
     branches:
       - feature/termux-modular-app
       - feature/v2.0.3
+      - feature/v2.0.4
+      - "feature/**"
       - "fix/**"
   pull_request:
     branches:

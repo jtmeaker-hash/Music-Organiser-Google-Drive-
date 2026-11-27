@@ -1,5 +1,5 @@
 """
-Package CLI entrypoint for Music Vault Manager v2.0.3.
+Package CLI entrypoint for Music Vault Manager v2.0.4.
 """
 import argparse
 import sys
@@ -36,7 +36,7 @@ from .db_lock import database_lock
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="musicvault",
-        description="Music Vault Manager v2.0.3: Read-Only Audio Library Metadata & Organisation Preview Tool",
+        description="Music Vault Manager v2.0.4: Read-Only Audio Library Metadata & Organisation Preview Tool",
     )
     parser.add_argument("--version", action="version", version=f"musicvault {__version__}")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
