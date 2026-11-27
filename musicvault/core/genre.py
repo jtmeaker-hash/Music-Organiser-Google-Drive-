@@ -13,8 +13,8 @@ ALIASES_PARENT: Dict[str, str] = {
     'rawphoric': 'Hardstyle',
     'euphorichardstyle': 'Hardstyle',
     'xtraraw': 'Hardstyle',
-    'frenchcore': 'Hardstyle',
-    'uptempo': 'Hardstyle',
+    'frenchcore': 'Hardcore',
+    'uptempo': 'Hardcore',
     'reversebass': 'Hardstyle',
     'slowtempohardstyle': 'Hardstyle',
     'mainstreamhardstyle': 'Hardstyle',
@@ -199,8 +199,8 @@ ARTIST_PROFILES: Dict[str, Tuple[str, str]] = {
     norm('A-Rize'): ('Hardstyle', 'Euphoric'),
     norm('Headhunterz'): ('Hardstyle', 'Euphoric'),
     norm('Angerfist'): ('Hardcore', ''),
-    norm('Sefa'): ('Hardstyle', 'Frenchcore'),
-    norm('Dr. Peacock'): ('Hardstyle', 'Frenchcore'),
+    norm('Sefa'): ('Hardcore', 'Frenchcore'),
+    norm('Dr. Peacock'): ('Hardcore', 'Frenchcore'),
     norm('Da Tweekaz'): ('Hardstyle', 'Euphoric'),
     norm('Luude'): ('Drum & Bass', ''),
     norm('Basstripper'): ('Drum & Bass', 'Jump Up'),
@@ -217,10 +217,14 @@ LABEL_PROFILES: Dict[str, Tuple[str, str]] = {
 
 
 def canonical_genre(genre_name: Optional[str]) -> str:
-    """Resolve raw genre text to canonical parent genre name."""
+    """Resolve raw genre or subgenre text to canonical parent genre name."""
     if not genre_name:
         return ""
-    return ALIASES_PARENT.get(norm(genre_name), "")
+    parent = ALIASES_PARENT.get(norm(genre_name), "")
+    if parent:
+        return parent
+    sub = canonical_subgenre(genre_name)
+    return SUBGENRE_PARENT.get(sub, "") if sub else ""
 
 
 def decide_genre(existing_genre: str, evidence_genres: List[str], locked: bool = False) -> Tuple[str, str]:

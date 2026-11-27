@@ -55,6 +55,9 @@ def _edition(title):
     _, tokens, remixer = extract_version_tokens(title)
     if remixer or "remix" in tokens:
         return f"remix ({remixer})" if remixer else "remix"
+    named_edits = sorted(t.split(":", 1)[1] for t in tokens if t.startswith("edit:"))
+    if named_edits:
+        return f"edit ({' / '.join(named_edits)})"
     if "radioedit" in tokens:
         return "edit"
     if "extendedmix" in tokens:
@@ -390,6 +393,10 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
     )
     no_match = research_complete and track.research_status == "no_match"
 
+    sheet_unmapped_or_ambiguous = bool("schema_error" in sheet_info or len(sheet_rows) != 1)
+    if lock_error:
+        double_check_flags.append(f"lock_error:{lock_error}")
+
     for field, detail in field_data.items():
         old_val = old[COL[field]].strip() if old and field in COL else ""
         detail["old"] = old_val
@@ -403,6 +410,7 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
         is_umbrella_upgrade = (
             field == "genre"
             and is_umbrella_club_genre(old_val)
+            and "sheet_status_review_hold" not in sem["row_flags"]
             and detail["value"] == "Hardstyle"
             and detail["confidence"] in {"HIGH", "MEDIUM"}
             and not detail["conflict"]
@@ -410,16 +418,47 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
             and not is_review_hold
         )
 
-        if is_locked:
+        if lock_error:
+            detail["proposed"] = old_val
+            detail["would_propose"] = ""
+            detail["proposal_action"] = "lock_error_hold"
+            detail["terms_hold"] = False
+        elif field in COL and sheet_unmapped_or_ambiguous:
+            detail["proposed"] = old_val
+            detail["would_propose"] = (
+                detail["value"]
+                if (detail["value"] and not detail["conflict"] and detail["confidence"] in {"HIGH", "MEDIUM"})
+                else ""
+            )
+            detail["proposal_action"] = "sheet_mapping_hold"
+            detail["terms_hold"] = False
+        elif is_locked:
             detail["proposed"] = old_val
             detail["would_propose"] = old_val
             detail["proposal_action"] = "locked_preserved"
             detail["terms_hold"] = False
         elif is_review_hold:
+            hold_reason = locks[field].get("reason", "human review hold")
+            detail["state"] = "conflicting" if "conflict" in hold_reason.lower() else "candidate_only"
+            detail["confidence"] = "LOW"
+            detail["provenance"] = []
+            detail["reason"] = hold_reason
+            detail["conflict"] = detail["state"] == "conflicting"
             detail["proposed"] = old_val
             detail["would_propose"] = ""
             detail["proposal_action"] = "human_review_hold"
             detail["terms_hold"] = False
+        elif (
+            field == "bpm"
+            and detail.get("octave_adjusted")
+            and old
+            and canonical_subgenre(old[COL["subgenre"]]) == "Slowtempo"
+        ):
+            detail["proposed"] = old_val
+            detail["would_propose"] = ""
+            detail["proposal_action"] = "slowtempo_octave_blocked"
+            detail["terms_hold"] = False
+            double_check_flags.append("slowtempo_octave_blocked")
         elif old_val and not is_placeholder and not is_umbrella_upgrade:
             detail["proposed"] = old_val
             detail["would_propose"] = old_val
@@ -429,7 +468,10 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
             if field in COL and detail["confidence"] in {"HIGH", "MEDIUM"} and detail["value"] and not detail["conflict"]:
                 if field == "genre":
                     ex_cg = canonical_genre(old_val)
-                    contradicts = bool(ex_cg and ex_cg != canonical_genre(detail["value"]))
+                    contradicts = bool(
+                        (ex_cg and ex_cg != canonical_genre(detail["value"]))
+                        or (is_umbrella_club_genre(old_val) and canonical_genre(detail["value"]) == "Hardstyle")
+                    )
                 elif field == "bpm" and is_valid_bpm(old_val):
                     contradicts = abs(int(round(float(old_val))) - int(round(float(detail["value"])))) >= 2
                 elif field == "key":
@@ -485,6 +527,7 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
     metadata_complete = all(value["state"] in {"accepted", "verified"} for value in field_data.values())
     identity_ready = all(field_data[f]["state"] in {"accepted", "verified"} for f in ("artist", "title"))
     conflict = any(value["conflict"] for value in field_data.values())
+    any_field_review_hold = any(locks.get(f, {}).get("state") == "REVIEW_HOLD" for f in COL)
     human_routing_hold = any(
         fl in sem["row_flags"]
         for fl in ("potential_duplicate_hold", "keep_in_source_hold", "human_genre_conflict_hold", "sheet_status_review_hold")
@@ -493,6 +536,7 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
         track.quarantined
         or lock_error
         or conflict
+        or any_field_review_hold
         or human_routing_hold
         or bool(tempo_hint)
         or exhausted_enrichment

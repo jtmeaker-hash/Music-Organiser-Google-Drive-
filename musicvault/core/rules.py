@@ -39,6 +39,11 @@ _IMMUTABLE_STATES = ("HIGH_LOCKED", "USER_LOCKED")
 _HOLD_STATES = ("REVIEW_HOLD",)
 _CONFLICT_STATES = ("CONFLICT", "LOW_CONFLICT", "REJECTED")
 _OPEN_FAMILIES = frozenset({"musicbrainz", "embedded", "manual"})
+UPTEMPO_OCTAVE_GENRES = frozenset({
+    "Hardstyle", "Hardcore", "Happy Hardcore", "Techno", "Drum & Bass", "Jungle",
+    "House", "Trance", "UK Garage", "Hard Bounce", "Bassline", "Breakbeat",
+    "Electro", "Dubstep", "Trap",
+})
 
 
 def strip_automated_vault_audit_notes(notes_text: Any) -> str:
@@ -74,7 +79,7 @@ def inspect_sheet_row_semantics(row: List[Any]) -> Dict[str, Any]:
 
     # 1. Processing Status == MOVED / ANALYSED locks verified populated fields
     if proc_status in ("MOVED", "ANALYSED"):
-        if raw_genre and not is_genre_placeholder(raw_genre) and not is_umbrella_club_genre(raw_genre):
+        if raw_genre and not is_genre_placeholder(raw_genre):
             field_locks["genre"] = {"state": "USER_LOCKED", "reason": f"sheet status {proc_status}", "source": "sheet_human"}
         if raw_sub and not is_subgenre_placeholder(raw_sub) and "(provisional)" not in raw_sub.casefold():
             field_locks["subgenre"] = {"state": "USER_LOCKED", "reason": f"sheet status {proc_status}", "source": "sheet_human"}
@@ -101,9 +106,21 @@ def inspect_sheet_row_semantics(row: List[Any]) -> Dict[str, Any]:
         )
 
     # 3. Deliberate human withholds & unresolved conflicts in Col M / Col P
-    if not raw_key and any(
-        kw in combined_mp
-        for kw in ("key withheld", "omit key", "key conflict", "key conflicts", "key conflicting", "key unconfirmed")
+    if not raw_key and (
+        any(
+            kw in combined_mp
+            for kw in (
+                "key withheld",
+                "omit key",
+                "key conflict",
+                "key conflicts",
+                "key conflicting",
+                "key unconfirmed",
+                "key not confirmed",
+                "no reliable key",
+            )
+        )
+        or (proc_status == "REVIEW" and "key pending" in combined_mp)
     ):
         field_holds["key"] = {
             "state": "REVIEW_HOLD",
@@ -112,7 +129,9 @@ def inspect_sheet_row_semantics(row: List[Any]) -> Dict[str, Any]:
         }
         row_flags.append("human_key_withheld_or_conflicting")
 
-    if ("genre " in p_low and "inconsistent" in p_low) or "genre conflict" in combined_mp:
+    if ("genre " in p_low and "inconsistent" in p_low) or any(
+        kw in combined_mp for kw in ("genre conflict", "genre/key conflict", "key/genre conflict")
+    ):
         field_holds["genre"] = {
             "state": "REVIEW_HOLD",
             "reason": "human note genre conflict hold",
@@ -120,9 +139,20 @@ def inspect_sheet_row_semantics(row: List[Any]) -> Dict[str, Any]:
         }
         row_flags.append("human_genre_conflict_hold")
 
-    if "potential duplicate" in p_low or "suspected duplicate" in p_low:
+    if any(
+        kw in combined_mp
+        for kw in (
+            "potential duplicate",
+            "suspected duplicate",
+            "possible duplicate",
+            "exact duplicate",
+            "duplicate-release",
+            "duplicate encoding",
+            "duplicate unresolved",
+        )
+    ):
         row_flags.append("potential_duplicate_hold")
-    if "keep source in import" in p_low:
+    if any(kw in combined_mp for kw in ("keep source in import", "do not rename or move")):
         row_flags.append("keep_in_source_hold")
     if proc_status == "REVIEW":
         row_flags.append("sheet_status_review_hold")
@@ -195,18 +225,21 @@ def candidate_field_values(
 def cluster_bpm_candidates(
     candidates: List[Candidate],
     meta: Optional[TrackMetadata] = None,
+    parent_genre: str = "",
     subgenre: str = "",
 ) -> Dict[str, Any]:
     """
     Cluster recording-verified BPM measurements and resolve half/double tempo ONLY when
-    corroborated by track-specific evidence:
+    corroborated by track-specific evidence on uptempo DJ genres:
     - Direct cluster: values rounding to the SAME integer BPM (`int(round(v))`) with spread <= 0.5 BPM.
       (e.g. 151.9 + 152.0 -> 152 HIGH; 150.0 vs 151.0 -> 2 distinct clusters -> CONFLICT).
-    - Octave corroboration: if a slow cluster (65..107.5 BPM) co-occurs on the SAME track with a
-      full-time DJ tempo cluster (118..215 BPM) where |slow * 2 - fast| <= 1.0 (or with this track's
-      own embedded 2x BPM tag, when subgenre != 'Slowtempo'), resolves to the full-time integer BPM
-      with `octave_adjusted=True` while preserving all raw float measurements and provenance.
-    - Never auto-doubles uncorroborated slow tempos; keeps genuine slow-tempo Hardstyle intact.
+    - Octave corroboration: ONLY when `parent_genre` is in `UPTEMPO_OCTAVE_GENRES` and `subgenre != 'Slowtempo'`,
+      if a slow cluster (60..107.5 BPM) co-occurs on the SAME track with a full-time DJ tempo cluster
+      (118..215 BPM) where |slow * 2 - fast| <= 1.0 (or with this track's own embedded 2x BPM tag),
+      resolves to the full-time integer BPM with `octave_adjusted=True` while preserving all raw float
+      measurements and provenance.
+    - Never auto-doubles uncorroborated slow tempos or non-DJ genres (Pop, Rock, Country, etc.);
+      keeps genuine slow-tempo Hardstyle intact.
     """
     matched = candidate_field_values(candidates, "bpm")
     raw_measurements = [
@@ -249,7 +282,7 @@ def cluster_bpm_candidates(
                 "direct_families": {x[1] for x in items},
             })
 
-    allow_octave = (subgenre != "Slowtempo")
+    allow_octave = bool(parent_genre in UPTEMPO_OCTAVE_GENRES and subgenre != "Slowtempo")
 
     # Case 1: Exactly 2 candidate clusters that form a corroborated 0.5x <-> 2x octave pair
     if len(clusters) == 2 and allow_octave:
@@ -335,7 +368,7 @@ def build_track_proposal(meta: TrackMetadata, candidates: List[Candidate]) -> Di
         prop_sub = ""
         sub_conf = "artist/label hint only (unverified)" if g_info["subgenre"] else "missing"
 
-    bpm_info = cluster_bpm_candidates(candidates, meta=meta, subgenre=prop_sub)
+    bpm_info = cluster_bpm_candidates(candidates, meta=meta, parent_genre=prop_genre, subgenre=prop_sub)
     if bpm_info["status"] == "conflict":
         prop_bpm: Any = "CONFLICT"
         bpm_conf = "contradictory recording-supported candidates"
@@ -424,8 +457,14 @@ def field_decision(candidates: List[Candidate], field: str, proposed_value: Any)
         return ("LOW", "missing or conflicting")
 
     if field == "bpm":
+        parent_g_bpm = canonical_genre(str(proposed_value.get("genre", ""))) if isinstance(proposed_value, dict) else ""
         sub = proposed_value.get("subgenre", "") if isinstance(proposed_value, dict) else ""
-        bpm_info = cluster_bpm_candidates(candidates, meta=None, subgenre=sub if sub != "CONFLICT" else "")
+        bpm_info = cluster_bpm_candidates(
+            candidates,
+            meta=None,
+            parent_genre=parent_g_bpm,
+            subgenre=sub if sub != "CONFLICT" else "",
+        )
         if bpm_info["status"] == "missing":
             # Check if embedded-corroborated octave resolution occurred in build_track_proposal
             if isinstance(proposed_value, dict) and proposed_value.get("bpm_octave_adjusted") and bpm_info["raw_measurements"]:
@@ -662,6 +701,7 @@ def planned_row(
         is_umbrella_upgrade = (
             field == "genre"
             and is_umbrella_club_genre(existing)
+            and "sheet_status_review_hold" not in sem["row_flags"]
             and str(val) == "Hardstyle"
             and (level == "HIGH" or (level == "MEDIUM" and save_medium))
         )
@@ -673,7 +713,10 @@ def planned_row(
             if level in ("HIGH", "MEDIUM") and val not in ("", "CONFLICT", None):
                 if field == "genre":
                     ex_cg = canonical_genre(existing)
-                    contradicts_existing = bool(ex_cg and ex_cg != canonical_genre(str(val)))
+                    contradicts_existing = bool(
+                        (ex_cg and ex_cg != canonical_genre(str(val)))
+                        or (is_umbrella_club_genre(existing) and canonical_genre(str(val)) == "Hardstyle")
+                    )
                 elif field == "bpm" and is_valid_bpm(existing):
                     contradicts_existing = abs(int(round(float(existing))) - int(round(float(val)))) >= 2
                 elif field == "key":
@@ -694,6 +737,16 @@ def planned_row(
             continue
 
         # Blank, placeholder, or eligible Dance/Club -> Hardstyle upgrade:
+        if (
+            field == "bpm"
+            and effective_proposal.get("bpm_octave_adjusted")
+            and canonical_subgenre(out[COL["subgenre"]]) == "Slowtempo"
+            and not manual_override
+        ):
+            decisions[field] = "REVIEW"
+            reasons.append("bpm: sheet subgenre Slowtempo blocks 2x octave promotion")
+            continue
+
         if level == "HIGH" or (level == "MEDIUM" and save_medium):
             open_only = manual_override or _is_open_provenance_only(candidates, field, parent_genre=parent_g)
             if not provider_terms_cleared and not open_only:

@@ -82,6 +82,9 @@ def normalize_tracks_row(raw, index):
     original = [str(cell) if cell is not None else "" for cell in raw]
     padded = original + [""] * max(0, 27 - len(original))
     canonical = padded[:27]
+    for opt_slot in (0, 1, 11, 12, 15):
+        if opt_slot not in index.columns and opt_slot < len(index.headers) and index.headers[opt_slot].strip():
+            canonical[opt_slot] = ""
     for dest, source in index.columns.items():
         canonical[dest] = padded[source] if source < len(padded) else ""
     return canonical

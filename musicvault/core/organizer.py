@@ -372,6 +372,7 @@ def evaluate_live_preview(
         # Collect recording-supported catalogue genres and check novel 2-provider proposals
         known_cat_genres: List[str] = []
         novel_by_tag: Dict[str, Set[str]] = {}
+        is_umbrella_row = (norm(existing_vals["genre"]) in ("danceclub", "danceandclub"))
         for c in cands:
             v_low = (c.verification or "").lower()
             if "conflict" in v_low or "mismatch" in v_low or "inferred" in v_low or "title-only" in v_low:
@@ -384,7 +385,7 @@ def evaluate_live_preview(
                 if not isinstance(raw_tag, str) or not raw_tag.strip():
                     continue
                 cg = canonical_genre(raw_tag)
-                if cg and (is_rec_verified or c.provider == "Discogs release"):
+                if cg and (is_rec_verified or (c.provider == "Discogs release" and not is_umbrella_row)):
                     known_cat_genres.append(cg)
                 elif (
                     not cg
@@ -400,7 +401,15 @@ def evaluate_live_preview(
         if (
             gs in ("CONFLICT", "LOW_CONFLICT", "REJECTED", "REVIEW_HOLD")
             or ss in ("CONFLICT", "LOW_CONFLICT", "REJECTED")
-            or any(fl in sem["row_flags"] for fl in ("potential_duplicate_hold", "keep_in_source_hold", "human_genre_conflict_hold"))
+            or any(
+                fl in sem["row_flags"]
+                for fl in (
+                    "potential_duplicate_hold",
+                    "keep_in_source_hold",
+                    "human_genre_conflict_hold",
+                    "sheet_status_review_hold",
+                )
+            )
         ):
             summary.conflict_holds += 1
             summary.rows.append(

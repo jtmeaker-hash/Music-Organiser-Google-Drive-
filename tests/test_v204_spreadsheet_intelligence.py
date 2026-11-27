@@ -409,3 +409,239 @@ def test_v204_distinct_file_id_md5_duplicates_preserved_and_sonovault_disabled_g
     assert "potential_duplicate_hold" in rows_by_id["src_dup_fid_1"]["double_check_flags"]
     assert rows_by_id["dst_dup_fid_2"]["routing"] == "already_correctly_located"
     assert rep["providers"]["sonovault"]["availability"] == "DISABLED"
+
+
+def test_v204_audit_fixes_hardcore_subgenres_sefa_and_schranz_parent_resolution():
+    # Audit Fix 1: Subgenre-only tags resolve to their canonical SUBGENRE_PARENT; Uptempo & Frenchcore stay Hardcore!
+    assert canonical_genre("Uptempo") == "Hardcore"
+    assert canonical_genre("Frenchcore") == "Hardcore"
+    assert canonical_genre("Schranz") == "Techno"
+    assert canonical_genre("Melodic Hardstyle") == "Hardstyle"
+
+    cands_uptempo = [
+        Candidate("MusicBrainz", "Bassline", ["N-Vitral"], duration=180.0, genre=["Hardcore", "Uptempo"], verification="ISRC supported", source_family="musicbrainz"),
+        Candidate("Discogs release", "Bassline", ["N-Vitral"], duration=180.0, genre=["Uptempo"], verification="Duration supported", source_family="discogs"),
+    ]
+    prop_up = build_track_proposal(TrackMetadata(artist="N-Vitral", title="Bassline", duration=180.0), cands_uptempo)
+    assert prop_up["genre"] == "Hardcore"
+    assert prop_up["subgenre"] == "Uptempo"
+    assert field_decision(cands_uptempo, "genre", prop_up)[0] == "HIGH"
+    assert field_decision(cands_uptempo, "subgenre", prop_up)[0] == "HIGH"
+
+    cands_sefa = [
+        Candidate("MusicBrainz", "Lovely Day to Die", ["Sefa"], duration=210.0, genre=["Hardcore", "Frenchcore"], verification="ISRC supported", source_family="musicbrainz"),
+    ]
+    prop_sefa = build_track_proposal(TrackMetadata(artist="Sefa", title="Lovely Day to Die", duration=210.0), cands_sefa)
+    assert prop_sefa["genre"] == "Hardcore"
+    assert prop_sefa["subgenre"] == "Frenchcore"
+    assert field_decision(cands_sefa, "genre", prop_sefa)[0] == "MEDIUM"
+
+    cands_schranz = [
+        Candidate("MusicBrainz", "Warehouse", ["Klangkuenstler"], duration=300.0, genre=["Schranz"], verification="Duration supported", source_family="musicbrainz"),
+    ]
+    prop_sch = build_track_proposal(TrackMetadata(artist="Klangkuenstler", title="Warehouse", duration=300.0), cands_schranz)
+    assert prop_sch["genre"] == "Techno"
+    assert prop_sch["subgenre"] == "Hard Techno"
+    assert field_decision(cands_schranz, "genre", prop_sch)[0] == "MEDIUM"
+    assert field_decision(cands_schranz, "subgenre", prop_sch)[0] == "MEDIUM"
+
+
+def test_v204_audit_fixes_moved_review_locks_text_only_guard_and_reordered_headers(tmp_path):
+    # Audit Fix 2a & 2b: MOVED locks Dance / Club; REVIEW blocks umbrella upgrade AND holds evaluate_live_preview
+    cands_hs = [
+        Candidate("MusicBrainz", "Anthem", ["Artist"], duration=200.0, genre=["Hardstyle"], verification="ISRC supported", source_family="musicbrainz"),
+        Candidate("Discogs release", "Anthem", ["Artist"], duration=200.0, genre=["Hardstyle"], verification="Duration supported", source_family="discogs"),
+    ]
+    prop_hs = build_track_proposal(TrackMetadata(artist="Artist", title="Anthem", duration=200.0), cands_hs)
+
+    row_moved = _make_tracks_row(genre="Dance / Club", subgenre="Club", proc_status="MOVED", file_id="fid_moved_club")
+    out_mv, dec_mv, chg_mv = planned_row(cands_hs, prop_hs, row_moved, provider_terms_cleared=True)
+    assert out_mv[2] == "Dance / Club"
+    assert dec_mv["genre"] == "LOCKED"
+    assert chg_mv == []
+
+    row_review = _make_tracks_row(genre="Dance & Club", subgenre="Needs Review", proc_status="REVIEW", file_id="fid_review_club")
+    out_rv, dec_rv, chg_rv = planned_row(cands_hs, prop_hs, row_review, provider_terms_cleared=True)
+    assert out_rv[2] == "Dance & Club"
+    assert dec_rv["genre"] == "EXISTING_CONFLICT_REVIEW"
+    assert "genre" not in chg_rv
+
+    # Audit Fix 2c: Col M duplicate & key-unconfirmed phrasings
+    row_colm_dup = _make_tracks_row(
+        genre="Hardstyle", subgenre="Euphoric", bpm="150", key="",
+        proc_status="SORTED – AUDIO PENDING",
+        anal_conf="Potential duplicate across formats; no reliable key; key/genre conflict",
+        file_id="fid_colm_dup",
+    )
+    sem_m = inspect_sheet_row_semantics(row_colm_dup)
+    assert "potential_duplicate_hold" in sem_m["row_flags"]
+    assert sem_m["field_holds"]["key"]["state"] == "REVIEW_HOLD"
+    assert sem_m["field_holds"]["genre"]["state"] == "REVIEW_HOLD"
+
+    # Audit Fix 4: Text-only Discogs candidate must NOT trigger umbrella upgrade in evaluate_live_preview
+    tr_text_only = Track(
+        file_id="fid_text_only",
+        name="Artist - ClubTrack.flac",
+        is_live_source=True,
+        observed_parent_id="SRC_ID",
+        hydration_status="success",
+        hydration_version="v1",
+        research_status="success",
+        research_version="v1",
+        provider_calls_json=json.dumps({"_meta": {"lookup_complete": True}}),
+        metadata=TrackMetadata(version="v1", artist="Artist", title="ClubTrack", duration=180.0, identity_origin="embedded"),
+    )
+    cands_text_only = [
+        Candidate("Discogs release", "ClubTrack", ["Artist"], duration=0.0, genre=["Hardstyle"], verification="Text only", source_family="discogs"),
+    ]
+    tr_rev = Track(
+        file_id="fid_review_live",
+        name="Artist - Anthem.flac",
+        is_live_source=True,
+        observed_parent_id="SRC_ID",
+        hydration_status="success",
+        hydration_version="v1",
+        research_status="success",
+        research_version="v1",
+        provider_calls_json=json.dumps({"_meta": {"lookup_complete": True}}),
+        metadata=TrackMetadata(version="v1", artist="Artist", title="Anthem", duration=200.0, identity_origin="embedded"),
+    )
+    sheet_idx = validate_and_index_tracks_sheet(
+        [
+            "Original Filename", "Source Folder", "Genre", "Subgenre", "BPM (full)", "Camelot Key",
+            "Energy /10", "Filth /10", "Format", "Size (MB)", "Proposed Filename", "Processing Status",
+            "Analysis Confidence", "Drive File URL", "Drive File ID", "Notes / Override",
+        ],
+        [
+            _make_tracks_row(genre="Dance / Club", proc_status="PENDING", file_id="fid_text_only"),
+            _make_tracks_row(genre="Dance / Club", proc_status="REVIEW", file_id="fid_review_live"),
+        ],
+    )
+    live_summary = evaluate_live_preview(
+        [tr_text_only, tr_rev],
+        {"fid_text_only": cands_text_only, "fid_review_live": cands_hs},
+        sheet_idx,
+        "SRC_ID",
+        "VAULT_ID",
+        vault_folders={"Hardstyle": ["HS_ID"], "Dance & Club": ["DC_ID"]},
+        provider_terms_cleared=True,
+    )
+    rows_live = {r.file_id: r for r in live_summary.rows}
+    assert rows_live["fid_text_only"].eligible is False
+    assert rows_live["fid_text_only"].destination != "Hardstyle"
+    assert rows_live["fid_review_live"].eligible is False
+    assert rows_live["fid_review_live"].reason == "METADATA_OR_HUMAN_REVIEW_HOLD"
+
+    # Audit Fix 6a: Custom reordered sheet with unmapped column at index 15 must NOT leak into Notes (col 15)
+    custom_hdr = ["Title", "Artist", "Genre", "Subgenre", "BPM", "Key"] + [f"Extra{i}" for i in range(8)] + ["Drive ID", "ISRC"]
+    custom_row = ["Song", "Act", "Hardstyle", "Rawstyle", "155", "8A"] + [""] * 8 + ["fid_custom_15", "potential duplicate key withheld"]
+    c_idx = validate_and_index_tracks_sheet(custom_hdr, [custom_row])
+    assert c_idx.schema_valid
+    norm_r = c_idx.unique_rows_by_id["fid_custom_15"][1]
+    assert norm_r[15] == ""
+    assert inspect_sheet_row_semantics(norm_r)["row_flags"] == []
+
+
+def test_v204_audit_fixes_genre_gated_octave_bpm_named_edits_and_coverage_holds(tmp_path):
+    # Audit Fix 3: Pop / non-uptempo genre at 70 BPM + 140 BPM must NOT octave-double!
+    cands_pop = [
+        Candidate("MusicBrainz", "Ballad", ["Indie Singer"], duration=210.0, genre=["Pop"], verification="ISRC supported", source_family="musicbrainz"),
+        Candidate("Audiometa", "Ballad", ["Indie Singer"], duration=210.0, bpm=70.0, verification="Duration supported", source_family="audiometa"),
+    ]
+    prop_pop = build_track_proposal(TrackMetadata(artist="Indie Singer", title="Ballad", duration=210.0, embedded_bpm="140"), cands_pop)
+    assert prop_pop["genre"] == "Pop"
+    assert prop_pop["bpm"] == 70
+    assert prop_pop["bpm_octave_adjusted"] is False
+
+    # Sheet Subgenre='Slowtempo' blocks 2x octave promotion even if Hardstyle candidates lack subgenre tags!
+    cands_hs_oct = [
+        Candidate("MusicBrainz", "Slow Rave", ["DJ"], duration=200.0, genre=["Hardstyle"], bpm=80.0, verification="Duration supported", source_family="musicbrainz"),
+        Candidate("SonoVault", "Slow Rave", ["DJ"], duration=200.0, genre=["Hardstyle"], bpm=160.0, verification="Duration supported", source_family="sonovault"),
+    ]
+    prop_hs_oct = build_track_proposal(TrackMetadata(artist="DJ", title="Slow Rave", duration=200.0), cands_hs_oct)
+    assert prop_hs_oct["bpm_octave_adjusted"] is True
+    row_sheet_slow = _make_tracks_row(genre="Hardstyle", subgenre="Slowtempo", bpm="", file_id="fid_sheet_slow")
+    out_sl, dec_sl, chg_sl = planned_row(cands_hs_oct, prop_hs_oct, row_sheet_slow, provider_terms_cleared=True)
+    assert out_sl[4] == ""
+    assert dec_sl["bpm"] == "REVIEW"
+    assert "bpm" not in chg_sl
+
+    # Audit Fix 5: Named DJ edits & Extended Remixes
+    assert versions_compatible("Live Fast (Act of Rage Edit)", "Live Fast (Radio Edit)") is False
+    assert versions_compatible("Live Fast (Act of Rage Edit)", "Live Fast (Rebelion Edit)") is False
+    assert versions_compatible("Live Fast (Act of Rage Edit)", "Live Fast") is False
+    assert versions_compatible("Live Fast (Act of Rage Edit)", "Live Fast (Act of Rage Edit)") is True
+    assert _edition("Live Fast (Act of Rage Edit)") == "edit (actofrage)"
+    assert versions_compatible("Song (Darren Styles Remix)", "Song (Darren Styles Extended Remix)") is True
+    assert versions_compatible("Song (Darren Styles Radio Remix)", "Song (Darren Styles Extended Remix)") is False
+    assert _edition("Song (Darren Styles Extended Remix)") == "remix (darrenstyles)"
+
+    # Audit Fix 2d: Coverage REVIEW_HOLD downgrades field from verified -> conflicting/candidate_only and sets review_required=True;
+    # MALFORMED_LOCK_JSON holds proposed!
+    cfg = Config(tmp_path)
+    cfg.set("PROVIDER_TERMS_CLEARED", "true")
+    db = Database(cfg.db_path)
+
+    class HoldDrive:
+        def scan_inventory(self, root):
+            if root == cfg.source_folder_id:
+                yield {"id": "fid_key_hold", "name": "Artist - KeyHold.flac", "parents": [root], "scanned_parent": root, "md5Checksum": "v1"}
+                yield {"id": "fid_bad_lock", "name": "Artist - BadLock.flac", "parents": [root], "scanned_parent": root, "md5Checksum": "v2"}
+            else:
+                return
+                yield
+        def get_children_folders(self, root):
+            return {"Hardstyle": ["HS_ID"]}
+
+    class HoldSheet:
+        def fetch_header_row(self, *a):
+            return [
+                "Original Filename", "Source Folder", "Genre", "Subgenre", "BPM (full)", "Camelot Key",
+                "Energy /10", "Filth /10", "Format", "Size (MB)", "Proposed Filename", "Processing Status",
+                "Analysis Confidence", "Drive File URL", "Drive File ID", "Notes / Override",
+                "Review Star", "Review Reasons", "BPM State", "Key State", "Genre State", "Subgenre State", "Metadata Lock JSON",
+            ]
+        def iter_tracks_rows(self, *a):
+            yield 2, _make_tracks_row(
+                genre="Hardstyle", subgenre="Rawstyle", bpm="155", key="",
+                anal_conf="BPM high; key conflicts", file_id="fid_key_hold",
+            )
+            bad = _make_tracks_row(genre="", subgenre="", bpm="", key="", file_id="fid_bad_lock") + [""] * 6 + ["{corrupt_json"]
+            yield 3, bad
+
+    drive = HoldDrive()
+    scan_root(db, drive, cfg.source_folder_id, "source")
+    scan_root(db, drive, cfg.vault_folder_id, "destination")
+    for fid, ver, title in (("fid_key_hold", "v1", "KeyHold"), ("fid_bad_lock", "v2", "BadLock")):
+        db.update_hydration_result(
+            fid, "success", ver, method="embedded_ranged",
+            metadata=TrackMetadata(version=ver, artist="Artist", title=title, duration=200.0, identity_origin="embedded"),
+        )
+        db.update_research_result(
+            fid, "success", ver,
+            candidates=[
+                Candidate("MusicBrainz", title, ["Artist"], duration=200.0, bpm=155.0, key="8A", genre=["Hardstyle", "Rawstyle"], verification="ISRC supported", source_family="musicbrainz"),
+                Candidate("Discogs release", title, ["Artist"], duration=200.0, bpm=155.0, key="8A", genre=["Hardstyle", "Rawstyle"], verification="Duration supported", source_family="discogs"),
+            ],
+            provider_calls={"_meta": {"lookup_complete": True}, "MusicBrainz": {"request_made": True}},
+            research_incomplete=False,
+        )
+
+    exp = tmp_path / "hold_cov.json"
+    with closing(db._get_connection()) as conn:
+        library_report(
+            conn, db, cfg,
+            Namespace(scope="all", file_id=[], verbose=True, export_json=str(exp), export_csv=""),
+            HoldSheet(), drive,
+        )
+    by_id = {r["file_id"]: r for r in json.loads(exp.read_text())["rows"]}
+    kh = by_id["fid_key_hold"]
+    assert kh["fields"]["key"]["proposal_action"] == "human_review_hold"
+    assert kh["fields"]["key"]["state"] == "conflicting"
+    assert kh["states"]["metadata_complete"] is False
+    assert kh["states"]["review_required"] is True
+
+    bl = by_id["fid_bad_lock"]
+    assert bl["fields"]["genre"]["proposal_action"] == "lock_error_hold"
+    assert bl["fields"]["genre"]["proposed"] == ""
+    assert bl["routing"] == "sheet_mapping_hold"
