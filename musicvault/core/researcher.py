@@ -21,6 +21,7 @@ from ..models import Candidate, Track
 from ..providers.audiometa import AudioMetaProvider
 from ..providers.base import ProviderCallOutcome, ProviderStatus, canonical_provider_family
 from ..providers.discogs import DiscogsProvider
+from ..providers.hdrr import HDRRProvider
 from ..providers.musicbrainz import MusicBrainzProvider
 from ..providers.research import ResearchProvider
 from ..providers.sonovault import SonoVaultProvider
@@ -88,7 +89,7 @@ def _has_verified_catalogue_genre(candidates: List[Candidate]) -> bool:
         if c.verification not in ("ISRC supported", "Duration supported"):
             continue
         fam = canonical_provider_family(c.source_family or c.provider)
-        if fam == "wikidata":
+        if fam in ("wikidata", "hdrr") or getattr(c, "genre_evidence_kind", "") == "artist_derived":
             continue
         for g in (c.genre or []):
             if isinstance(g, str) and norm(g) not in GENERIC_TAGS and canonical_genre(g):
@@ -202,8 +203,24 @@ def build_research_providers(config, db, limit, clock_utc=None, clock_mono=None,
         provider_terms_cleared=terms_ok,
         **clock_kwargs,
     )
+    hdrr_delay = float(config.get("HDRR_REQUEST_DELAY_SECONDS", "2.0") or 2.0)
+    hdrr_ttl = int(config.get("HDRR_CACHE_TTL_SECONDS", str(7 * 86400)) or (7 * 86400))
+    hdrr = (
+        HDRRProvider(
+            contact=config.contact,
+            max_requests=min(150, max(20, int(limit) * 3)),
+            db=db,
+            provider_terms_cleared=terms_ok,
+            default_delay=hdrr_delay,
+            cache_ttl_seconds=hdrr_ttl,
+            offline_only=config.get_bool("HDRR_OFFLINE_ONLY", False),
+            **clock_kwargs,
+        )
+        if config.get_bool("HDRR_ENABLED", True)
+        else None
+    )
 
-    return {"sono": sono, "am": am, "dc": dc, "mb": mb, "wiki": wiki}
+    return {"sono": sono, "am": am, "dc": dc, "mb": mb, "hdrr": hdrr, "wiki": wiki}
 
 
 def execute_research_batch(
@@ -316,7 +333,7 @@ def execute_research_batch(
     providers = providers_override if providers_override is not None else build_research_providers(
         config, db, limit, clock_utc, clock_mono, sleep_fn
     )
-    sono, am, dc, mb, wiki = (providers.get(key) for key in ("sono", "am", "dc", "mb", "wiki"))
+    sono, am, dc, mb, hdrr, wiki = (providers.get(key) for key in ("sono", "am", "dc", "mb", "hdrr", "wiki"))
 
     seen_issue_keys = set()
     observed_retry_deadlines: List[str] = []
@@ -453,6 +470,7 @@ def execute_research_batch(
                     ("AudioMeta", am, lambda p, a, ti: p.search_detailed(a, ti)),
                     ("Discogs", dc, lambda p, a, ti: p.search_detailed(a, ti)),
                     ("MusicBrainz", mb, lambda p, a, ti: p.search_detailed(a, ti, isrc=t.metadata.isrc)),
+                    ("HDRR", hdrr, lambda p, a, ti: p.search_detailed(a, ti, isrc=t.metadata.isrc)),
                 ]
 
                 def verify(candidates):
@@ -534,7 +552,7 @@ def execute_research_batch(
                             if policy.is_fallback_only(family)
                             else needed
                         )
-                        skip = policy.reason_to_skip(family, effective_needed)
+                        skip = policy.reason_to_skip(family, effective_needed, track=t, candidates=combined_so_far)
                         if skip:
                             provider_audit[p_name] = {
                                 "status": skip, "lookup_completed": False, "actual_calls": 0,
@@ -777,7 +795,7 @@ def execute_research_batch(
                             and not policy.is_fallback_only(canonical_provider_family(name))
                             and (not policy.provider or policy.provider == canonical_provider_family(name))
                         ))
-                        for name, p in (("SonoVault", sono), ("AudioMeta", am), ("Discogs", dc), ("MusicBrainz", mb))
+                        for name, p in (("SonoVault", sono), ("AudioMeta", am), ("Discogs", dc), ("MusicBrainz", mb), ("HDRR", hdrr))
                     )
                 )
                 if not any_healthy_provider:

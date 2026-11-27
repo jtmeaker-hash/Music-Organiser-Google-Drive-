@@ -310,6 +310,8 @@ def canonical_provider_family(provider_name: str) -> str:
         return "discogs"
     if "musicbrainz" in p:
         return "musicbrainz"
+    if "hdrr" in p or "harddancereleaseradar" in p or "hard dance release radar" in p:
+        return "hdrr"
     if "wikidata" in p or "onlineresearch" in p:
         return "wikidata"
     return p or "unknown"
@@ -759,6 +761,7 @@ class BaseProvider:
         timeout: int = 20,
         use_cache: bool = True,
         allow_404_as_empty: bool = False,
+        expect_json: bool = True,
     ) -> ProviderCallOutcome:
         """Execute paced HTTP GET with separated cooldown, hard-block, and request-cap handling."""
         cache_key = self._build_cache_key(url, params)
@@ -987,30 +990,33 @@ class BaseProvider:
                     return outcome
 
                 if resp.ok:
-                    try:
-                        payload = resp.json()
-                    except ValueError as json_exc:
-                        breaker_until = ""
-                        if self.request_monitor:
-                            self.request_monitor.count("malformed_responses")
-                            wait = self.request_monitor.observe("temporary_failures", self._clock_mono() - started, now_utc)
-                            if wait:
-                                breaker_until = self._set_cooldown(
-                                    wait, ProviderStatus.SERVER_ERROR.value, code, "circuit_breaker",
-                                    "Repeated malformed provider responses",
-                                )
-                        self.stats["malformed_json"] += 1
-                        outcome = ProviderCallOutcome(
-                            provider=self.name,
-                            status=ProviderStatus.MALFORMED_JSON,
-                            http_status=code,
-                            error=f"Malformed JSON response ({self._redact(json_exc)})",
-                            error_kind="malformed_json",
-                            retry_until_utc=breaker_until,
-                            request_made=True,
-                        )
-                        self.last_outcome = outcome
-                        return outcome
+                    if expect_json:
+                        try:
+                            payload: Any = resp.json()
+                        except ValueError as json_exc:
+                            breaker_until = ""
+                            if self.request_monitor:
+                                self.request_monitor.count("malformed_responses")
+                                wait = self.request_monitor.observe("temporary_failures", self._clock_mono() - started, now_utc)
+                                if wait:
+                                    breaker_until = self._set_cooldown(
+                                        wait, ProviderStatus.SERVER_ERROR.value, code, "circuit_breaker",
+                                        "Repeated malformed provider responses",
+                                    )
+                            self.stats["malformed_json"] += 1
+                            outcome = ProviderCallOutcome(
+                                provider=self.name,
+                                status=ProviderStatus.MALFORMED_JSON,
+                                http_status=code,
+                                error=f"Malformed JSON response ({self._redact(json_exc)})",
+                                error_kind="malformed_json",
+                                retry_until_utc=breaker_until,
+                                request_made=True,
+                            )
+                            self.last_outcome = outcome
+                            return outcome
+                    else:
+                        payload = resp.text or ""
 
                     if self.request_monitor:
                         self.request_monitor.observe("successful_responses", self._clock_mono() - started, now_utc)

@@ -378,7 +378,7 @@ def evaluate_live_preview(
             if "conflict" in v_low or "mismatch" in v_low or "inferred" in v_low or "title-only" in v_low:
                 continue
             fam = c.source_family or canonical_provider_family(c.provider)
-            if fam == "wikidata":
+            if fam in ("wikidata", "hdrr") or getattr(c, "genre_evidence_kind", "") == "artist_derived":
                 continue
             is_rec_verified = c.verification in ("ISRC supported", "Duration supported")
             for raw_tag in (c.genre or []):
@@ -398,9 +398,11 @@ def evaluate_live_preview(
         gs = states.get("genre", {}).get("state", "")
         ss = states.get("subgenre", {}).get("state", "")
         sem = inspect_sheet_row_semantics(old_row)
+        r_eval = proposal.get("artist_rule_eval") or {}
         if (
             gs in ("CONFLICT", "LOW_CONFLICT", "REJECTED", "REVIEW_HOLD")
             or ss in ("CONFLICT", "LOW_CONFLICT", "REJECTED")
+            or r_eval.get("genre_blocked_conflict")
             or any(
                 fl in sem["row_flags"]
                 for fl in (

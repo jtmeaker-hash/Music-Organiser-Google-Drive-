@@ -12,6 +12,15 @@ from typing import Any, Dict, List, Optional
 from .. import __version__
 from ..auth import GoogleAuthManager
 from ..config import Config
+from ..core.artist_rules import (
+    ARTIST_RULES_HEADERS,
+    approve_artist_rule_suggestion,
+    artist_rule_to_sheet_row,
+    ensure_default_artist_rules,
+    flag_existing_rows_against_approved_rules,
+    learn_artist_rule_suggestions,
+    load_artist_rules,
+)
 from ..core.hydrator import hydrate_live_inventory
 from ..core.inventory import scan_root
 from ..core.organizer import evaluate_live_preview
@@ -885,3 +894,90 @@ def run_benchmark(
         if o.passed is False:
             print(f"  [FAIL] {o.track_name}: {o.failure_detail}")
     return res
+
+
+def run_artist_rules(
+    config: Config,
+    db: Database,
+    learn: bool = False,
+    approve_id: str = "",
+    export_sheet_csv: Optional[Path] = None,
+    export_json: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Inspect configurable `Artist_Rules`, export the `Artist_Rules` Google Sheets tab template/rows,
+    learn `pending_approval` suggestions from manual corrections, or explicitly approve a suggestion.
+    """
+    db._ensure_additive_v3_extensions()
+    ensure_default_artist_rules(db)
+
+    approved_rule = None
+    if approve_id.strip():
+        approved_rule = approve_artist_rule_suggestion(db, approve_id.strip(), actor="cli_user")
+        if approved_rule:
+            print(f"[✓] Approved artist rule suggestion '{approve_id}' -> active rule '{approved_rule.rule_id}' ({approved_rule.artist_name})")
+        else:
+            print(f"[!] Suggestion '{approve_id}' not found.")
+
+    learned = learn_artist_rule_suggestions(db) if learn else []
+    rules = load_artist_rules(db=db, config=config, active_only=False)
+
+    with db._get_connection() as conn:
+        pending_sugs = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT suggestion_id, artist_name, pattern_type, evidence_count, status, updated_utc FROM artist_rule_suggestions ORDER BY updated_utc DESC"
+            ).fetchall()
+        ]
+        audit_entries = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT id, rule_id, action, actor, notes, created_utc FROM artist_rules_audit ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+        ]
+
+    print(f"\n=== ARTIST CLASSIFICATION RULES ({len(rules)} configured) ===")
+    for r in rules:
+        print(
+            f"  [{r.rule_id}] {r.artist_name} | enabled={r.enabled} | status={r.approval_status}/{r.verification_status} | "
+            f"preferred={r.preferred} | discouraged={r.discouraged} | blocked={r.blocked}"
+        )
+    if pending_sugs:
+        print(f"\nPending / Historical Rule Suggestions ({len(pending_sugs)}):")
+        for s in pending_sugs[:10]:
+            print(f"  [{s['suggestion_id']}] {s['artist_name']} ({s['status']}, evidence={s['evidence_count']})")
+
+    secrets = config.known_secrets()
+    if export_sheet_csv:
+        rows_dicts = [
+            dict(zip(ARTIST_RULES_HEADERS, artist_rule_to_sheet_row(r)))
+            for r in rules
+        ]
+        export_safe_csv(export_sheet_csv, ARTIST_RULES_HEADERS, rows_dicts, secrets)
+        print(f"[✓] Exported Artist_Rules Google Sheets tab CSV to {export_sheet_csv}")
+
+    payload = {
+        "rules": [
+            {
+                "rule_id": r.rule_id,
+                "artist_name": r.artist_name,
+                "enabled": r.enabled,
+                "approval_status": r.approval_status,
+                "verification_status": r.verification_status,
+                "preferred": r.preferred,
+                "discouraged": r.discouraged,
+                "blocked": r.blocked,
+                "collab_policy": r.collab_policy,
+                "remix_priority": r.remix_priority,
+            }
+            for r in rules
+        ],
+        "learned_now": learned,
+        "suggestions": pending_sugs,
+        "recent_audit": audit_entries,
+        "approved_rule_id": approved_rule.rule_id if approved_rule else "",
+    }
+    if export_json:
+        export_safe_json(export_json, payload, secrets)
+        print(f"[✓] Exported Artist_Rules JSON report to {export_json}")
+    return payload

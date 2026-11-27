@@ -9,6 +9,7 @@ from typing import List, Optional
 
 from . import __version__
 from .cli.commands import (
+    run_artist_rules,
     run_backup,
     run_benchmark,
     run_hydrate,
@@ -133,6 +134,16 @@ def build_parser() -> argparse.ArgumentParser:
     bm_p.add_argument("--wide", action="store_true", help="Force wide horizontal table output")
     bm_p.add_argument("--verbose", action="store_true", help="Show full Drive file IDs")
 
+    # artist-rules
+    ar_p = subparsers.add_parser(
+        "artist-rules",
+        help="Inspect configurable Artist_Rules, export Artist_Rules sheet CSV, or review learned rule suggestions",
+    )
+    ar_p.add_argument("--learn", action="store_true", help="Scan verified corrections to generate pending_approval rule suggestions")
+    ar_p.add_argument("--approve", type=str, default="", help="Explicitly approve a pending suggestion ID")
+    ar_p.add_argument("--export-sheet-csv", type=str, default="", help="Export 18-column Artist_Rules Google Sheets tab CSV")
+    ar_p.add_argument("--export-json", type=str, default="", help="Export rules, suggestions, and audit log to UTF-8 JSON")
+
     # setup
     subparsers.add_parser("setup", help="Run credential & Google OAuth setup wizard")
 
@@ -174,6 +185,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 0
             if not version or args.command == "migrate":
                 db = Database(config.db_path)
+            elif version == SCHEMA_VERSION and args.command not in {"status", "backup"}:
+                db._ensure_additive_v3_extensions()
             if args.command == "migrate":
                 print(f"Local schema version {db.get_schema_version()}")
                 if db.last_backup_path:
@@ -308,6 +321,15 @@ def dispatch(args: argparse.Namespace, config: Config, db: Database) -> int:
                 expected_rows_path=exp_path,
                 wide=args.wide,
                 verbose=args.verbose,
+            )
+        elif args.command == "artist-rules":
+            run_artist_rules(
+                config,
+                db,
+                learn=args.learn,
+                approve_id=args.approve,
+                export_sheet_csv=Path(args.export_sheet_csv) if args.export_sheet_csv else None,
+                export_json=Path(args.export_json) if args.export_json else None,
             )
     except KeyboardInterrupt:
         print("\n[i] Interrupted cleanly (Ctrl+C). Saved checkpoints preserved.")

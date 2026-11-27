@@ -10,6 +10,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..models import Candidate, TrackMetadata
 from ..providers.base import canonical_provider_family
+from .artist_rules import (
+    ArtistRule,
+    DEFAULT_PEYGAN_RULE,
+    _classification_matches_list,
+    evaluate_artist_rules,
+)
 from .genre import (
     GENERIC_TAGS,
     SUBGENRE_PARENT,
@@ -38,7 +44,24 @@ EXTRA_HEADERS = [
 _IMMUTABLE_STATES = ("HIGH_LOCKED", "USER_LOCKED")
 _HOLD_STATES = ("REVIEW_HOLD",)
 _CONFLICT_STATES = ("CONFLICT", "LOW_CONFLICT", "REJECTED")
-_OPEN_FAMILIES = frozenset({"musicbrainz", "embedded", "manual"})
+_OPEN_FAMILIES = frozenset({"musicbrainz", "embedded", "manual", "hdrr"})
+_ARTIST_DERIVED_GENRE_FAMILIES = frozenset({"wikidata", "hdrr"})
+_SPOTIFY_CORRELATED_FAMILIES = frozenset({"sonovault", "audiometa", "hdrr"})
+
+
+def independent_genre_family_count(families: Set[str]) -> int:
+    """
+    Count genuinely independent catalogue source families for genre/subgenre confirmation.
+    Collapses correlated Spotify-ecosystem families (`sonovault`, `audiometa`, `hdrr`) into at most
+    one confirmation bucket so correlated upstream metadata never masquerades as independent agreement.
+    """
+    buckets: Set[str] = set()
+    for fam in families:
+        if fam in _SPOTIFY_CORRELATED_FAMILIES:
+            buckets.add("spotify_ecosystem")
+        elif fam and fam != "wikidata":
+            buckets.add(fam)
+    return len(buckets)
 UPTEMPO_OCTAVE_GENRES = frozenset({
     "Hardstyle", "Hardcore", "Happy Hardcore", "Techno", "Drum & Bass", "Jungle",
     "House", "Trance", "UK Garage", "Hard Bounce", "Bassline", "Breakbeat",
@@ -202,6 +225,8 @@ def candidate_field_values(
                 continue
             out.append((norm_k, family, v_status))
         elif field == "genre":
+            if family in _ARTIST_DERIVED_GENRE_FAMILIES or getattr(c, "genre_evidence_kind", "") == "artist_derived":
+                continue
             cand_genres = {
                 canonical_genre(g)
                 for g in (c.genre or [])
@@ -210,6 +235,8 @@ def candidate_field_values(
             if len(cand_genres) == 1:
                 out.append((next(iter(cand_genres)), family, v_status))
         elif field == "subgenre":
+            if family in _ARTIST_DERIVED_GENRE_FAMILIES or getattr(c, "genre_evidence_kind", "") == "artist_derived":
+                continue
             cand_subs = {
                 sub
                 for g in (c.genre or [])
@@ -340,17 +367,48 @@ def cluster_bpm_candidates(
     }
 
 
-def build_track_proposal(meta: TrackMetadata, candidates: List[Candidate]) -> Dict[str, Any]:
+def build_track_proposal(
+    meta: TrackMetadata,
+    candidates: List[Candidate],
+    artist_rules: Optional[List[ArtistRule]] = None,
+    file_id: str = "",
+) -> Dict[str, Any]:
     """
-    Build unified metadata proposal from recording-supported provider candidates and local metadata.
+    Build unified metadata proposal from recording-supported provider candidates, HDRR artist-derived
+    catalogue provenance, configurable `Artist_Rules`, and local metadata.
     - Normalizes verified/proposed BPM to integer display while retaining raw float measurements & provenance.
     - Resolves recording-supported granular subgenres within the approved SUBGENRE_PARENT taxonomy.
-    - Never promotes artist-only or BPM-only hints above LOW review hints.
+    - Preserves original HDRR classifications (`hdrr_raw_genres`) separately from normalized MusicVault
+      classifications and NEVER lets HDRR or `Artist_Rules` preferences independently elevate to MEDIUM/HIGH.
     """
-    g_info = classify_track_genres(meta, candidates, enable_subgenres=True)
+    active_rules = list(artist_rules) if artist_rules is not None else [DEFAULT_PEYGAN_RULE]
+
+    # Exclude artist-derived HDRR candidates from weighted track-level genre promotion while retaining provenance
+    non_hdrr_cands = [
+        c
+        for c in candidates
+        if (c.source_family or canonical_provider_family(c.provider)) != "hdrr"
+        and getattr(c, "genre_evidence_kind", "") != "artist_derived"
+    ]
+    g_info = classify_track_genres(meta, non_hdrr_cands, enable_subgenres=True)
     prop_genre = g_info["genre"]
 
-    # Recording-verified subgenre resolution (artist/label hints never populate verified/provisional subgenre)
+    hdrr_raw_genres: List[str] = []
+    hdrr_normalized: List[Dict[str, str]] = []
+    for c in candidates:
+        fam = c.source_family or canonical_provider_family(c.provider)
+        if fam == "hdrr":
+            for rg in (c.raw_source_genre or []):
+                if rg and rg not in hdrr_raw_genres:
+                    hdrr_raw_genres.append(rg)
+            cg = next((canonical_genre(g) for g in (c.genre or []) if canonical_genre(g)), "")
+            cs = next((canonical_subgenre(g) for g in (c.genre or []) if canonical_subgenre(g)), "")
+            if cg or cs:
+                entry = {"genre": cg, "subgenre": cs, "raw": ", ".join(c.raw_source_genre or c.genre or [])}
+                if entry not in hdrr_normalized:
+                    hdrr_normalized.append(entry)
+
+    # Recording-verified subgenre resolution (artist/label/HDRR hints never populate verified/provisional subgenre)
     matched_subs = candidate_field_values(candidates, "subgenre", parent_genre=prop_genre) if prop_genre else []
     sub_vals = {x[0] for x in matched_subs}
     sub_fams = {x[1] for x in matched_subs}
@@ -361,12 +419,41 @@ def build_track_proposal(meta: TrackMetadata, candidates: List[Candidate]) -> Di
         prop_sub = next(iter(sub_vals))
         sub_conf = (
             "independent recording-supported subgenre agreement"
-            if len(sub_fams) >= 2
+            if independent_genre_family_count(sub_fams) >= 2
             else "single recording-supported subgenre"
         )
     else:
         prop_sub = ""
-        sub_conf = "artist/label hint only (unverified)" if g_info["subgenre"] else "missing"
+        if hdrr_normalized:
+            sub_conf = "HDRR artist-derived hint only (requires independent confirmation)"
+        elif g_info["subgenre"]:
+            sub_conf = "artist/label hint only (unverified)"
+        else:
+            sub_conf = "missing"
+
+    rule_eval = evaluate_artist_rules(
+        meta=meta,
+        candidates=candidates,
+        rules=active_rules,
+        proposed_genre=prop_genre,
+        proposed_subgenre=prop_sub if prop_sub != "CONFLICT" else "",
+        file_id=file_id,
+    )
+
+    override_fields: Set[str] = set()
+    if rule_eval["explicit_override_genre"] and not prop_genre:
+        prop_genre = rule_eval["explicit_override_genre"]
+        override_fields.add("genre")
+    if rule_eval["explicit_override_subgenre"] and prop_sub in ("", "CONFLICT") and not rule_eval["blocked_conflict"]:
+        ov_s = rule_eval["explicit_override_subgenre"]
+        ov_p = SUBGENRE_PARENT.get(ov_s, "")
+        if not prop_genre and ov_p:
+            prop_genre = ov_p
+            override_fields.add("genre")
+        if prop_genre == ov_p:
+            prop_sub = ov_s
+            sub_conf = "explicit approved artist rule / track exception"
+            override_fields.add("subgenre")
 
     bpm_info = cluster_bpm_candidates(candidates, meta=meta, parent_genre=prop_genre, subgenre=prop_sub)
     if bpm_info["status"] == "conflict":
@@ -427,6 +514,10 @@ def build_track_proposal(meta: TrackMetadata, candidates: List[Candidate]) -> Di
         elif prop_genre == "Drum & Bass" and 75 <= prop_bpm <= 98:
             tempo_hint = f"Check half/double-time ({prop_bpm * 2:g} BPM)"
 
+    hint_sub = g_info["subgenre"] if not prop_sub else ""
+    if not hint_sub and not prop_sub and hdrr_normalized and not rule_eval["hdrr_rule_conflict"]:
+        hint_sub = hdrr_normalized[0].get("subgenre", "")
+
     return {
         "bpm": prop_bpm,
         "bpm_display": format_display_bpm(prop_bpm),
@@ -435,7 +526,7 @@ def build_track_proposal(meta: TrackMetadata, candidates: List[Candidate]) -> Di
         "key": prop_key,
         "genre": prop_genre,
         "subgenre": prop_sub,
-        "subgenre_hint": g_info["subgenre"] if not prop_sub else "",
+        "subgenre_hint": hint_sub,
         "bpm_confidence": bpm_conf,
         "key_confidence": key_conf,
         "genre_confidence": g_info["genre_confidence"],
@@ -443,6 +534,10 @@ def build_track_proposal(meta: TrackMetadata, candidates: List[Candidate]) -> Di
         "genre_scores": g_info["genre_scores"],
         "unmapped_tags": g_info["unmapped_tags"],
         "tempo_hint": tempo_hint,
+        "hdrr_raw_genres": hdrr_raw_genres,
+        "hdrr_normalized": hdrr_normalized,
+        "artist_rule_eval": rule_eval,
+        "artist_rule_override_fields": sorted(override_fields),
     }
 
 
@@ -453,7 +548,20 @@ def field_decision(candidates: List[Candidate], field: str, proposed_value: Any)
     clustering, and taxonomy-validated subgenre corroboration.
     """
     val = proposed_value.get(field, "") if isinstance(proposed_value, dict) else proposed_value
+    rule_eval = proposed_value.get("artist_rule_eval", {}) if isinstance(proposed_value, dict) else {}
+    override_fields = set(proposed_value.get("artist_rule_override_fields", [])) if isinstance(proposed_value, dict) else set()
+
+    if field in ("genre", "subgenre") and rule_eval.get("hdrr_rule_conflict") and val in ("", "CONFLICT", None):
+        return ("LOW", "; ".join(rule_eval.get("conflict_reasons") or ["HDRR artist-rule conflict; review required"]))
+
     if val in ("", "CONFLICT", None):
+        if field in ("genre", "subgenre"):
+            has_hdrr = any(
+                (c.source_family or canonical_provider_family(c.provider)) == "hdrr"
+                for c in candidates
+            )
+            if has_hdrr:
+                return ("LOW", "HDRR artist-derived classification requires independent track-level confirmation")
         return ("LOW", "missing or conflicting")
 
     if field == "bpm":
@@ -505,12 +613,22 @@ def field_decision(candidates: List[Candidate], field: str, proposed_value: Any)
         canon_val = canonical_genre(str(val))
         if not canon_val:
             return ("LOW", "unknown or novel unmapped genre; review required")
+        if rule_eval.get("genre_blocked_conflict"):
+            return ("LOW", "; ".join(rule_eval.get("conflict_reasons") or ["blocked by artist rule"]))
         matched_genres = candidate_field_values(candidates, "genre")
         if not matched_genres:
+            if "genre" in override_fields:
+                return ("MEDIUM", "explicit approved artist rule / track exception")
+            if rule_eval.get("hdrr_rule_conflict"):
+                return ("LOW", "; ".join(rule_eval["conflict_reasons"]))
+            if any((c.source_family or canonical_provider_family(c.provider)) == "hdrr" for c in candidates):
+                return ("LOW", "HDRR artist-derived classification requires independent track-level confirmation")
             return ("LOW", "genre weighted inference; review required")
         vals = {x[0] for x in matched_genres}
         if len(vals) != 1 or canon_val not in vals:
             return ("LOW", "conflicting catalogue genre evidence; review required")
+        families = {x[1] for x in matched_genres}
+        indep_count = independent_genre_family_count(families)
         for c in candidates:
             v_low = (c.verification or "").lower()
             fam = c.source_family or canonical_provider_family(c.provider)
@@ -522,12 +640,21 @@ def field_decision(candidates: List[Candidate], field: str, proposed_value: Any)
                 or fam == "wikidata"
             ):
                 continue
+            # Artist-derived HDRR cannot veto >=2 independent recording-verified sources, nor veto when HDRR itself violates an Artist_Rule
+            if fam == "hdrr" or getattr(c, "genre_evidence_kind", "") == "artist_derived":
+                if indep_count >= 2 or rule_eval.get("hdrr_rule_conflict"):
+                    continue
+                if (c.match_confidence or "") != "exact" and v_low not in ("isrc supported", "duration supported"):
+                    continue
             for g in (c.genre or []):
                 cg = canonical_genre(g)
                 if cg and cg != canon_val:
                     return ("LOW", "cross-source genre disagreement; review required")
-        families = {x[1] for x in matched_genres}
-        if len(families) >= 2:
+        if rule_eval.get("genre_discouraged_conflict"):
+            if indep_count >= 2 and int(rule_eval.get("confidence_delta", -1)) >= -1:
+                return ("MEDIUM", "catalogue genre conflicts with discouraged artist rule; double-check: " + ", ".join(sorted(families)))
+            return ("LOW", "; ".join(rule_eval.get("conflict_reasons") or ["discouraged by artist rule; review required"]))
+        if indep_count >= 2:
             return ("HIGH", "independent recording-supported genre agreement: " + ", ".join(sorted(families)))
         return ("MEDIUM", "single recording-supported catalogue genre: " + ", ".join(sorted(families)))
 
@@ -535,6 +662,8 @@ def field_decision(candidates: List[Candidate], field: str, proposed_value: Any)
         canon_sub = canonical_subgenre(str(val))
         if not canon_sub:
             return ("LOW", "unknown or unmapped subgenre; review required")
+        if rule_eval.get("subgenre_blocked_conflict") or rule_eval.get("genre_blocked_conflict"):
+            return ("LOW", "; ".join(rule_eval.get("conflict_reasons") or ["blocked by artist rule"]))
         parent_g = (
             canonical_genre(str(proposed_value.get("genre", "")))
             if isinstance(proposed_value, dict)
@@ -548,30 +677,48 @@ def field_decision(candidates: List[Candidate], field: str, proposed_value: Any)
                 return ("LOW", "parent genre unresolved; subgenre held for review")
         matched_subs = candidate_field_values(candidates, "subgenre", parent_genre=parent_g)
         if not matched_subs:
+            if "subgenre" in override_fields:
+                return ("MEDIUM", "explicit approved artist rule / track exception")
+            if rule_eval.get("hdrr_rule_conflict"):
+                return ("LOW", "; ".join(rule_eval["conflict_reasons"]))
+            if any((c.source_family or canonical_provider_family(c.provider)) == "hdrr" for c in candidates):
+                return ("LOW", "HDRR artist-derived subgenre requires independent track-level confirmation")
             return ("LOW", "subgenre artist/label inference; review required")
         vals = {x[0] for x in matched_subs}
         if len(vals) != 1 or canon_sub not in vals:
             return ("LOW", "conflicting recording-supported subgenre evidence; review required")
+        families = {x[1] for x in matched_subs}
+        indep_count = independent_genre_family_count(families)
         # Also block promotion if any recording-verified candidate carries a contradictory subgenre under parent_g
         for c in candidates:
             if (c.verification or "") not in ("ISRC supported", "Duration supported"):
                 continue
             fam = c.source_family or canonical_provider_family(c.provider)
-            if fam == "wikidata":
-                continue
+            if fam in _ARTIST_DERIVED_GENRE_FAMILIES or getattr(c, "genre_evidence_kind", "") == "artist_derived":
+                if indep_count >= 2 or rule_eval.get("hdrr_rule_conflict"):
+                    continue
             for g in (c.genre or []):
                 cs = canonical_subgenre(g)
                 if cs and SUBGENRE_PARENT.get(cs) == parent_g and cs != canon_sub:
                     return ("LOW", "cross-source subgenre disagreement; review required")
-        families = {x[1] for x in matched_subs}
+        if rule_eval.get("subgenre_discouraged_conflict") or rule_eval.get("genre_discouraged_conflict"):
+            if indep_count >= 2 and int(rule_eval.get("confidence_delta", -1)) >= -1:
+                return ("MEDIUM", "catalogue subgenre conflicts with discouraged artist rule; double-check: " + ", ".join(sorted(families)))
+            return ("LOW", "; ".join(rule_eval.get("conflict_reasons") or ["discouraged by artist rule; review required"]))
         parent_high = (
             field_decision(candidates, "genre", proposed_value)[0] == "HIGH"
             if isinstance(proposed_value, dict)
-            else len(families) >= 2
+            else indep_count >= 2
         )
-        if len(families) >= 2 and parent_high:
-            return ("HIGH", "independent recording-supported subgenre agreement: " + ", ".join(sorted(families)))
-        return ("MEDIUM", "recording-supported catalogue subgenre: " + ", ".join(sorted(families)))
+        hdrr_corroborates = any(
+            (c.source_family or canonical_provider_family(c.provider)) == "hdrr"
+            and any(canonical_subgenre(g) == canon_sub for g in (c.genre or []))
+            for c in candidates
+        )
+        suffix = " (+hdrr corroborated)" if hdrr_corroborates else ""
+        if indep_count >= 2 and parent_high:
+            return ("HIGH", "independent recording-supported subgenre agreement: " + ", ".join(sorted(families)) + suffix)
+        return ("MEDIUM", "recording-supported catalogue subgenre: " + ", ".join(sorted(families)) + suffix)
 
     return ("LOW", "review required")
 
@@ -640,6 +787,7 @@ def planned_row(
     save_medium: bool = True,
     provider_terms_cleared: bool = False,
     overrides: Optional[Dict[str, str]] = None,
+    artist_rules: Optional[List[ArtistRule]] = None,
 ) -> Tuple[List[str], Dict[str, str], List[str]]:
     """
     Compute proposed row updates while strictly preserving human locks (L/M/P & Q:AA),
@@ -727,6 +875,28 @@ def planned_row(
                 reasons.append(f"{field}: existing '{existing}' differs from {level} catalogue '{val}'; preserved for review")
                 continue
 
+            # Check whether an active approved Artist_Rule flags this existing unlocked genre/subgenre for review
+            active_r_list = list(artist_rules) if artist_rules is not None else [DEFAULT_PEYGAN_RULE]
+            rule_ev_cur = effective_proposal.get("artist_rule_eval") or {}
+            if field in ("genre", "subgenre") and rule_ev_cur.get("matched_rules"):
+                matched_ids = set(rule_ev_cur["matched_rules"])
+                for ar in active_r_list:
+                    if ar.rule_id not in matched_ids or not ar.is_active:
+                        continue
+                    g_chk = existing if field == "genre" else out[COL["genre"]].strip()
+                    s_chk = existing if field == "subgenre" else ""
+                    hit_blk = _classification_matches_list(g_chk if field == "genre" else "", s_chk, ar.blocked)
+                    hit_dsc = _classification_matches_list(g_chk if field == "genre" else "", s_chk, ar.discouraged)
+                    if hit_blk or hit_dsc:
+                        decisions[field] = "EXISTING_CONFLICT_REVIEW"
+                        reasons.append(
+                            f"{field}: existing '{existing}' conflicts with approved Artist_Rule {ar.rule_id} "
+                            f"({ar.artist_name}); preserved for review"
+                        )
+                        break
+                if decisions.get(field) == "EXISTING_CONFLICT_REVIEW":
+                    continue
+
             decisions[field] = (
                 "EXISTING_UNVERIFIED"
                 if prior_status not in ("MEDIUM_PROVISIONAL", "HIGH_LOCKED", "USER_LOCKED")
@@ -748,7 +918,8 @@ def planned_row(
             continue
 
         if level == "HIGH" or (level == "MEDIUM" and save_medium):
-            open_only = manual_override or _is_open_provenance_only(candidates, field, parent_genre=parent_g)
+            is_rule_override = field in set(effective_proposal.get("artist_rule_override_fields") or [])
+            open_only = manual_override or is_rule_override or _is_open_provenance_only(candidates, field, parent_genre=parent_g)
             if not provider_terms_cleared and not open_only:
                 decisions[field] = "TERMS_HOLD"
                 reasons.append(f"{field}: provider retention not cleared")
@@ -787,6 +958,11 @@ def planned_row(
             decisions[field] = "REVIEW"
             reasons.append(f"{field}: {why}")
 
+    rule_eval = effective_proposal.get("artist_rule_eval") or {}
+    for c_rsn in (rule_eval.get("conflict_reasons") or []):
+        reasons.append(c_rsn)
+    if rule_eval.get("investigation_cues") and decisions.get("subgenre") in ("REVIEW", "REVIEW_HOLD", "EXISTING_CONFLICT_REVIEW"):
+        reasons.append("investigate_subgenres: " + ", ".join(rule_eval["investigation_cues"]))
     for flag in sem["row_flags"]:
         reasons.append(f"row_hold: {flag}")
 

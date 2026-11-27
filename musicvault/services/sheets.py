@@ -13,6 +13,13 @@ from googleapiclient.discovery import build
 
 from .read_only import read_only_request
 
+from ..core.artist_rules import (
+    ARTIST_RULES_HEADERS,
+    ARTIST_RULES_TAB_NAME,
+    ArtistRule,
+    artist_rule_to_sheet_row,
+    parse_artist_rules_sheet,
+)
 from ..core.matcher import norm
 from ..core.rules import EXTRA_HEADERS
 
@@ -240,6 +247,33 @@ class SheetsService:
         with backup_path.open("w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         return backup_path
+
+    def load_artist_rules_tab(
+        self, spreadsheet_id: str, tab_name: str = ARTIST_RULES_TAB_NAME
+    ) -> Tuple[List[ArtistRule], List[str]]:
+        """
+        Read-only fetch of the optional `Artist_Rules` tab from Google Sheets.
+        Returns `([], [])` cleanly if the `Artist_Rules` tab has not been created yet.
+        """
+        metadata = self.service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(title))",
+        ).execute(num_retries=3)
+        titles = {
+            s.get("properties", {}).get("title", "")
+            for s in metadata.get("sheets", [])
+        }
+        if tab_name not in titles:
+            return [], []
+        header_row = self.fetch_header_row(spreadsheet_id, f"'{tab_name}'!1:1")
+        last_col = _col_letter(max(len(ARTIST_RULES_HEADERS), len(header_row)))
+        data_rows = self.fetch_master_rows(spreadsheet_id, f"'{tab_name}'!A2:{last_col}")
+        return parse_artist_rules_sheet(header_row, data_rows)
+
+    @staticmethod
+    def build_artist_rules_tab_payload(rules: List[ArtistRule]) -> List[List[str]]:
+        """Build complete 2D sheet grid (`header + rows`) for staging/exporting the `Artist_Rules` tab."""
+        return [list(ARTIST_RULES_HEADERS)] + [artist_rule_to_sheet_row(r) for r in rules]
 
     def apply_batch_updates(
         self,

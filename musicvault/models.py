@@ -158,6 +158,10 @@ class Candidate:
     source_family: str = ""
     created_utc: str = ""
     updated_utc: str = ""
+    raw_source_genre: List[str] = field(default_factory=list)
+    release_year: Optional[int] = None
+    genre_evidence_kind: str = ""
+    source_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
