@@ -1,5 +1,5 @@
 """
-Command implementations for Music Vault Manager v2.0.3 (Read-only library processing).
+Command implementations for Music Vault Manager v2.0.4 (Read-only library processing).
 Implements local status diagnostics, verified DB backups, transactional inventory scanning,
 bandwidth-bounded audio hydration, resumable online research, selective dry-run-first recovery,
 real read-only Sheets/Drive preview, and isolated offline benchmarks.

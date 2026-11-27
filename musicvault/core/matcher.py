@@ -114,6 +114,15 @@ def extract_version_tokens(title: str) -> Tuple[str, Set[str], str]:
         m_rem = _REMIXER_SUFFIX_RE.match(q_clean)
         if m_rem:
             rem_raw = m_rem.group("remixer").strip()
+            # Strip trailing length/style modifiers on remixer name (e.g. 'Darren Styles Extended Remix')
+            m_mod = re.match(r"^(?P<base>.+?)\s+(?P<mod>extended|radio|club)$", rem_raw, flags=re.I)
+            if m_mod and norm(m_mod.group("base")):
+                mod_low = m_mod.group("mod").casefold()
+                if mod_low == "extended":
+                    version_tokens.add("extendedmix")
+                elif mod_low in ("radio", "club"):
+                    version_tokens.add("radioedit")
+                rem_raw = m_mod.group("base").strip()
             if norm(rem_raw) not in ("original", "extended", "radio", "club", "vocal", "instrumental"):
                 remixer_norm = artist_alias(rem_raw)
                 version_tokens.add(f"remix:{remixer_norm}")
@@ -125,8 +134,24 @@ def extract_version_tokens(title: str) -> Tuple[str, Set[str], str]:
             if kw in lower_q:
                 version_tokens.add(norm(kw))
                 matched_any = True
-        if "original mix" in lower_q:
-            # 'Original Mix' is compatible with unmarked studio original
+        if re.search(r"\bextended(?:\s+(?:mix|version|cut|edit))?\b", lower_q):
+            version_tokens.add("extendedmix")
+            matched_any = True
+        m_named_edit = re.match(r"^(?P<edit_qual>.+?)\s+edit$", q_clean, flags=re.I)
+        if m_named_edit:
+            eq_norm = artist_alias(m_named_edit.group("edit_qual").strip())
+            if eq_norm in ("radio", "short", "club", "clean", "vocal", "original"):
+                version_tokens.add("radioedit")
+            elif eq_norm == "extended":
+                version_tokens.add("extendedmix")
+            elif eq_norm:
+                version_tokens.add(f"edit:{eq_norm}")
+            matched_any = True
+        elif re.search(r"\b(?:radio|short|club|clean|vocal|original)\s+edit\b", lower_q) or lower_q == "edit":
+            version_tokens.add("radioedit")
+            matched_any = True
+        if re.search(r"\boriginal(?:\s+(?:mix|version))?\b", lower_q):
+            version_tokens.add("originalmix")
             matched_any = True
         return matched_any
 
@@ -163,15 +188,21 @@ def versions_compatible(query_title: str, candidate_title: str) -> bool:
     if q_rem != c_rem:
         return False
 
-    # Hard incompatibilities (remix, vip, acoustic, instrumental, live, spedup, slowed, bootleg)
+    # Hard incompatibilities (remix, named edit, vip, acoustic, instrumental, live, spedup, slowed, bootleg)
     strict_kinds = {"remix", "vip", "bootleg", "rework", "flip", "acoustic", "instrumental", "live", "spedup", "slowed"}
-    q_strict = {v for v in q_vers if v in strict_kinds or v.startswith("remix:")}
-    c_strict = {v for v in c_vers if v in strict_kinds or v.startswith("remix:")}
+    q_strict = {v for v in q_vers if v in strict_kinds or v.startswith("remix:") or v.startswith("edit:")}
+    c_strict = {v for v in c_vers if v in strict_kinds or v.startswith("remix:") or v.startswith("edit:")}
     if q_strict != c_strict:
         return False
 
     # Radio Edit vs Extended Mix conflict when both explicitly specify opposing lengths
     if ("radioedit" in q_vers and "extendedmix" in c_vers) or ("extendedmix" in q_vers and "radioedit" in c_vers):
+        return False
+
+    # Explicit Original Mix vs explicit Radio Edit or Extended Mix
+    if ("originalmix" in q_vers and ("extendedmix" in c_vers or "radioedit" in c_vers)) or (
+        "originalmix" in c_vers and ("extendedmix" in q_vers or "radioedit" in q_vers)
+    ):
         return False
 
     return True
@@ -500,6 +531,22 @@ def normalize_bpm_str(raw_bpm: Any) -> str:
     if not (40.0 <= val <= 350.0):
         return ""
     return f"{val:g}"
+
+
+def format_display_bpm(raw_bpm: Any) -> str:
+    """Format verified/proposed BPM for spreadsheet display as rounded integer string (40..350)."""
+    if raw_bpm is None or raw_bpm in ("", "CONFLICT"):
+        return ""
+    s = re.sub(r"(?i)\s*bpm\s*$", "", str(raw_bpm).strip())
+    if not s:
+        return ""
+    try:
+        val = float(s)
+    except ValueError:
+        return ""
+    if not (40.0 <= val <= 350.0):
+        return ""
+    return str(int(round(val)))
 
 
 def verify_candidate(

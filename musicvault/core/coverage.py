@@ -1,4 +1,4 @@
-"""Local metadata reconciliation and attribution over stored evidence only."""
+"""Local metadata reconciliation, spreadsheet intelligence preview, and attribution over stored evidence only."""
 import csv
 import json
 import os
@@ -10,11 +10,33 @@ from tempfile import NamedTemporaryFile
 from ..cli.formatting import _redact_json_tree, sanitize_csv_cell, short_file_id
 from ..providers.base import canonical_provider_family
 from ..services.sheets import _DRIVE_ID_TOKEN_RE, normalize_tracks_row, resolve_tracks_headers
-from .genre import SUBGENRE_PARENT, canonical_genre, canonical_subgenre
-from .matcher import extract_version_tokens, norm, parse_artists, versions_compatible
+from .genre import (
+    SUBGENRE_PARENT,
+    canonical_genre,
+    canonical_subgenre,
+    is_genre_placeholder,
+    is_subgenre_placeholder,
+    is_umbrella_club_genre,
+)
+from .matcher import (
+    extract_version_tokens,
+    format_display_bpm,
+    is_valid_bpm,
+    norm,
+    normalize_key_to_camelot,
+    parse_artists,
+    versions_compatible,
+)
 from .organizer import _vault_parent_folder_key
 from .provider_policy import MAX_ENRICHMENT_ATTEMPTS, _families, provider_report
-from .rules import COL, build_track_proposal, candidate_field_values, field_decision, parse_lock_states
+from .rules import (
+    COL,
+    build_track_proposal,
+    candidate_field_values,
+    field_decision,
+    inspect_sheet_row_semantics,
+    parse_lock_states,
+)
 
 FIELDS = ("artist", "title", "edition", "duration", "bpm", "key", "genre", "subgenre", "label", "isrc")
 ATTRIBUTED = ("identity", "bpm", "key", "genre", "subgenre")
@@ -31,7 +53,19 @@ def _edition(title):
     if not title:
         return ""
     _, tokens, remixer = extract_version_tokens(title)
-    return " / ".join([*sorted(tokens), *([remixer] if remixer else [])]) or "original"
+    if remixer or "remix" in tokens:
+        return f"remix ({remixer})" if remixer else "remix"
+    named_edits = sorted(t.split(":", 1)[1] for t in tokens if t.startswith("edit:"))
+    if named_edits:
+        return f"edit ({' / '.join(named_edits)})"
+    if "radioedit" in tokens:
+        return "edit"
+    if "extendedmix" in tokens:
+        return "extended"
+    if "originalmix" in tokens:
+        return "original"
+    other = sorted(tokens - {"originalmix"})
+    return " / ".join(other) or "original"
 
 
 def _candidate_values(candidate, field):
@@ -109,11 +143,12 @@ def decisions(track, candidates, manual):
         "title": meta.title,
         "edition": _edition(meta.title),
         "duration": meta.duration,
-        "bpm": meta.embedded_bpm,
-        "key": meta.embedded_key,
+        "bpm": format_display_bpm(meta.embedded_bpm) if meta.embedded_bpm else "",
+        "key": normalize_key_to_camelot(meta.embedded_key) if meta.embedded_key else "",
         "genre": meta.embedded_genre,
         "isrc": meta.isrc,
     }
+    parent_g = canonical_genre(str(proposal.get("genre", "")))
     results = {}
     for field in FIELDS:
         hits = {}
@@ -126,35 +161,23 @@ def decisions(track, candidates, manual):
         if hits or local.get(field):
             state, reason = "candidate_only", "Evidence requires verification"
         if field in COL:
-            value = proposal[field]
+            raw_prop_val = proposal[field]
+            value = format_display_bpm(raw_prop_val) if field == "bpm" else str(raw_prop_val or "")
             confidence, reason = field_decision(candidates, field, proposal)
-            if value == "CONFLICT" or "disagreement" in reason or "contradictory" in reason:
+            if raw_prop_val == "CONFLICT" or "disagreement" in reason or "contradictory" in reason or "conflicting" in reason and raw_prop_val not in ("", None):
                 state = "conflicting"
+                value = ""
             elif confidence == "HIGH" and value:
                 state = "verified"
-                sources = sorted({item[1] for item in candidate_field_values(candidates, field)})
-            elif field == "subgenre":
-                corroborated = {}
-                for item in verified:
-                    for style in _candidate_values(item, field):
-                        if SUBGENRE_PARENT.get(style) == proposal["genre"] and proposal["genre"]:
-                            corroborated.setdefault(style, set()).add(_family(item))
-                if len(corroborated) > 1:
-                    state, reason = "conflicting", "Recording-level styles disagree"
-                elif corroborated:
-                    value, families = next(iter(corroborated.items()))
-                    if len(families) >= 2:
-                        state, confidence, sources, reason = (
-                            "verified",
-                            "HIGH",
-                            sorted(families),
-                            "Independent recording-level styles agree",
-                        )
+                sources = sorted({
+                    item[1]
+                    for item in candidate_field_values(
+                        candidates, field, parent_genre=parent_g if field == "subgenre" else ""
+                    )
+                })
         else:
             matched = _group_recording_values(verified, field)
             embedded = local.get(field) and meta.identity_origin == "embedded"
-            # Note: Multiple release labels across territories/imprints are normal catalogue data,
-            # whereas contradictory recording editions or conflicting ISRCs without local ISRC require review.
             if len(matched) > 1 and field == "edition":
                 state, reason = "conflicting", "Recording-level values disagree"
             elif len(matched) > 1 and field == "isrc" and not embedded:
@@ -188,14 +211,19 @@ def decisions(track, candidates, manual):
                     )
         disputed = state == "conflicting"
         if field in manual and manual[field][0] and manual[field][1] in MANUAL_STATES:
-            value, lock = manual[field]
-            state, confidence, sources, reason = (
+            m_val, lock = manual[field]
+            if field == "bpm" and is_valid_bpm(m_val):
+                m_val = format_display_bpm(m_val)
+            elif field == "key":
+                m_val = normalize_key_to_camelot(m_val) or m_val
+            state, value, confidence, sources, reason = (
                 "verified" if lock in {"VERIFIED", "HIGH_LOCKED"} else "accepted",
+                m_val,
                 "HIGH",
                 ["manual"],
                 "Preserved accepted value",
             )
-        results[field] = {
+        entry_out = {
             "state": state,
             "value": str(value or ""),
             "confidence": confidence,
@@ -204,6 +232,10 @@ def decisions(track, candidates, manual):
             "candidates": evidence,
             "conflict": disputed,
         }
+        if field == "bpm":
+            entry_out["raw_measurements"] = proposal.get("bpm_raw_measurements", [])
+            entry_out["octave_adjusted"] = bool(proposal.get("bpm_octave_adjusted", False))
+        results[field] = entry_out
     return results, proposal.get("tempo_hint", "")
 
 
@@ -315,12 +347,21 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
         ).fetchall()
     )
     old = json.loads(sheet_rows[0][1]) if len(sheet_rows) == 1 else []
-    locks, lock_error = parse_lock_states(old)
+    locks, lock_error = parse_lock_states(old) if old else ({}, None)
+    sem = inspect_sheet_row_semantics(old) if old else {"field_locks": {}, "field_holds": {}, "row_flags": []}
     for field, col in COL.items():
         lock = locks.get(field, {}).get("state")
-        if old and lock in MANUAL_STATES:
-            manual.setdefault(field, (old[col], lock))
+        if old and lock in MANUAL_STATES and old[col].strip():
+            manual.setdefault(field, (old[col].strip(), lock))
+
     field_data, tempo_hint = decisions(track, candidates, manual)
+    parent_g = canonical_genre(field_data["genre"]["value"])
+    double_check_flags = list(sem["row_flags"])
+    if tempo_hint:
+        double_check_flags.append(f"tempo_hint:{tempo_hint}")
+    if field_data["bpm"].get("octave_adjusted"):
+        double_check_flags.append("bpm_octave_adjusted_2x")
+
     try:
         audit = json.loads(track.provider_calls_json)
         audit_meta = audit.get("_meta", {})
@@ -351,35 +392,153 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
         and not track.content_stale
     )
     no_match = research_complete and track.research_status == "no_match"
+
+    sheet_unmapped_or_ambiguous = bool("schema_error" in sheet_info or len(sheet_rows) != 1)
+    if lock_error:
+        double_check_flags.append(f"lock_error:{lock_error}")
+
     for field, detail in field_data.items():
-        detail["old"] = old[COL[field]] if old and field in COL else ""
-        if detail["old"]:
-            detail["proposed"] = detail["old"]
+        old_val = old[COL[field]].strip() if old and field in COL else ""
+        detail["old"] = old_val
+        lock_state = locks.get(field, {}).get("state", "") if field in COL else ""
+        is_locked = lock_state in MANUAL_STATES
+        is_review_hold = lock_state == "REVIEW_HOLD"
+        is_placeholder = (
+            (field == "genre" and is_genre_placeholder(old_val))
+            or (field == "subgenre" and is_subgenre_placeholder(old_val))
+        )
+        is_umbrella_upgrade = (
+            field == "genre"
+            and is_umbrella_club_genre(old_val)
+            and "sheet_status_review_hold" not in sem["row_flags"]
+            and detail["value"] == "Hardstyle"
+            and detail["confidence"] in {"HIGH", "MEDIUM"}
+            and not detail["conflict"]
+            and not is_locked
+            and not is_review_hold
+        )
+
+        if lock_error:
+            detail["proposed"] = old_val
+            detail["would_propose"] = ""
+            detail["proposal_action"] = "lock_error_hold"
             detail["terms_hold"] = False
-        elif detail["state"] in {"accepted", "verified"}:
+        elif field in COL and sheet_unmapped_or_ambiguous:
+            detail["proposed"] = old_val
+            detail["would_propose"] = (
+                detail["value"]
+                if (detail["value"] and not detail["conflict"] and detail["confidence"] in {"HIGH", "MEDIUM"})
+                else ""
+            )
+            detail["proposal_action"] = "sheet_mapping_hold"
+            detail["terms_hold"] = False
+        elif is_locked:
+            detail["proposed"] = old_val
+            detail["would_propose"] = old_val
+            detail["proposal_action"] = "locked_preserved"
+            detail["terms_hold"] = False
+        elif is_review_hold:
+            hold_reason = locks[field].get("reason", "human review hold")
+            detail["state"] = "conflicting" if "conflict" in hold_reason.lower() else "candidate_only"
+            detail["confidence"] = "LOW"
+            detail["provenance"] = []
+            detail["reason"] = hold_reason
+            detail["conflict"] = detail["state"] == "conflicting"
+            detail["proposed"] = old_val
+            detail["would_propose"] = ""
+            detail["proposal_action"] = "human_review_hold"
+            detail["terms_hold"] = False
+        elif (
+            field == "bpm"
+            and detail.get("octave_adjusted")
+            and old
+            and canonical_subgenre(old[COL["subgenre"]]) == "Slowtempo"
+        ):
+            detail["proposed"] = old_val
+            detail["would_propose"] = ""
+            detail["proposal_action"] = "slowtempo_octave_blocked"
+            detail["terms_hold"] = False
+            double_check_flags.append("slowtempo_octave_blocked")
+        elif old_val and not is_placeholder and not is_umbrella_upgrade:
+            detail["proposed"] = old_val
+            detail["would_propose"] = old_val
+            detail["terms_hold"] = False
+            # Flag discrepancy if HIGH/MEDIUM catalogue disagrees with unlocked concrete Sheet value
+            contradicts = False
+            if field in COL and detail["confidence"] in {"HIGH", "MEDIUM"} and detail["value"] and not detail["conflict"]:
+                if field == "genre":
+                    ex_cg = canonical_genre(old_val)
+                    contradicts = bool(
+                        (ex_cg and ex_cg != canonical_genre(detail["value"]))
+                        or (is_umbrella_club_genre(old_val) and canonical_genre(detail["value"]) == "Hardstyle")
+                    )
+                elif field == "bpm" and is_valid_bpm(old_val):
+                    contradicts = abs(int(round(float(old_val))) - int(round(float(detail["value"])))) >= 2
+                elif field == "key":
+                    ex_k = normalize_key_to_camelot(old_val)
+                    contradicts = bool(ex_k and ex_k != normalize_key_to_camelot(detail["value"]))
+            if contradicts:
+                detail["proposal_action"] = "preserved_existing_conflict_flagged"
+                double_check_flags.append(f"{field}_existing_vs_catalogue_discrepancy")
+            else:
+                detail["proposal_action"] = "existing_preserved"
+        elif (
+            detail["value"]
+            and not detail["conflict"]
+            and (detail["state"] in {"accepted", "verified"} or (field in COL and detail["confidence"] in {"HIGH", "MEDIUM"}))
+        ):
+            cand_fams = set(detail["provenance"]) or {
+                x[1]
+                for x in candidate_field_values(
+                    candidates, field, parent_genre=parent_g if field == "subgenre" else ""
+                )
+            }
             restricted_prov = bool(
                 field in COL
                 and not terms
-                and detail["provenance"]
-                and not (set(detail["provenance"]) <= OPEN_PROVENANCE)
+                and cand_fams
+                and not (cand_fams <= OPEN_PROVENANCE)
             )
+            detail["would_propose"] = detail["value"]
+            if is_umbrella_upgrade:
+                double_check_flags.append(f"umbrella_dance_club_to_hardstyle_{detail['confidence'].lower()}")
+            elif detail["confidence"] == "MEDIUM" and field in COL:
+                double_check_flags.append(f"{field}_medium_provisional")
             if restricted_prov:
-                detail["proposed"] = ""
+                # Preserve existing placeholder text (or '' if blank) while holding live Sheet cell under TERMS_HOLD
+                detail["proposed"] = old_val
+                detail["proposal_action"] = "terms_hold_upgrade" if (is_placeholder or is_umbrella_upgrade) else "terms_hold"
                 detail["terms_hold"] = True
             else:
                 detail["proposed"] = detail["value"]
+                detail["proposal_action"] = (
+                    "umbrella_upgrade" if is_umbrella_upgrade
+                    else "placeholder_upgrade" if is_placeholder
+                    else "fill_blank"
+                )
                 detail["terms_hold"] = False
         else:
-            detail["proposed"] = ""
+            # Preserve existing cell value when evidence is LOW, MISSING, or CONFLICT!
+            detail["proposed"] = old_val
+            detail["would_propose"] = ""
+            detail["proposal_action"] = "conflict_hold" if detail["conflict"] else "insufficient_evidence_preserved"
             detail["terms_hold"] = False
 
     metadata_complete = all(value["state"] in {"accepted", "verified"} for value in field_data.values())
     identity_ready = all(field_data[f]["state"] in {"accepted", "verified"} for f in ("artist", "title"))
-    conflict = any(value["conflict"] for value in field_data.values()) or bool(tempo_hint)
+    conflict = any(value["conflict"] for value in field_data.values())
+    any_field_review_hold = any(locks.get(f, {}).get("state") == "REVIEW_HOLD" for f in COL)
+    human_routing_hold = any(
+        fl in sem["row_flags"]
+        for fl in ("potential_duplicate_hold", "keep_in_source_hold", "human_genre_conflict_hold", "sheet_status_review_hold")
+    )
     review = bool(
         track.quarantined
         or lock_error
         or conflict
+        or any_field_review_hold
+        or human_routing_hold
+        or bool(tempo_hint)
         or exhausted_enrichment
         or (research_complete and track.research_status == "partial")
     )
@@ -419,7 +578,11 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
     elif len(sheet_rows) != 1 or lock_error:
         route = "sheet_mapping_hold"
     elif (
-        review
+        track.quarantined
+        or conflict
+        or human_routing_hold
+        or exhausted_enrichment
+        or (research_complete and track.research_status == "partial")
         or no_match
         or pending
         or not research_complete
@@ -462,6 +625,7 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
         "states": states,
         "fields": field_data,
         "tempo_hint": tempo_hint,
+        "double_check_flags": list(dict.fromkeys(double_check_flags)),
         "routing": route,
         "destination": canon_g if route == "preview_ready" else "",
         "move_authorized": False,
@@ -503,6 +667,7 @@ def library_report(conn, db, config, args, sheets, drive):
         "states",
         "fields",
         "tempo_hint",
+        "double_check_flags",
         "routing",
         "destination",
         "move_authorized",
@@ -573,6 +738,8 @@ def library_report(conn, db, config, args, sheets, drive):
                         field_counts[scope][field][item["state"]] += 1
                         if item.get("terms_hold"):
                             field_counts[scope][field]["terms_hold"] += 1
+                        if item.get("proposal_action"):
+                            field_counts[scope][field][f"action:{item['proposal_action']}"] += 1
                         if item["conflict"] and item["state"] != "conflicting":
                             field_counts[scope][field]["conflict_with_preserved_value"] += 1
                 if args.file_id and row["file_id"] not in args.file_id:
@@ -581,7 +748,7 @@ def library_report(conn, db, config, args, sheets, drive):
                     csv_writer.writerow(
                         {
                             key: sanitize_csv_cell(
-                                json.dumps(value) if isinstance(value, dict) else value,
+                                json.dumps(value) if isinstance(value, (dict, list)) else value,
                                 secrets,
                             )
                             for key, value in detail.items()
