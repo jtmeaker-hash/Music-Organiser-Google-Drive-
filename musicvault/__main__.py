@@ -141,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ar_p.add_argument("--learn", action="store_true", help="Scan verified corrections to generate pending_approval rule suggestions")
     ar_p.add_argument("--approve", type=str, default="", help="Explicitly approve a pending suggestion ID")
+    ar_p.add_argument("--sheet-snapshot", type=str, default="", help="Optional read-only Tracks JSON snapshot for offline learning")
     ar_p.add_argument("--export-sheet-csv", type=str, default="", help="Export 18-column Artist_Rules Google Sheets tab CSV")
     ar_p.add_argument("--export-json", type=str, default="", help="Export rules, suggestions, and audit log to UTF-8 JSON")
 
@@ -328,6 +329,7 @@ def dispatch(args: argparse.Namespace, config: Config, db: Database) -> int:
                 db,
                 learn=args.learn,
                 approve_id=args.approve,
+                sheet_snapshot=Path(args.sheet_snapshot) if args.sheet_snapshot else None,
                 export_sheet_csv=Path(args.export_sheet_csv) if args.export_sheet_csv else None,
                 export_json=Path(args.export_json) if args.export_json else None,
             )

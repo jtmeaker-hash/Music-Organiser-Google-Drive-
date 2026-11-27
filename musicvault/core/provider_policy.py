@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from ..db import _utc_iso
 from ..providers.base import canonical_provider_family
+from .artist_rules import load_artist_rules
 from .genre import SUBGENRE_PARENT, canonical_subgenre
 from .rules import build_track_proposal, field_decision
 
@@ -81,12 +82,20 @@ class ProviderPolicy:
                 raise ValueError("Breaker counts and cooldowns are out of bounds.")
         if self.breaker.get("cooldown", 300) > self.breaker.get("max_cooldown", 3600):
             raise ValueError("Breaker cooldown exceeds its maximum.")
+        self.config = config
         self.db = None
         self.provider = ""
         self.providers = {}
+        self.artist_rules = None
+
+    def _get_artist_rules(self):
+        if self.artist_rules is None:
+            self.artist_rules = load_artist_rules(db=self.db, config=self.config)
+        return self.artist_rules
 
     def bind(self, db, providers, provider=""):
         self.db = db
+        self.artist_rules = load_artist_rules(db=db, config=self.config)
         self.provider = canonical_provider_family(provider.strip()) if provider else ""
         if self.provider and self.provider not in CAPABILITIES:
             raise ValueError("Unknown provider for selective resumption.")
@@ -160,7 +169,12 @@ class ProviderPolicy:
             }
 
     def needed_fields(self, track, candidates):
-        proposed = build_track_proposal(track.metadata, candidates)
+        proposed = build_track_proposal(
+            track.metadata,
+            candidates,
+            artist_rules=self._get_artist_rules(),
+            file_id=track.file_id,
+        )
         missing = {
             field
             for field in ("bpm", "key", "genre", "subgenre")
@@ -208,7 +222,12 @@ class ProviderPolicy:
         - Fields already in cross-provider conflict cannot be promoted by fallback and are skipped.
         - Missing optional `subgenre` or `label` alone never trigger fallback calls.
         """
-        proposed = build_track_proposal(track.metadata, candidates)
+        proposed = build_track_proposal(
+            track.metadata,
+            candidates,
+            artist_rules=self._get_artist_rules(),
+            file_id=track.file_id,
+        )
         missing = set()
         verified = [
             c
@@ -290,7 +309,16 @@ class ProviderPolicy:
         if not self.permits(family):
             return "disabled_by_policy"
         if family == "hdrr" and candidates:
-            prop = build_track_proposal(track.metadata, list(candidates)) if track is not None else {}
+            prop = (
+                build_track_proposal(
+                    track.metadata,
+                    list(candidates),
+                    artist_rules=self._get_artist_rules(),
+                    file_id=track.file_id,
+                )
+                if track is not None
+                else {}
+            )
             if prop.get("genre") in NON_HARD_DANCE_PARENTS and field_decision(list(candidates), "genre", prop)[0] == "HIGH":
                 return "sufficient_evidence"
         if self.is_fallback_only(family):

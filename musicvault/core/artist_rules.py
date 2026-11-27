@@ -34,7 +34,7 @@ from .genre import (
     is_genre_placeholder,
     is_subgenre_placeholder,
 )
-from .matcher import extract_version_tokens, norm, parse_artists
+from .matcher import extract_version_tokens, norm, parse_artists, parse_filename_identity
 
 ARTIST_RULES_TAB_NAME = "Artist_Rules"
 
@@ -448,27 +448,35 @@ def parse_artist_rules_sheet(
     return rules_out, warnings
 
 
+def _safe_sheet_text(value: Any) -> str:
+    """Prevent spreadsheet formula injection on untrusted text cells."""
+    s = str(value or "")
+    if s and s[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
+
+
 def artist_rule_to_sheet_row(rule: ArtistRule) -> List[str]:
     """Serialize an `ArtistRule` to the 18-column `Artist_Rules` Google Sheets layout."""
     return [
-        rule.rule_id,
-        rule.artist_name,
+        _safe_sheet_text(rule.rule_id),
+        _safe_sheet_text(rule.artist_name),
         "TRUE" if rule.enabled else "FALSE",
         rule.approval_status,
         rule.verification_status,
-        "; ".join(rule.preferred),
-        "; ".join(rule.discouraged),
-        "; ".join(rule.blocked),
-        rule.explicit_override_genre,
-        rule.explicit_override_subgenre,
-        format_track_exceptions(rule.track_exceptions),
+        _safe_sheet_text("; ".join(rule.preferred)),
+        _safe_sheet_text("; ".join(rule.discouraged)),
+        _safe_sheet_text("; ".join(rule.blocked)),
+        _safe_sheet_text(rule.explicit_override_genre),
+        _safe_sheet_text(rule.explicit_override_subgenre),
+        _safe_sheet_text(format_track_exceptions(rule.track_exceptions)),
         format_year_range(rule.year_min, rule.year_max),
         rule.collab_policy,
         rule.remix_priority,
         str(rule.confidence_boost),
         str(rule.confidence_penalty),
-        rule.notes,
-        rule.audit_summary or f"updated:{rule.updated_utc or _utc_iso()} ({rule.source_origin})",
+        _safe_sheet_text(rule.notes),
+        _safe_sheet_text(rule.audit_summary or f"updated:{rule.updated_utc or _utc_iso()} ({rule.source_origin})"),
     ]
 
 
@@ -817,13 +825,19 @@ def evaluate_artist_rules(
         if exc is not None:
             exception_info = {"rule_id": r.rule_id, "artist": r.artist_name, **exc}
             allowed_tok = exc.get("allowed", "*")
-            if allowed_tok != "*":
-                p_exc, s_exc = normalize_classification_token(allowed_tok)
-                if p_exc and not override_g:
-                    override_g = p_exc
-                if s_exc and not override_s:
-                    override_s = s_exc
-            continue
+            if allowed_tok == "*":
+                continue
+            p_exc, s_exc = normalize_classification_token(allowed_tok)
+            if p_exc and not override_g:
+                override_g = p_exc
+            if s_exc and not override_s:
+                override_s = s_exc
+            prop_matches_exc = (
+                (not proposed_genre or not p_exc or canonical_genre(proposed_genre) == p_exc)
+                and (not proposed_subgenre or not s_exc or canonical_subgenre(proposed_subgenre) == s_exc)
+            )
+            if prop_matches_exc:
+                continue
 
         for pref in r.preferred:
             if pref not in investigation_cues:
@@ -856,13 +870,15 @@ def evaluate_artist_rules(
                 conflict_reasons.append(
                     f"Artist rule {r.rule_id} ({r.artist_name}): discouraged classification {', '.join(d_hits)}"
                 )
-            elif p_hits and r.confidence_boost > 0:
+            elif p_hits and r.confidence_boost > 0 and r.verification_status == "user_verified":
                 net_delta += r.confidence_boost
 
         # 2. Check HDRR candidate classifications against blocked / discouraged (e.g. Famous — Peygan & Firelite!)
         for hg, hs, h_raw in hdrr_pairs:
             hb = _classification_matches_list(hg, hs, r.blocked)
             hd = _classification_matches_list(hg, hs, r.discouraged)
+            if is_collab and r.collab_policy == "defer_to_collaborator":
+                hd = []
             if hb or hd:
                 hdrr_rule_conflict = True
                 kind_lbl = "blocked" if hb else "discouraged"
@@ -884,6 +900,20 @@ def evaluate_artist_rules(
                 override_g = r.explicit_override_genre
             if r.explicit_override_subgenre and not override_s:
                 override_s = r.explicit_override_subgenre
+
+    # 4. Enforce `hold_on_conflict` when >=2 collaborators' active rules clash on preferred vs discouraged/blocked
+    if is_collab and len(filtered_applicable) >= 2 and any(r.collab_policy == "hold_on_conflict" for r, _ in filtered_applicable):
+        all_prefs = {p for r, _ in filtered_applicable for p in r.preferred}
+        all_neg = {n for r, _ in filtered_applicable for n in (list(r.discouraged) + list(r.blocked))}
+        ov_subs = {r.explicit_override_subgenre for r, _ in filtered_applicable if r.explicit_override_subgenre}
+        if (all_prefs & all_neg) or len(ov_subs) > 1:
+            discouraged_conflict = True
+            subgenre_discouraged_conflict = True
+            net_delta = min(net_delta, -2)
+            override_s = ""
+            msg = "Collaborator Artist_Rules conflict under hold_on_conflict policy; review required"
+            if msg not in conflict_reasons:
+                conflict_reasons.append(msg)
 
     return {
         "matched_rules": [r.rule_id for r, _ in filtered_applicable],
@@ -969,9 +999,11 @@ def learn_artist_rule_suggestions(
 
     for fid, (ver_g, ver_s, disp_name) in verified_by_fid.items():
         tr = db.get_track(fid)
-        if not tr:
-            continue
-        raw_artist = tr.metadata.artist.strip()
+        raw_artist = tr.metadata.artist.strip() if tr else ""
+        if not raw_artist:
+            parsed_fn = parse_filename_identity(tr.name if tr else disp_name)
+            if parsed_fn.artist and not parsed_fn.alt_artist:
+                raw_artist = parsed_fn.artist.strip()
         if not raw_artist:
             continue
         artists = parse_artists(raw_artist)
@@ -980,7 +1012,7 @@ def learn_artist_rule_suggestions(
             continue
         a_norm = artists[0]
         artist_display.setdefault(a_norm, raw_artist)
-        cands = [c for c in db.get_candidates(fid) if not c.is_stale]
+        cands = [c for c in db.get_candidates(fid) if not c.is_stale] if tr else []
 
         cand_subs: Set[str] = set()
         for c in cands:
@@ -1071,7 +1103,11 @@ def learn_artist_rule_suggestions(
 
 
 def approve_artist_rule_suggestion(db: Any, suggestion_id: str, actor: str = "user") -> Optional[ArtistRule]:
-    """Explicitly approve a `pending_approval` suggestion, promoting it to an active `ArtistRule` with audit trail."""
+    """
+    Explicitly approve a `pending_approval` suggestion, promoting it to an active `ArtistRule` with audit trail.
+    If an existing rule for the same `norm_artist` already exists, merges new `preferred`/`discouraged`/`blocked`
+    classifications without clobbering existing `track_exceptions`, year ranges, policies, or overrides.
+    """
     now_iso = _utc_iso()
     with closing(db._get_connection()) as conn:
         row = conn.execute(
@@ -1081,18 +1117,62 @@ def approve_artist_rule_suggestion(db: Any, suggestion_id: str, actor: str = "us
     if not row:
         return None
     raw_rule = json.loads(row["suggested_rule_json"])
-    approved_rule = ArtistRule(
-        rule_id=str(raw_rule.get("rule_id") or f"AR-{row['norm_artist'][:10].upper()}-001"),
-        artist_name=row["artist_name"],
-        enabled=True,
-        approval_status="approved",
-        verification_status="user_verified",
-        preferred=list(raw_rule.get("preferred") or []),
-        discouraged=list(raw_rule.get("discouraged") or []),
-        blocked=list(raw_rule.get("blocked") or []),
-        notes=str(raw_rule.get("notes") or ""),
-        source_origin="approved_suggestion",
+    existing_for_artist = next(
+        (r for r in load_artist_rules(db=db, active_only=False) if r.norm_artist == row["norm_artist"]),
+        None,
     )
+    new_pref = list(raw_rule.get("preferred") or [])
+    new_disc = list(raw_rule.get("discouraged") or [])
+    new_blk = list(raw_rule.get("blocked") or [])
+    sug_note = str(raw_rule.get("notes") or "")
+
+    if existing_for_artist is not None:
+        merged_disc = list(dict.fromkeys(list(existing_for_artist.discouraged) + new_disc))
+        merged_blk = list(dict.fromkeys(list(existing_for_artist.blocked) + new_blk))
+        merged_pref = [
+            p for p in dict.fromkeys(list(existing_for_artist.preferred) + new_pref)
+            if p not in merged_disc and p not in merged_blk
+        ]
+        combined_notes = (
+            f"{existing_for_artist.notes}; {sug_note}".strip("; ")
+            if existing_for_artist.notes and sug_note and sug_note not in existing_for_artist.notes
+            else (existing_for_artist.notes or sug_note)
+        )
+        approved_rule = ArtistRule(
+            rule_id=existing_for_artist.rule_id,
+            artist_name=existing_for_artist.artist_name,
+            enabled=True,
+            approval_status="approved",
+            verification_status="user_verified",
+            preferred=merged_pref,
+            discouraged=merged_disc,
+            blocked=merged_blk,
+            explicit_override_genre=existing_for_artist.explicit_override_genre,
+            explicit_override_subgenre=existing_for_artist.explicit_override_subgenre,
+            track_exceptions=list(existing_for_artist.track_exceptions),
+            year_min=existing_for_artist.year_min,
+            year_max=existing_for_artist.year_max,
+            collab_policy=existing_for_artist.collab_policy,
+            remix_priority=existing_for_artist.remix_priority,
+            confidence_boost=existing_for_artist.confidence_boost,
+            confidence_penalty=existing_for_artist.confidence_penalty,
+            notes=combined_notes,
+            source_origin="approved_suggestion",
+            created_utc=existing_for_artist.created_utc,
+        )
+    else:
+        approved_rule = ArtistRule(
+            rule_id=str(raw_rule.get("rule_id") or f"AR-{row['norm_artist'][:10].upper()}-001"),
+            artist_name=row["artist_name"],
+            enabled=True,
+            approval_status="approved",
+            verification_status="user_verified",
+            preferred=new_pref,
+            discouraged=new_disc,
+            blocked=new_blk,
+            notes=sug_note,
+            source_origin="approved_suggestion",
+        )
     upsert_artist_rule(db, approved_rule, actor=actor, notes=f"Approved suggestion {suggestion_id}")
     with closing(db._get_connection()) as conn, conn:
         conn.execute(
@@ -1110,9 +1190,19 @@ def flag_existing_rows_against_approved_rules(
     """
     Scan existing `Tracks` rows against active approved `ArtistRule`s and flag unlocked rows whose
     current genre/subgenre conflicts with an approved rule (`discouraged` or `blocked`) for review,
-    WITHOUT overwriting any existing metadata!
+    WITHOUT overwriting any existing metadata or flagging manually locked (`USER_LOCKED`/`HIGH_LOCKED`/`MOVED`/`ANALYSED`) rows!
     """
+    from .rules import _IMMUTABLE_STATES, parse_lock_states
+
     active_rules = list(rules) if rules is not None else load_artist_rules(db=db, active_only=True)
+    manual_db_locks: Dict[str, Set[str]] = defaultdict(set)
+    if db is not None:
+        with closing(db._get_connection()) as conn:
+            for m_fid, m_field in conn.execute(
+                "SELECT file_id, field_name FROM field_decisions WHERE value != '' AND state IN ('USER_LOCKED', 'HIGH_LOCKED', 'ACCEPTED', 'VERIFIED')"
+            ):
+                manual_db_locks[m_fid].add(m_field)
+
     flagged: List[Dict[str, Any]] = []
     for row_num, canon_r in sheet_rows:
         fid = canon_r[14].strip() if len(canon_r) > 14 else ""
@@ -1120,18 +1210,47 @@ def flag_existing_rows_against_approved_rules(
         ex_s = canon_r[3].strip() if len(canon_r) > 3 else ""
         if not fid or (is_genre_placeholder(ex_g) and is_subgenre_placeholder(ex_s)):
             continue
+
+        states, lock_err = parse_lock_states(canon_r)
+        if lock_err is not None:
+            continue
+        g_locked = (
+            states.get("genre", {}).get("state") in _IMMUTABLE_STATES
+            or "genre" in manual_db_locks.get(fid, set())
+        )
+        s_locked = (
+            states.get("subgenre", {}).get("state") in _IMMUTABLE_STATES
+            or "subgenre" in manual_db_locks.get(fid, set())
+        )
+        eval_g = "" if (g_locked or is_genre_placeholder(ex_g)) else ex_g
+        eval_s = "" if (s_locked or is_subgenre_placeholder(ex_s)) else ex_s
+        if not eval_g and not eval_s:
+            continue
+
         tr = db.get_track(fid) if db is not None else None
-        meta = tr.metadata if tr else TrackMetadata(artist=canon_r[1] if len(canon_r) > 1 else "", title=canon_r[0] if canon_r else "")
+        if tr and tr.metadata.artist.strip():
+            meta = tr.metadata
+        else:
+            raw_fn = tr.name if tr else (canon_r[0] if canon_r else "")
+            parsed_fn = parse_filename_identity(raw_fn)
+            meta = TrackMetadata(
+                artist=parsed_fn.artist,
+                title=parsed_fn.title or parsed_fn.title_hint or raw_fn,
+            )
         cands = db.get_candidates(fid) if (db is not None and tr) else []
         ev = evaluate_artist_rules(
             meta=meta,
             candidates=cands,
             rules=active_rules,
-            proposed_genre=ex_g,
-            proposed_subgenre="" if is_subgenre_placeholder(ex_s) else ex_s,
+            proposed_genre=eval_g,
+            proposed_subgenre=eval_s,
             file_id=fid,
         )
-        if ev["blocked_conflict"] or ev["discouraged_conflict"]:
+        has_unlocked_conflict = (
+            (bool(eval_g) and (ev["genre_blocked_conflict"] or ev["genre_discouraged_conflict"]))
+            or (bool(eval_s) and (ev["subgenre_blocked_conflict"] or ev["subgenre_discouraged_conflict"]))
+        )
+        if has_unlocked_conflict:
             flagged.append({
                 "row_num": row_num,
                 "file_id": fid,

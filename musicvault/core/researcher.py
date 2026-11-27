@@ -476,7 +476,7 @@ def execute_research_batch(
                 def verify(candidates):
                     verified = []
                     for candidate in candidates:
-                        candidate.verification = verify_recording_candidate(
+                        v_state = verify_recording_candidate(
                             query_artist=artist, query_title=title,
                             identity_confidence=t.metadata.identity_confidence or "verified_embedded",
                             local_isrc=t.metadata.isrc, local_duration=t.metadata.duration,
@@ -484,8 +484,29 @@ def execute_research_batch(
                             candidate_isrc=candidate.isrc, candidate_duration=candidate.duration,
                             alt_artist=alt_artist, alt_title=alt_title,
                         )
+                        if (
+                            v_state == "Identity mismatch"
+                            and getattr(candidate, "match_confidence", "") == "fuzzy_conservative"
+                            and (t.metadata.identity_confidence or "verified_embedded") != "title_only"
+                        ):
+                            # Preserve pre-validated conservative fuzzy matches (e.g. HDRR festival-anthem subtitle
+                            # or >=0.92 base-title similarity) as review/text-level evidence unless ISRC/duration conflicts
+                            from .matcher import verify_candidate
+                            vc = verify_candidate(
+                                candidate_isrc=candidate.isrc,
+                                candidate_duration=candidate.duration,
+                                local_isrc=t.metadata.isrc,
+                                local_duration=t.metadata.duration,
+                            )
+                            if vc in ("ISRC conflict", "Duration conflict"):
+                                v_state = vc
+                            elif vc == "ISRC supported":
+                                v_state = "ISRC supported"
+                            else:
+                                v_state = "Text only"
+                        candidate.verification = v_state
                         candidate.content_version = ver
-                        if candidate.verification not in ("Identity mismatch", "Version conflict"):
+                        if candidate.verification not in ("Identity mismatch", "Version conflict", "ISRC conflict", "Duration conflict"):
                             verified.append(candidate)
                     return verified
 
@@ -1038,6 +1059,7 @@ def execute_research_batch(
         ("AudioMeta", am),
         ("Discogs", dc),
         ("MusicBrainz", mb),
+        ("HDRR", hdrr),
         ("Wikidata", wiki),
     ]:
         if p_obj is not None and hasattr(p_obj, "stats"):

@@ -10,7 +10,7 @@ from tempfile import NamedTemporaryFile
 from ..cli.formatting import _redact_json_tree, sanitize_csv_cell, short_file_id
 from ..providers.base import canonical_provider_family
 from ..services.sheets import _DRIVE_ID_TOKEN_RE, normalize_tracks_row, resolve_tracks_headers
-from .artist_rules import load_artist_rules
+from .artist_rules import DEFAULT_PEYGAN_RULE, _classification_matches_list, load_artist_rules
 from .genre import (
     SUBGENRE_PARENT,
     canonical_genre,
@@ -242,6 +242,8 @@ def decisions(track, candidates, manual, artist_rules=None):
             r_ev = proposal.get("artist_rule_eval") or {}
             if r_ev.get("matched_rules"):
                 entry_out["artist_rules_matched"] = r_ev["matched_rules"]
+            if r_ev.get("exception_applied"):
+                entry_out["artist_rule_exception"] = r_ev["exception_applied"]
             if r_ev.get("conflict_reasons"):
                 entry_out["artist_rule_conflicts"] = r_ev["conflict_reasons"]
             if field == "subgenre" and r_ev.get("investigation_cues"):
@@ -492,14 +494,47 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
                         (ex_cg and ex_cg != canonical_genre(detail["value"]))
                         or (is_umbrella_club_genre(old_val) and canonical_genre(detail["value"]) == "Hardstyle")
                     )
+                elif field == "subgenre":
+                    ex_cs = canonical_subgenre(old_val)
+                    contradicts = bool(ex_cs and canonical_subgenre(detail["value"]) and ex_cs != canonical_subgenre(detail["value"]))
                 elif field == "bpm" and is_valid_bpm(old_val):
                     contradicts = abs(int(round(float(old_val))) - int(round(float(detail["value"])))) >= 2
                 elif field == "key":
                     ex_k = normalize_key_to_camelot(old_val)
                     contradicts = bool(ex_k and ex_k != normalize_key_to_camelot(detail["value"]))
+
+            rule_conflict_existing = False
+            if (
+                not contradicts
+                and field in ("genre", "subgenre")
+                and field not in manual
+                and not detail.get("artist_rule_exception")
+            ):
+                active_r_list = list(artist_rules) if artist_rules is not None else [DEFAULT_PEYGAN_RULE]
+                matched_ids = set(detail.get("artist_rules_matched") or [])
+                if matched_ids:
+                    g_chk = old_val if field == "genre" else (old[COL["genre"]].strip() if old else "")
+                    s_chk = old_val if field == "subgenre" else ""
+                    for ar in active_r_list:
+                        if ar.rule_id not in matched_ids or not ar.is_active:
+                            continue
+                        if any(
+                            exc.get("match_type") == "file_id" and exc.get("match_value") == track.file_id
+                            for exc in (ar.track_exceptions or [])
+                        ):
+                            continue
+                        hit_blk = _classification_matches_list(g_chk if field == "genre" else "", s_chk, ar.blocked)
+                        hit_dsc = _classification_matches_list(g_chk if field == "genre" else "", s_chk, ar.discouraged)
+                        if hit_blk or hit_dsc:
+                            rule_conflict_existing = True
+                            break
+
             if contradicts:
                 detail["proposal_action"] = "preserved_existing_conflict_flagged"
                 double_check_flags.append(f"{field}_existing_vs_catalogue_discrepancy")
+            elif rule_conflict_existing:
+                detail["proposal_action"] = "preserved_existing_artist_rule_conflict"
+                double_check_flags.append(f"{field}_existing_vs_artist_rule_conflict")
             else:
                 detail["proposal_action"] = "existing_preserved"
         elif (
@@ -558,6 +593,7 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
         or conflict
         or any_field_review_hold
         or human_routing_hold
+        or any("_existing_vs_" in fl for fl in double_check_flags)
         or bool(tempo_hint)
         or exhausted_enrichment
         or (research_complete and track.research_status == "partial")

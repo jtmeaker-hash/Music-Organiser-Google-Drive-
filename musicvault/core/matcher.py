@@ -225,16 +225,20 @@ def match_track(
     if not versions_compatible(query_title, candidate_title):
         return False
 
+    q_base, _, q_rem = extract_version_tokens(query_title)
+    c_base, _, c_rem = extract_version_tokens(candidate_title)
     if norm(query_title) != norm(candidate_title):
-        q_base, _, _ = extract_version_tokens(query_title)
-        c_base, _, _ = extract_version_tokens(candidate_title)
         if not q_base or q_base != c_base:
             return False
 
     q_artists = set(parse_artists(query_artist))
+    if q_rem:
+        q_artists.add(q_rem)
     c_artists: Set[str] = set()
     for item in candidate_artists:
         c_artists.update(parse_artists(item))
+    if c_rem:
+        c_artists.add(c_rem)
 
     return bool(q_artists & c_artists)
 

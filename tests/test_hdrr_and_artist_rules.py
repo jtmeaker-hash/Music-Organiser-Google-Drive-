@@ -539,8 +539,347 @@ def test_learning_suggestions_from_manual_corrections_and_flagging_existing_rows
     # Now active! Existing unlocked conflicting row is flagged for review without destructive overwrite
     existing_indexed = [
         (40, ["RawProducer - Unchecked Old Row.flac", "Hardstyle", "Hardstyle", "Euphoric", "158", "8A", "", "", "FLAC", "25", "", "SORTED – AUDIO PENDING", "", "", "fid_existing_wrong", ""]),
+        # M-2 regression: manually locked MOVED row MUST NOT be falsely flagged!
+        (41, ["RawProducer - Verified Melodic Track.flac", "Hardstyle", "Hardstyle", "Euphoric", "155", "8A", "", "", "FLAC", "25", "", "MOVED", "", "", "fid_locked_moved", "Verified override"]),
     ]
     flagged = flag_existing_rows_against_approved_rules(db, existing_indexed)
     assert len(flagged) == 1
     assert flagged[0]["file_id"] == "fid_existing_wrong"
     assert "Euphoric" in flagged[0]["existing_subgenre"]
+
+
+def test_audit_remediations_h1_through_l3_end_to_end(tmp_path, monkeypatch):
+    """
+    Comprehensive regression coverage for independent review findings H-1..H-4, M-1..M-5, and L-1..L-3:
+    - H-1: execute_research_batch() preserves HDRR fuzzy_conservative & remixer-credited remixes
+    - H-2: HDRRProvider resolves '&'-duo names ('D-Block & S-te-Fan') without dropping unsplit duo
+    - H-3: ProviderPolicy, evaluate_live_preview(), and coverage.library_report() honor Artist_Rules & file_id
+    - H-4: execute_research_batch() records HDRR telemetry, HTTP calls, cache_hits, and cooldowns
+    - M-1: Track exception (`fid:...=Rawphoric`) overrides conflicting single-source 'Euphoric' with source='artist_rule'
+    - M-3: CLI `--learn --sheet-snapshot` works offline, and `approve_artist_rule_suggestion` merges without clobbering exceptions
+    - M-4: Anti-bot HTTP-200 HTML is never persisted in `provider_cache`
+    - M-5: `HDRRProvider(db=None)` returns matches cleanly and prolific `?q=` non-matches are negative-cached
+    - L-1: `confidence_boost`, `defer_to_collaborator` on HDRR, and `hold_on_conflict` collaborator clashes work
+    - L-2: `_assert_allowed_hdrr_url` blocks dot-segments (`/artists/../api/v1`), exact `/api`, and disallowed hosts
+    - L-3: `artist_rule_to_sheet_row` neutralizes formula prefixes and `evidence_history` retains `candidate_provenance`
+    """
+    import html
+    import json
+    from argparse import Namespace
+    from contextlib import closing
+    import requests
+    from musicvault.core.artist_rules import (
+        ArtistRule,
+        approve_artist_rule_suggestion,
+        artist_rule_to_sheet_row,
+        evaluate_artist_rules,
+        upsert_artist_rule,
+    )
+    from musicvault.core.coverage import library_report
+    from musicvault.core.organizer import evaluate_live_preview
+    from musicvault.core.provider_policy import ProviderPolicy
+    from musicvault.core.researcher import execute_research_batch
+    from musicvault.providers.hdrr import HDRRProvider, _assert_allowed_hdrr_url
+    from musicvault.services.sheets import VerifiedSheetIndex
+
+    monkeypatch.setenv("MUSICVAULT_CONFIG_DIR", str(tmp_path))
+    cfg = Config(tmp_path)
+    cfg.set("SOURCE_FOLDER_ID", "src_root_1")
+    cfg.set("VAULT_FOLDER_ID", "dst_root_1")
+    cfg.set("SHEET_ID", "sheet_1")
+    db = Database(cfg.db_path)
+
+    # --- L-2: Path normalization & host guard ---
+    for blocked_target in (
+        "/api",
+        "/share",
+        "/media/img",
+        "/artists/../api/v1/public/tracks",
+        "/artists/%2e%2e/share/card",
+        "https://evil.example/artists/peygan",
+        "http://www.hdrr.info/artists/peygan",
+    ):
+        with pytest.raises(RuntimeError):
+            _assert_allowed_hdrr_url(blocked_target)
+    assert _assert_allowed_hdrr_url("/artists/d-block-s-te-fan") == "/artists/d-block-s-te-fan"
+
+    # --- L-3: Formula sanitization in artist_rule_to_sheet_row ---
+    malicious_rule = ArtistRule(
+        rule_id="=CMD()",
+        artist_name="+EvilArtist",
+        notes="-dangerous note",
+    )
+    safe_cells = artist_rule_to_sheet_row(malicious_rule)
+    assert safe_cells[0].startswith("'=")
+    assert safe_cells[1].startswith("'+")
+    assert safe_cells[16].startswith("'-")
+
+    # --- H-2 & M-5: Ampersand duo resolution ('D-Block & S-te-Fan') + db=None support + prolific negative `?q=` cache ---
+    dbstf_props = html.escape(json.dumps({
+        "initial": [0, {
+            "items": [1, [
+                [0, {
+                    "slug": [0, "angels-demons"],
+                    "name": [0, "Angels & Demons (Official Intents 2026 Anthem)"],
+                    "artists": [1, [[0, {"name": [0, "D-Block & S-te-Fan"], "slug": [0, "d-block-s-te-fan"]}]]],
+                    "releaseDate": [0, "2026-02-01"],
+                    "popularity": [0, 62],
+                    "genre": [0, {"slug": [0, "euphoric-hardstyle"], "label": [0, "Euphoric Hardstyle"]}],
+                }],
+                [0, {
+                    "slug": [0, "in-too-deep-firelite-remix"],
+                    "name": [0, "In Too Deep (Firelite Remix)"],
+                    "artists": [1, [[0, {"name": [0, "Toneshifterz"], "slug": [0, "toneshifterz"]}]]],
+                    "releaseDate": [0, "2025-11-10"],
+                    "popularity": [0, 50],
+                    "genre": [0, {"slug": [0, "euphoric-hardstyle"], "label": [0, "Euphoric Hardstyle"]}],
+                }],
+            ]],
+            "total": [0, 45],  # Prolific (>20) to exercise `?q=` negative caching!
+            "page": [0, 1],
+            "pageSize": [0, 20],
+        }],
+    }), quote=True)
+    dbstf_html = f"""<!DOCTYPE html><html><head>
+    <script type="application/ld+json">{json.dumps({"@type": "MusicGroup", "name": "D-Block & S-te-Fan", "genre": ["Euphoric Hardstyle"]})}</script>
+    </head><body><astro-island component-url="/_astro/TrackExplorer.1.js" props="{dbstf_props}"></astro-island></body></html>"""
+
+    def _mock_duo_get(url, params=None, **kw):
+        resp = requests.Response()
+        resp.url = url
+        if url.endswith("/artists/d-block-s-te-fan"):
+            resp.status_code = 200
+            resp._content = dbstf_html.encode("utf-8")
+            return resp
+        if url.endswith("/artists/firelite"):
+            resp.status_code = 200
+            resp._content = dbstf_html.replace('"D-Block & S-te-Fan"', '"Firelite"', 1).encode("utf-8")
+            return resp
+        resp.status_code = 404
+        resp._content = b"Not Found"
+        return resp
+
+    # M-5a: db=None works without crashing or losing parsed items
+    hdrr_nodb = HDRRProvider(db=None, sleep_fn=lambda s: None, fetch_track_details_for_isrc=False)
+    hdrr_nodb.session.get = _mock_duo_get
+    c_nodb, o_nodb = hdrr_nodb.search_detailed("D-Block & S-te-Fan", "Angels & Demons")
+    assert o_nodb.status.value == "ok" and len(c_nodb) == 1
+    assert c_nodb[0].match_confidence == "fuzzy_conservative"
+
+    # H-1, H-2, H-4, M-5b: Run through real `execute_research_batch()` with `ProviderPolicy`
+    tr_fuzzy = Track(
+        file_id="fid_dbstf_fuzzy",
+        name="D-Block & S-te-Fan - Angels & Demons.flac",
+        is_live_source=True,
+        parent_id="src_root_1",
+        observed_parent_id="src_root_1",
+        metadata=TrackMetadata(version="vf1", artist="D-Block & S-te-Fan", title="Angels & Demons", duration=210.0, identity_origin="embedded"),
+    )
+    tr_rmx = Track(
+        file_id="fid_firelite_rmx",
+        name="Firelite - In Too Deep (Firelite Remix).flac",
+        is_live_source=True,
+        parent_id="src_root_1",
+        observed_parent_id="src_root_1",
+        metadata=TrackMetadata(version="vr1", artist="Firelite", title="In Too Deep (Firelite Remix)", duration=195.0, identity_origin="embedded"),
+    )
+    db.save_track(tr_fuzzy)
+    db.save_track(tr_rmx)
+
+    hdrr_db = HDRRProvider(db=db, sleep_fn=lambda s: None, fetch_track_details_for_isrc=False)
+    hdrr_db.session.get = _mock_duo_get
+    pol = ProviderPolicy(cfg)
+    provs = {"hdrr": hdrr_db}
+    pol.bind(db, provs)
+
+    batch_sum = execute_research_batch(
+        cfg, db, limit=5, providers_override=provs, selected_tracks=[tr_fuzzy, tr_rmx],
+        policy=pol, enable_wikidata_fallback=False,
+    )
+    # H-4: HDRR telemetry & HTTP requests included in summary
+    assert "HDRR" in batch_sum.provider_telemetry
+    assert batch_sum.total_actual_http_requests == hdrr_db.stats["calls"] > 0
+    # H-1: Neither fuzzy_conservative nor remixer-credited remix was dropped!
+    saved_fuzzy = db.get_candidates("fid_dbstf_fuzzy")
+    saved_rmx = db.get_candidates("fid_firelite_rmx")
+    assert len(saved_fuzzy) == 1 and saved_fuzzy[0].match_confidence == "fuzzy_conservative"
+    assert len(saved_rmx) == 1 and saved_rmx[0].title == "In Too Deep (Firelite Remix)"
+
+    # Subsequent lookup of D-Block & S-te-Fan hits SQLite cache at index 0 (0 HTTP calls, cache_hits incremented!)
+    calls_before = hdrr_db.stats["calls"]
+    cache_before = hdrr_db.stats["cache_hits"]
+    _, o_cached_duo = hdrr_db.search_detailed("D-Block & S-te-Fan", "Angels & Demons")
+    assert hdrr_db.stats["calls"] == calls_before
+    assert hdrr_db.stats["cache_hits"] > cache_before
+    assert o_cached_duo.from_cache is True
+
+    # M-5b: Non-matching `?q=` on prolific artist (>20 tracks) is negative-cached so repeat lookup makes 0 HTTP calls
+    _, _ = hdrr_db.search_detailed("D-Block & S-te-Fan", "Nonexistent Track XYZ")
+    calls_after_first_miss = hdrr_db.stats["calls"]
+    _, o_second_miss = hdrr_db.search_detailed("D-Block & S-te-Fan", "Nonexistent Track XYZ")
+    assert hdrr_db.stats["calls"] == calls_after_first_miss
+    assert o_second_miss.from_cache is True
+
+    # L-3b: Archiving stale version retains `candidate_provenance` fields in `evidence_history`
+    tr_fuzzy_v2 = Track(
+        file_id="fid_dbstf_fuzzy",
+        name="D-Block & S-te-Fan - Angels & Demons.flac",
+        is_live_source=True,
+        metadata=TrackMetadata(version="vf2", artist="D-Block & S-te-Fan", title="Angels & Demons", duration=210.0),
+    )
+    db.save_track(tr_fuzzy_v2)
+    with closing(db._get_connection()) as conn:
+        hist_json = conn.execute("SELECT candidates_json FROM evidence_history WHERE file_id='fid_dbstf_fuzzy'").fetchone()[0]
+    assert "Euphoric Hardstyle" in hist_json
+
+    # --- M-4: HTTP-200 anti-bot challenge HTML is NEVER stored in `provider_cache` ---
+    hdrr_bot = HDRRProvider(db=db, sleep_fn=lambda s: None)
+    def _bot_200_get(url, params=None, **kw):
+        r = requests.Response()
+        r.url = url
+        r.status_code = 200
+        r._content = b"<html><title>Just a moment...</title><div class='cf-turnstile'></div></html>"
+        return r
+    hdrr_bot.session.get = _bot_200_get
+    _, bot_out = hdrr_bot.search_detailed("NewBotTestArtist", "AnyTrack")
+    assert bot_out.hard_blocked is True
+    with closing(db._get_connection()) as conn:
+        pc_cnt = conn.execute("SELECT COUNT(*) FROM provider_cache WHERE provider = 'HDRR'").fetchone()[0]
+    assert pc_cnt == 0
+
+    # --- M-1, H-3 & L-1: Track-exception override vs single-source conflict, `preview`, `ProviderPolicy`, `coverage`, and `hold_on_conflict` ---
+    peygan_with_exc = ArtistRule(
+        rule_id="AR-PEYGAN-001",
+        artist_name="Peygan",
+        enabled=True,
+        approval_status="approved",
+        verification_status="user_verified",
+        preferred=["Rawstyle", "Xtra Raw"],
+        discouraged=["Euphoric"],
+        track_exceptions=[{"match_type": "file_id", "match_value": "fid_exc_rawphoric", "allowed": "Rawphoric"}],
+        collab_policy="hold_on_conflict",
+        confidence_boost=1,
+    )
+    upsert_artist_rule(db, peygan_with_exc, actor="test")
+
+    tr_exc = Track(
+        file_id="fid_exc_rawphoric",
+        name="Peygan - Special Melodic Cut.flac",
+        is_live_source=True,
+        parent_id="src_root_1",
+        observed_parent_id="src_root_1",
+        metadata=TrackMetadata(version="ve1", artist="Peygan", title="Special Melodic Cut", duration=175.0, identity_origin="embedded"),
+    )
+    db.save_track(tr_exc)
+    # Single source (Discogs) wrongly claims 'Euphoric', while track exception specifies 'Rawphoric'!
+    discogs_wrong = [
+        Candidate("Discogs", "Special Melodic Cut", ["Peygan"], duration=175.0, genre=["Hardstyle", "Euphoric"], verification="Duration supported", source_family="discogs"),
+    ]
+    db.update_research_result("fid_exc_rawphoric", "success", "ve1", candidates=discogs_wrong, provider_calls={"_meta": {"lookup_complete": True}})
+
+    idx = VerifiedSheetIndex(
+        schema_valid=True,
+        schema_error="",
+        headers=["Track Name", "Folder", "Genre", "Subgenre", "BPM", "Key", "Artist", "Title", "Fmt", "MB", "Link", "Status", "Conf", "Date", "Drive ID", "Notes"],
+        columns={"genre": 2, "subgenre": 3, "bpm": 4, "key": 5},
+        drive_id_col=14,
+        unique_rows_by_id={
+            "fid_exc_rawphoric": (10, ["Peygan - Special Melodic Cut.flac", "Unsorted", "Unclassified", "Needs Review", "", "", "", "", "FLAC", "20", "", "PENDING", "", "", "fid_exc_rawphoric", ""]),
+        },
+        duplicate_ids={},
+    )
+    pv = evaluate_live_preview(
+        live_tracks=[tr_exc],
+        candidates_by_id={"fid_exc_rawphoric": db.get_candidates("fid_exc_rawphoric")},
+        sheet_index=idx,
+        source_folder_id="src_root_1",
+        vault_folder_id="dst_root_1",
+        vault_folders={"Hardstyle": ["hs_folder"]},
+        artist_rules=[peygan_with_exc],
+    )
+    assert pv.rows[0].proposed_values["subgenre"] == "Rawphoric"
+    new_r, decs, _ = planned_row(
+        db.get_candidates("fid_exc_rawphoric"),
+        pv.rows[0].proposed_values,
+        idx.unique_rows_by_id["fid_exc_rawphoric"][1],
+        artist_rules=[peygan_with_exc],
+    )
+    assert new_r[3] == "Rawphoric"
+    assert json.loads(new_r[22])["subgenre"]["source"] == "artist_rule"
+
+    # L-1: `hold_on_conflict` between two collaborators with opposing rules (`Peygan` discourages Euphoric, `EuphArtist` prefers Euphoric)
+    euph_collab_rule = ArtistRule(
+        rule_id="AR-EUPH-001",
+        artist_name="EuphArtist",
+        enabled=True,
+        approval_status="approved",
+        verification_status="user_verified",
+        preferred=["Euphoric"],
+        collab_policy="hold_on_conflict",
+    )
+    ev_clash = evaluate_artist_rules(
+        TrackMetadata(artist="Peygan & EuphArtist", title="Clash Track"),
+        [],
+        rules=[peygan_with_exc, euph_collab_rule],
+        proposed_genre="Hardstyle",
+        proposed_subgenre="Euphoric",
+    )
+    assert ev_clash["discouraged_conflict"] is True
+    assert any("hold_on_conflict" in r for r in ev_clash["conflict_reasons"])
+
+    # H-3c: `library_report` flags unlocked existing conflicting subgenre against active Artist_Rules
+    tr_existing_bad = Track(
+        file_id="fid_peygan_bad_sheet",
+        name="Peygan - Old Mislabelled.flac",
+        is_live_source=True,
+        metadata=TrackMetadata(version="vb1", artist="Peygan", title="Old Mislabelled", duration=165.0),
+    )
+    db.save_track(tr_existing_bad)
+    with closing(db._get_connection()) as conn, conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO root_membership(role, root_id, file_id, parent_id, path_json, scan_id, ambiguous) VALUES ('source', ?, ?, 'src_root_1', '[]', 1, 0)",
+            ("src_root_1", "fid_peygan_bad_sheet"),
+        )
+
+    class _StubSheets:
+        def fetch_header_row(self, sid, rng):
+            return ["Track Name", "Folder", "Genre", "Subgenre", "BPM", "Key", "Artist", "Title", "Fmt", "MB", "Link", "Status", "Conf", "Date", "Drive ID", "Notes"]
+        def iter_tracks_rows(self, sid, lc):
+            yield 2, ["Peygan - Old Mislabelled.flac", "Hardstyle", "Hardstyle", "Euphoric", "158", "5A", "", "", "FLAC", "20", "", "SORTED – AUDIO PENDING", "", "", "fid_peygan_bad_sheet", ""]
+        def load_artist_rules_tab(self, sid):
+            return [peygan_with_exc], []
+
+    class _StubDrive:
+        def get_children_folders(self, vid):
+            return {"Hardstyle": ["hs_folder"]}
+
+    rep_json = tmp_path / "cov_rep.json"
+    with closing(db._get_connection()) as conn:
+        cov_sum = library_report(
+            conn, db, cfg,
+            Namespace(export_csv="", export_json=str(rep_json), verbose=True, file_id=["fid_peygan_bad_sheet"]),
+            _StubSheets(), _StubDrive(),
+        )
+    cov_data = json.loads(rep_json.read_text(encoding="utf-8"))
+    row_rep = cov_data["rows"][0]
+    assert "subgenre_existing_vs_artist_rule_conflict" in row_rep["double_check_flags"]
+    assert row_rep["states"]["review_required"] is True
+
+    # M-3: `approve_artist_rule_suggestion` merges into existing rule without clobbering `track_exceptions`!
+    with closing(db._get_connection()) as conn, conn:
+        conn.execute(
+            """
+            INSERT INTO artist_rule_suggestions(
+                suggestion_id, artist_name, norm_artist, pattern_type,
+                suggested_rule_json, supporting_tracks_json, evidence_count, status, created_utc, updated_utc
+            ) VALUES ('SUG-PEYGAN-MERGE', 'Peygan', 'peygan', 'recurring_subgenre_correction', ?, '[]', 2, 'pending_approval', '2026-11-27T00:00:00Z', '2026-11-27T00:00:00Z')
+            """,
+            (json.dumps({"rule_id": "AR-PEYGAN-LEARNED", "preferred": ["Experimental Raw"], "discouraged": ["Mainstream Hardstyle"], "notes": "Merged note"}),),
+        )
+    merged_rule = approve_artist_rule_suggestion(db, "SUG-PEYGAN-MERGE", actor="tester")
+    assert merged_rule is not None
+    assert merged_rule.rule_id == "AR-PEYGAN-001"
+    assert len(merged_rule.track_exceptions) == 1
+    assert "Mainstream Hardstyle" in merged_rule.discouraged
+    assert "Euphoric" in merged_rule.discouraged
+    assert "Experimental Raw" in merged_rule.preferred

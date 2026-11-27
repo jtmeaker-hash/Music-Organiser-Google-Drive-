@@ -202,6 +202,7 @@ def evaluate_live_preview(
     save_medium: bool = True,
     provider_terms_cleared: bool = False,
     quarantined_count: int = 0,
+    artist_rules: Optional[List[Any]] = None,
 ) -> LivePreviewSummary:
     """
     Build real read-only organisation & spreadsheet preview from live source inventory.
@@ -237,7 +238,7 @@ def evaluate_live_preview(
             continue
         summary.evaluated_count += 1
         cands = candidates_by_id.get(t.file_id, [])
-        proposal = build_track_proposal(t.metadata, cands)
+        proposal = build_track_proposal(t.metadata, cands, artist_rules=artist_rules, file_id=t.file_id)
 
         # Build concise provenance/evidence summary
         ev_parts: List[str] = []
@@ -367,6 +368,7 @@ def evaluate_live_preview(
             old_row=old_row,
             save_medium=save_medium,
             provider_terms_cleared=provider_terms_cleared,
+            artist_rules=artist_rules,
         )
 
         # Collect recording-supported catalogue genres and check novel 2-provider proposals

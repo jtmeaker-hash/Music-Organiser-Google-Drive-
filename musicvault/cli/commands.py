@@ -546,12 +546,17 @@ def run_recover_research(
     stranded by transient/cooldown/budget provider failures.
     Never runs automatically; requires --apply plus a verified SQLite backup to mutate.
     """
-    configured_provs = {"musicbrainz"}
-    if config.sonovault_api_key:
+    disabled_raw = {
+        x.strip().lower()
+        for x in (config.get("DISABLED_RESEARCH_PROVIDERS", "") or "").split(",")
+        if x.strip()
+    }
+    configured_provs = {"musicbrainz", "hdrr"} - disabled_raw
+    if config.sonovault_api_key and "sonovault" not in disabled_raw:
         configured_provs.add("sonovault")
-    if config.audiometa_api_key:
+    if config.audiometa_api_key and "audiometa" not in disabled_raw:
         configured_provs.add("audiometa")
-    if config.discogs_token:
+    if config.discogs_token and "discogs" not in disabled_raw:
         configured_provs.add("discogs")
 
     try:
@@ -728,6 +733,16 @@ def run_preview(
     except Exception as exc:
         print(f"[!] Warning: Could not inspect Vault destination folders ({config.redact(exc)}); folder checks marked provisional.")
 
+    sheet_artist_rules = []
+    if hasattr(sh_svc, "load_artist_rules_tab"):
+        try:
+            sheet_artist_rules, ar_warns = sh_svc.load_artist_rules_tab(config.sheet_id)
+            for w in ar_warns:
+                print(f"[!] Artist_Rules sheet warning: {w}")
+        except Exception:
+            sheet_artist_rules = []
+    active_artist_rules = load_artist_rules(db=db, config=config, sheet_rules=sheet_artist_rules)
+
     cands_by_id = {t.file_id: db.get_candidates(t.file_id) for t in selected_tracks}
     preview = evaluate_live_preview(
         live_tracks=selected_tracks,
@@ -739,6 +754,7 @@ def run_preview(
         save_medium=config.save_medium,
         provider_terms_cleared=config.provider_terms_cleared,
         quarantined_count=inv["quarantined_records"],
+        artist_rules=active_artist_rules,
     )
 
     print(f"\n=== LIVE READ-ONLY ORGANISATION PREVIEW (v{__version__}) ===")
@@ -901,6 +917,7 @@ def run_artist_rules(
     db: Database,
     learn: bool = False,
     approve_id: str = "",
+    sheet_snapshot: Optional[Path] = None,
     export_sheet_csv: Optional[Path] = None,
     export_json: Optional[Path] = None,
 ) -> Dict[str, Any]:
@@ -908,6 +925,9 @@ def run_artist_rules(
     Inspect configurable `Artist_Rules`, export the `Artist_Rules` Google Sheets tab template/rows,
     learn `pending_approval` suggestions from manual corrections, or explicitly approve a suggestion.
     """
+    import json as _json
+    from ..services.sheets import normalize_tracks_row, resolve_tracks_headers
+
     db._ensure_additive_v3_extensions()
     ensure_default_artist_rules(db)
 
@@ -919,7 +939,31 @@ def run_artist_rules(
         else:
             print(f"[!] Suggestion '{approve_id}' not found.")
 
-    learned = learn_artist_rule_suggestions(db) if learn else []
+    learned = []
+    if learn:
+        canon_rows: List[List[str]] = []
+        if sheet_snapshot and sheet_snapshot.is_file():
+            snap_data = _json.loads(sheet_snapshot.read_text(encoding="utf-8"))
+            raw_t_rows = (
+                snap_data.get("tabs", {}).get("Tracks", {}).get("rows")
+                or snap_data.get("rows")
+                or []
+            )
+            if raw_t_rows:
+                idx = resolve_tracks_headers(raw_t_rows[0])
+                if idx.schema_valid:
+                    canon_rows = [normalize_tracks_row(r, idx) for r in raw_t_rows[1:] if any(str(x or "").strip() for x in r)]
+        elif config.sheet_id:
+            try:
+                creds = GoogleAuthManager(config).get_credentials()
+                if creds:
+                    sh = SheetsService(creds)
+                    s_idx = sh.load_verified_index(config.sheet_id)
+                    if s_idx.schema_valid:
+                        canon_rows = [row for _, row in s_idx.unique_rows_by_id.values()]
+            except Exception:
+                canon_rows = []
+        learned = learn_artist_rule_suggestions(db, sheet_rows=canon_rows or None)
     rules = load_artist_rules(db=db, config=config, active_only=False)
 
     with db._get_connection() as conn:

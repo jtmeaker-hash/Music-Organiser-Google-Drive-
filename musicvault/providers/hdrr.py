@@ -19,6 +19,7 @@ import difflib
 import html as html_mod
 import json
 import logging
+import posixpath
 import re
 import unicodedata
 import urllib.parse
@@ -35,6 +36,35 @@ logger = logging.getLogger("musicvault.providers.hdrr")
 
 HDRR_BASE_URL = "https://www.hdrr.info"
 _DISALLOWED_HDRR_PREFIXES = ("/api/", "/share/", "/media/img/")
+_DISALLOWED_HDRR_EXACT = frozenset({"/api", "/share", "/media/img"})
+
+
+def _assert_allowed_hdrr_url(url_or_path: str) -> str:
+    """
+    Validate and normalize an HDRR URL or path against `robots.txt` rules:
+    - Enforces `https://www.hdrr.info` when a scheme/host is supplied.
+    - Normalizes dot-segments (`..`, `.`) and percent-encoded slashes before checking prefixes.
+    - Hard-blocks `/api`, `/api/*`, `/share`, `/share/*`, `/media/img`, and `/media/img/*`.
+    Returns the normalized path starting with `/`.
+    """
+    raw = str(url_or_path or "").strip()
+    if not raw:
+        raise RuntimeError("HDRR robots.txt compliance guard blocked empty URL/path")
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme or parsed.netloc:
+        if parsed.scheme.lower() != "https" or parsed.netloc.lower() != "www.hdrr.info":
+            raise RuntimeError(f"HDRR compliance guard blocked unexpected host/scheme: {raw}")
+        raw_path = parsed.path or "/"
+    else:
+        raw_path = parsed.path or "/"
+    unquoted = urllib.parse.unquote(raw_path)
+    norm_path = posixpath.normpath("/" + unquoted.lstrip("/"))
+    if not norm_path.startswith("/"):
+        norm_path = "/" + norm_path
+    low_path = norm_path.casefold()
+    if low_path in _DISALLOWED_HDRR_EXACT or any(low_path.startswith(dis) for dis in _DISALLOWED_HDRR_PREFIXES):
+        raise RuntimeError(f"HDRR robots.txt compliance guard blocked disallowed path: {norm_path}")
+    return norm_path
 
 _ANTI_BOT_GATE_RE = re.compile(
     r"(?:cf-turnstile|g-recaptcha|h-captcha|Just a moment\.\.\.|Enable JavaScript and cookies to continue|verify you are human)",
@@ -133,15 +163,16 @@ def _parse_year(date_str: Any) -> Optional[int]:
     return yr if 1985 <= yr <= 2100 else None
 
 
-def _strip_benign_subtitle(base_t: str) -> str:
-    """Strip festival anthem / year subtitles for conservative fuzzy base-title comparison."""
+def _strip_benign_subtitle(raw_title: str) -> str:
+    """Strip festival anthem / year subtitles from a raw title before version/base normalization."""
     cleaned = re.sub(
-        r"\b(?:official\s+)?(?:defqon\s*1|decibel(?:\s+outdoor)?|intents(?:\s+festival)?|qlimax|reverze|dominator|supremacy|rebirth|rawzone(?:\s+arena)?)\s*(?:20\d{2})?\s*(?:closing\s+theme|anthem|ost)\b",
+        r"[\(\[\-]?\s*\b(?:official\s+)?(?:defqon\.?\s*1|decibel(?:\s+outdoor)?|intents(?:\s+festival)?|qlimax|reverze|dominator|supremacy|rebirth|rawzone(?:\s+arena)?)\s*(?:20\d{2})?\s*(?:closing\s+theme|anthem|ost)\b\s*[\)\]]?",
         "",
-        base_t,
+        raw_title,
         flags=re.IGNORECASE,
     )
-    return norm(cleaned)
+    base, _, _ = extract_version_tokens(cleaned)
+    return base or norm(cleaned)
 
 
 def parse_hdrr_artist_html(html_text: str, fallback_slug: str = "") -> Optional[Dict[str, Any]]:
@@ -238,6 +269,8 @@ def parse_hdrr_artist_html(html_text: str, fallback_slug: str = "") -> Optional[
                         art_names.append(an)
                     if asl:
                         art_slugs.append(asl)
+                elif isinstance(a_obj, str) and a_obj.strip():
+                    art_names.append(html_mod.unescape(a_obj).strip())
             rel_date = str(raw_item.get("releaseDate") or "").strip()
             pop_val = raw_item.get("popularity")
             items_out.append({
@@ -455,17 +488,29 @@ class HDRRProvider(BaseProvider):
         self.offline_only = bool(offline_only)
         self.fetch_track_details_for_isrc = bool(fetch_track_details_for_isrc)
 
+        def _guard_redirect_response(resp: Any, *args: Any, **kw: Any) -> None:
+            resp_url = getattr(resp, "url", "")
+            if resp_url:
+                _assert_allowed_hdrr_url(str(resp_url))
+
+        if hasattr(self, "session") and hasattr(self.session, "hooks"):
+            self.session.hooks.setdefault("response", []).append(_guard_redirect_response)
+
+    def _record_cache_hit(self) -> None:
+        self.stats["cache_hits"] += 1
+        mon = getattr(self, "request_monitor", None)
+        if mon is not None:
+            mon.count("cache_hits")
+
     def _fetch_permitted_html(
         self,
         path: str,
         params: Optional[Dict[str, Any]] = None,
         allow_404_as_empty: bool = True,
-        use_cache: bool = True,
+        use_cache: bool = False,
     ) -> ProviderCallOutcome:
         """Fetch a permitted public HDRR HTML route while hard-blocking `/api/`, `/share/`, and anti-bot challenges."""
-        clean_path = "/" + path.lstrip("/")
-        if any(clean_path.startswith(dis) for dis in _DISALLOWED_HDRR_PREFIXES):
-            raise RuntimeError(f"HDRR robots.txt compliance guard blocked disallowed path: {clean_path}")
+        clean_path = _assert_allowed_hdrr_url(path)
 
         if self.offline_only:
             return ProviderCallOutcome(
@@ -681,6 +726,37 @@ class HDRRProvider(BaseProvider):
             return None
         return dict(row)
 
+    def _get_cached_artist_by_slug(self, artist_slug: str) -> Optional[Dict[str, Any]]:
+        if self.db is None or not artist_slug:
+            return None
+        with closing(self.db._get_connection()) as conn:
+            row = conn.execute(
+                "SELECT * FROM hdrr_artists WHERE artist_slug = ? LIMIT 1",
+                (artist_slug,),
+            ).fetchone()
+        if not row:
+            return None
+        if not self._is_fresh(row["fetched_utc"], row["ttl_seconds"]):
+            return None
+        return dict(row)
+
+    @staticmethod
+    def _parsed_artist_to_inline_row(parsed: Dict[str, Any]) -> Dict[str, Any]:
+        items = list(parsed.get("items") or [])
+        total = int(parsed.get("total_tracks") or len(items))
+        return {
+            "artist_slug": parsed["artist_slug"],
+            "name": parsed["name"],
+            "norm_name": norm(parsed["name"]),
+            "genres_json": json.dumps(parsed.get("genres") or []),
+            "spotify_url": parsed.get("spotify_url") or "",
+            "followers": int(parsed.get("followers") or 0),
+            "tracked_releases": int(parsed.get("tracked_releases") or total),
+            "total_tracks": total,
+            "catalogue_complete": int(len(items) >= total and parsed.get("page", 1) == 1),
+            "_inline_items": items,
+        }
+
     def _get_cached_tracks_for_artist(self, artist_slug: str) -> List[Dict[str, Any]]:
         if self.db is None or not artist_slug:
             return []
@@ -744,9 +820,9 @@ class HDRRProvider(BaseProvider):
         if norm(query_title) == norm(cand_title) or (q_base and q_base == c_base):
             return "exact"
 
-        # Conservative fuzzy match: strip festival anthem subtitles or check >= 0.90 base similarity
-        q_stripped = _strip_benign_subtitle(q_base or norm(query_title))
-        c_stripped = _strip_benign_subtitle(c_base or norm(cand_title))
+        # Conservative fuzzy match: strip festival anthem subtitles from raw titles or check >= 0.92 base similarity
+        q_stripped = _strip_benign_subtitle(query_title)
+        c_stripped = _strip_benign_subtitle(cand_title)
         if q_stripped and q_stripped == c_stripped and len(q_stripped) >= 4:
             return "fuzzy_conservative"
 
@@ -849,32 +925,32 @@ class HDRRProvider(BaseProvider):
         """Resolve an artist's HDRR catalogue via SQLite cache first, then direct `/artists/<slug>`, then `/artists?q=`."""
         cached = self._get_cached_artist_by_name(target_artist)
         if cached is not None:
+            self._record_cache_hit()
             return cached, ProviderCallOutcome(provider=self.name, status=ProviderStatus.OK, from_cache=True)
 
         neg_key = f"artist:{norm(target_artist)}"
         if self._has_fresh_negative(neg_key):
-            self.stats["cache_hits"] += 1
+            self._record_cache_hit()
             return None, ProviderCallOutcome(provider=self.name, status=ProviderStatus.EMPTY, from_cache=True)
 
         if self.offline_only:
             return None, ProviderCallOutcome(provider=self.name, status=ProviderStatus.EMPTY, from_cache=True)
 
         slug_guess = slugify_hdrr(target_artist)
-        last_out = ProviderCallOutcome(provider=self.name, status=ProviderStatus.EMPTY)
         if slug_guess:
             out = self._fetch_permitted_html(f"/artists/{urllib.parse.quote(slug_guess, safe='')}", allow_404_as_empty=True)
-            last_out = out
             if out.status == ProviderStatus.OK and isinstance(out.data, str):
                 parsed = parse_hdrr_artist_html(out.data, fallback_slug=slug_guess)
                 if parsed and norm(parsed["name"]) == norm(target_artist):
-                    self._upsert_catalogue(parsed)
-                    return self._get_cached_artist_by_name(target_artist), out
+                    if self.db is not None:
+                        self._upsert_catalogue(parsed)
+                        return self._get_cached_artist_by_slug(parsed["artist_slug"]), out
+                    return self._parsed_artist_to_inline_row(parsed), out
             elif out.status not in (ProviderStatus.OK, ProviderStatus.EMPTY):
                 return None, out
 
         # Direct slug 404'd or collided with a homonym (e.g. 'TNT' -> 'tnt-2'): query `/artists?q=<artist>`
         s_out = self._fetch_permitted_html("/artists", params={"q": target_artist.strip()}, allow_404_as_empty=True)
-        last_out = s_out
         if s_out.status != ProviderStatus.OK or not isinstance(s_out.data, str):
             if s_out.status == ProviderStatus.EMPTY:
                 self._save_negative(neg_key)
@@ -896,8 +972,10 @@ class HDRRProvider(BaseProvider):
         if a_out.status == ProviderStatus.OK and isinstance(a_out.data, str):
             parsed = parse_hdrr_artist_html(a_out.data, fallback_slug=exact_slug)
             if parsed:
-                self._upsert_catalogue(parsed)
-                return self._get_cached_artist_by_name(target_artist), a_out
+                if self.db is not None:
+                    self._upsert_catalogue(parsed)
+                    return self._get_cached_artist_by_slug(parsed["artist_slug"]), a_out
+                return self._parsed_artist_to_inline_row(parsed), a_out
         return None, a_out
 
     def search_detailed(
@@ -916,8 +994,10 @@ class HDRRProvider(BaseProvider):
         if not clean_artist or not clean_title:
             return [], ProviderCallOutcome(provider=self.name, status=ProviderStatus.EMPTY)
 
-        # Build ordered artist names to inspect (remixer + primary collaborators)
+        # Build ordered artist names to inspect (cached full duo first, remixer, split collaborators, unsplit '&' duo)
         artist_tokens: List[str] = []
+        if self._get_cached_artist_by_name(clean_artist) is not None:
+            artist_tokens.append(clean_artist)
         remix_m = re.search(
             r"[\(\[\-]\s*([A-Za-z0-9][A-Za-z0-9 &.'+\-]{1,40}?)\s+(?:extended\s+|radio\s+|club\s+)?(?:remix|bootleg|rework|flip)\b",
             clean_title,
@@ -926,13 +1006,17 @@ class HDRRProvider(BaseProvider):
         if remix_m:
             rem_raw = remix_m.group(1).strip()
             if rem_raw and norm(rem_raw) not in ("original", "extended", "radio", "club", "official", "vip"):
-                artist_tokens.append(rem_raw)
+                if not any(norm(rem_raw) == norm(existing) for existing in artist_tokens):
+                    artist_tokens.append(rem_raw)
         for raw_part in re.split(r"\s*(?:,|;|&|\bfeat\.?|\bft\.?|\bvs\.?|\bx\b|\bwith\b)\s*", clean_artist, flags=re.I):
             p = raw_part.strip()
             if p and norm(p) not in ("unknown", "unknownartist", "various", "variousartists", "id"):
                 if not any(norm(p) == norm(existing) for existing in artist_tokens):
                     artist_tokens.append(p)
-        base_t, _, remixer_norm = extract_version_tokens(clean_title)
+        if re.search(r"(?:&|\band\b)", clean_artist, flags=re.I) and not any(
+            norm(clean_artist) == norm(existing) for existing in artist_tokens
+        ):
+            artist_tokens.append(clean_artist)
         if not artist_tokens:
             return [], ProviderCallOutcome(provider=self.name, status=ProviderStatus.EMPTY)
 
@@ -942,7 +1026,7 @@ class HDRRProvider(BaseProvider):
         any_cache_hit = False
         last_http: Optional[int] = None
 
-        for target_art in artist_tokens[:3]:
+        for target_art in artist_tokens[:4]:
             artist_row, a_out = self._resolve_and_cache_artist(target_art)
             any_request_made = any_request_made or a_out.request_made
             any_cache_hit = any_cache_hit or a_out.from_cache
@@ -954,7 +1038,11 @@ class HDRRProvider(BaseProvider):
                 continue
 
             a_slug = artist_row["artist_slug"]
-            cached_tracks = self._get_cached_tracks_for_artist(a_slug)
+            cached_tracks = (
+                list(artist_row["_inline_items"])
+                if "_inline_items" in artist_row
+                else self._get_cached_tracks_for_artist(a_slug)
+            )
             local_hits: List[Tuple[Dict[str, Any], str]] = []
             for item in cached_tracks:
                 mk = self._match_track_item(clean_artist, clean_title, item)
@@ -965,7 +1053,10 @@ class HDRRProvider(BaseProvider):
             if not local_hits and not artist_row.get("catalogue_complete") and not self.offline_only:
                 q_term = re.sub(r"\s*\([^)]*\)|\s*\[[^\]]*\]", "", clean_title).strip() or clean_title
                 q_key = f"artist_q:{a_slug}:{norm(q_term)}"
-                if not self._has_fresh_negative(q_key):
+                if self._has_fresh_negative(q_key):
+                    self._record_cache_hit()
+                    any_cache_hit = True
+                else:
                     q_out = self._fetch_permitted_html(
                         f"/artists/{urllib.parse.quote(a_slug, safe='')}",
                         params={"q": q_term},
@@ -977,20 +1068,21 @@ class HDRRProvider(BaseProvider):
                     if q_out.status == ProviderStatus.OK and isinstance(q_out.data, str):
                         parsed_q = parse_hdrr_artist_html(q_out.data, fallback_slug=a_slug)
                         if parsed_q and parsed_q.get("items"):
-                            # Persist newly discovered items incrementally without falsely marking full catalogue complete
-                            with closing(self.db._get_connection()) as conn, conn:
-                                now_iso = self._now_utc_normalized().isoformat()
-                                for it in parsed_q["items"]:
-                                    self._upsert_track_conn(conn, it, now_iso)
-                                    conn.execute(
-                                        "INSERT OR IGNORE INTO hdrr_artist_tracks(artist_slug, track_slug) VALUES (?, ?)",
-                                        (a_slug, it["track_slug"]),
-                                    )
+                            if self.db is not None:
+                                # Persist newly discovered items incrementally without falsely marking full catalogue complete
+                                with closing(self.db._get_connection()) as conn, conn:
+                                    now_iso = self._now_utc_normalized().isoformat()
+                                    for it in parsed_q["items"]:
+                                        self._upsert_track_conn(conn, it, now_iso)
+                                        conn.execute(
+                                            "INSERT OR IGNORE INTO hdrr_artist_tracks(artist_slug, track_slug) VALUES (?, ?)",
+                                            (a_slug, it["track_slug"]),
+                                        )
                             for it in parsed_q["items"]:
                                 mk = self._match_track_item(clean_artist, clean_title, it)
                                 if mk:
                                     local_hits.append((it, mk))
-                        else:
+                        if not local_hits:
                             self._save_negative(q_key)
                     elif q_out.status not in (ProviderStatus.OK, ProviderStatus.EMPTY):
                         incomplete_out = q_out

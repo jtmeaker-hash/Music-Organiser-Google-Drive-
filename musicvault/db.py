@@ -1052,9 +1052,7 @@ class Database:
         old_ver = existing_row["version"] or ""
         cands = [
             dict(r)
-            for r in conn.execute(
-                "SELECT * FROM candidates WHERE file_id = ? AND COALESCE(is_stale, 0) = 0", (fid,)
-            ).fetchall()
+            for r in self._select_candidate_rows_conn(conn, fid, include_stale=False)
         ]
         f_decs = [
             dict(r)
