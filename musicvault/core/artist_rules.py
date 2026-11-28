@@ -132,11 +132,12 @@ DEFAULT_PEYGAN_RULE = ArtistRule(
     year_max=None,
     collab_policy="apply_discouraged_and_blocked",
     remix_priority="remixer_first",
-    confidence_boost=0,
+    confidence_boost=1,
     confidence_penalty=1,
     notes=(
-        "Strongly discourage Euphoric Hardstyle; prefer investigation into Rawstyle, Xtra Raw "
-        "and Experimental Raw. Allow track-specific exceptions; do not force every track into Rawstyle."
+        "Soft-confidence rule: discourage Euphoric Hardstyle; favour Rawstyle, Xtra Raw and "
+        "Experimental Raw where supported by track-specific evidence. Allow track-specific "
+        "exceptions; never force classifications solely based on artist identity."
     ),
     source_origin="seed_default",
 )
@@ -483,16 +484,23 @@ def artist_rule_to_sheet_row(rule: ArtistRule) -> List[str]:
 # --- SQLite Persistence & Audit Log ---
 
 def ensure_default_artist_rules(db: Any) -> None:
-    """Seed `DEFAULT_PEYGAN_RULE` idempotently into SQLite if no rule for Peygan exists yet."""
+    """Seed `DEFAULT_PEYGAN_RULE` idempotently into SQLite (upgrading seed_default confidence_boost if needed)."""
     if db is None:
         return
     with closing(db._get_connection()) as conn:
         existing = conn.execute(
-            "SELECT 1 FROM artist_rules WHERE rule_id = ? OR norm_artist = ? LIMIT 1",
+            "SELECT rule_id, confidence_boost, source_origin FROM artist_rules WHERE rule_id = ? OR norm_artist = ? LIMIT 1",
             (DEFAULT_PEYGAN_RULE.rule_id, DEFAULT_PEYGAN_RULE.norm_artist),
         ).fetchone()
     if not existing:
         upsert_artist_rule(db, DEFAULT_PEYGAN_RULE, actor="seed_default", notes="Initial Peygan artist rule")
+    elif existing["source_origin"] == "seed_default" and int(existing["confidence_boost"] or 0) == 0:
+        upsert_artist_rule(
+            db,
+            DEFAULT_PEYGAN_RULE,
+            actor="seed_default",
+            notes="Aligned AR-PEYGAN-001 soft-confidence boost (+1 where supported by track evidence)",
+        )
 
 
 def upsert_artist_rule(db: Any, rule: ArtistRule, actor: str = "user", notes: str = "") -> ArtistRule:
@@ -1180,6 +1188,70 @@ def approve_artist_rule_suggestion(db: Any, suggestion_id: str, actor: str = "us
             (now_iso, suggestion_id),
         )
     return approved_rule
+
+
+def reject_artist_rule_suggestion(
+    db: Any,
+    suggestion_id: str,
+    actor: str = "user",
+    reason: str = "",
+) -> Optional[Dict[str, Any]]:
+    """
+    Explicitly reject an inferred artist-rule suggestion while RETAINING it in `artist_rule_suggestions`
+    (`status='rejected_manual_review'`, `enabled=False`) for manual review and recording an immutable
+    audit entry in `artist_rules_audit`. Never activates or deletes the suggestion.
+    """
+    if db is None:
+        return None
+    now_iso = _utc_iso()
+    with closing(db._get_connection()) as conn:
+        row = conn.execute(
+            "SELECT * FROM artist_rule_suggestions WHERE suggestion_id = ?",
+            (suggestion_id,),
+        ).fetchone()
+    if not row:
+        return None
+
+    before_dict = dict(row)
+    raw_rule = json.loads(row["suggested_rule_json"] or "{}")
+    raw_rule["enabled"] = False
+    raw_rule["approval_status"] = "rejected_manual_review"
+    if reason:
+        raw_rule["rejection_reason"] = reason
+    updated_json = json.dumps(raw_rule, sort_keys=True)
+    audit_note = reason or f"Rejected suggestion {suggestion_id}; retained for manual review"
+
+    with closing(db._get_connection()) as conn, conn:
+        conn.execute(
+            """
+            UPDATE artist_rule_suggestions
+            SET status = 'rejected_manual_review', suggested_rule_json = ?, updated_utc = ?
+            WHERE suggestion_id = ?
+            """,
+            (updated_json, now_iso, suggestion_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO artist_rules_audit(rule_id, action, actor, before_json, after_json, notes, created_utc)
+            VALUES (?, 'REJECT_SUGGESTION', ?, ?, ?, ?, ?)
+            """,
+            (
+                suggestion_id,
+                actor,
+                json.dumps(before_dict, sort_keys=True),
+                json.dumps({**before_dict, "status": "rejected_manual_review", "rejection_reason": reason}, sort_keys=True),
+                audit_note,
+                now_iso,
+            ),
+        )
+    return {
+        "suggestion_id": suggestion_id,
+        "artist_name": row["artist_name"],
+        "status": "rejected_manual_review",
+        "enabled": False,
+        "rejection_reason": reason,
+        "updated_utc": now_iso,
+    }
 
 
 def flag_existing_rows_against_approved_rules(

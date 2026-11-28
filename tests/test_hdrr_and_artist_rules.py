@@ -883,3 +883,186 @@ def test_audit_remediations_h1_through_l3_end_to_end(tmp_path, monkeypatch):
     assert "Mainstream Hardstyle" in merged_rule.discouraged
     assert "Euphoric" in merged_rule.discouraged
     assert "Experimental Raw" in merged_rule.preferred
+
+
+def test_controlled_sheets_writes_rejection_and_approval_gates(tmp_path, monkeypatch):
+    """
+    Verify controlled deployment safeguards (Items 4–9):
+    - AR-PEYGAN-001 soft-confidence rule (`confidence_boost=1`, no forced identity override)
+    - Rejecting a suggestion (`SUG-ACTOFRAGE-870118`) retains it as `rejected_manual_review` (`enabled=False`)
+    - `controlled_sheets_request` blocks DELETE and non-Sheets Drive URLs while allowing Sheets v4 POST/PUT
+    - `build_tracks_write_preview` includes ONLY HIGH/MEDIUM validated updates, protecting manual locks,
+      concrete existing values, LOW/HDRR artist-derived tags, and conflicts
+    - `execute_approved_tracks_writes` requires exact `preview_sha256`, detects row drift, writes RAW values,
+      and supports deterministic rollback via `rollback_sheets_manifest`
+    """
+    import json
+    from musicvault.core.artist_rules import (
+        DEFAULT_PEYGAN_RULE,
+        ensure_default_artist_rules,
+        reject_artist_rule_suggestion,
+    )
+    from musicvault.core.sheets_sync import (
+        build_tracks_write_preview,
+        execute_approved_tracks_writes,
+        rollback_sheets_manifest,
+        sync_artist_rules_to_sheet,
+    )
+    from musicvault.services.read_only import controlled_sheets_request
+    from musicvault.services.sheets import validate_and_index_tracks_sheet
+
+    monkeypatch.setenv("MUSICVAULT_CONFIG_DIR", str(tmp_path))
+    cfg = Config(tmp_path)
+    cfg.set("SHEET_ID", "sheet_ctrl_1")
+    db = Database(cfg.db_path)
+    ensure_default_artist_rules(db)
+
+    # Item 4: AR-PEYGAN-001 soft-confidence check
+    assert DEFAULT_PEYGAN_RULE.confidence_boost == 1
+    assert DEFAULT_PEYGAN_RULE.explicit_override_genre == ""
+    assert DEFAULT_PEYGAN_RULE.explicit_override_subgenre == ""
+
+    # Item 5: Reject SUG-ACTOFRAGE-870118 while retaining for manual review
+    with db._get_connection() as conn, conn:
+        conn.execute(
+            """
+            INSERT INTO artist_rule_suggestions(
+                suggestion_id, artist_name, norm_artist, pattern_type,
+                suggested_rule_json, supporting_tracks_json, evidence_count, status, created_utc, updated_utc
+            ) VALUES (
+                'SUG-ACTOFRAGE-870118', 'Act of Rage', 'actofrage', 'recurring_subgenre_correction',
+                '{"rule_id":"AR-ACTOFRAGE-LEARNED","preferred":["Rawphoric"],"discouraged":["Rawstyle"]}',
+                '[]', 2, 'pending_approval', '2026-11-28T00:00:00Z', '2026-11-28T00:00:00Z'
+            )
+            """
+        )
+    rej = reject_artist_rule_suggestion(
+        db,
+        "SUG-ACTOFRAGE-870118",
+        actor="reviewer",
+        reason="Act of Rage has a varied catalogue; Rawstyle must not be discouraged globally.",
+    )
+    assert rej is not None and rej["status"] == "rejected_manual_review" and rej["enabled"] is False
+    assert all(r.norm_artist != "actofrage" for r in load_artist_rules(db=db, active_only=False))
+    with db._get_connection() as conn:
+        retained = conn.execute(
+            "SELECT status, suggested_rule_json FROM artist_rule_suggestions WHERE suggestion_id='SUG-ACTOFRAGE-870118'"
+        ).fetchone()
+    assert retained is not None and retained["status"] == "rejected_manual_review"
+    assert "varied catalogue" in retained["suggested_rule_json"]
+
+    # Item 9 / Request guard: Drive URIs and DELETE are blocked even on controlled_sheets_request
+    with pytest.raises(RuntimeError):
+        controlled_sheets_request(None, None, "https://www.googleapis.com/drive/v3/files/123", method="POST")
+    with pytest.raises(RuntimeError):
+        controlled_sheets_request(None, None, "https://sheets.googleapis.com/v4/spreadsheets/s1", method="DELETE")
+
+    # Seed 3 tracks:
+    # 1) HIGH/MEDIUM open-provenance MusicBrainz Hardstyle on placeholder 'Unclassified' -> ELIGIBLE
+    # 2) HDRR-only artist-derived 'Rawstyle' -> LOW, MUST NOT populate Tracks!
+    # 3) Locked MOVED row -> PROTECTED, MUST NOT overwrite!
+    t_elig = Track("fid_elig_1", "Headhunterz - Reignite.flac", is_live_source=True, metadata=TrackMetadata(version="v1", artist="Headhunterz", title="Reignite", duration=200.0))
+    t_hdrr = Track("fid_hdrr_low", "PEYGAN - RELOAD.flac", is_live_source=True, metadata=TrackMetadata(version="v1", artist="PEYGAN", title="RELOAD", duration=160.0))
+    t_lock = Track("fid_locked_1", "Wildstylez - Timeless.flac", is_live_source=True, metadata=TrackMetadata(version="v1", artist="Wildstylez", title="Timeless", duration=220.0))
+    for t_obj in (t_elig, t_hdrr, t_lock):
+        db.save_track(t_obj)
+
+    db.update_research_result(
+        "fid_elig_1", "success", "v1",
+        candidates=[Candidate("MusicBrainz", "Reignite", ["Headhunterz"], duration=200.0, genre=["Hardstyle"], verification="Duration supported", source_family="musicbrainz")],
+        provider_calls={"_meta": {"lookup_complete": True}},
+    )
+    db.update_research_result(
+        "fid_hdrr_low", "partial", "v1",
+        candidates=[Candidate("HDRR", "RELOAD", ["PEYGAN"], genre=["Hardstyle", "Rawstyle"], raw_source_genre=["Rawstyle"], verification="Text only", source_family="hdrr", genre_evidence_kind="artist_derived")],
+        provider_calls={"_meta": {"lookup_complete": True}},
+    )
+    db.update_research_result(
+        "fid_locked_1", "success", "v1",
+        candidates=[Candidate("MusicBrainz", "Timeless", ["Wildstylez"], duration=220.0, genre=["Hardcore"], verification="Duration supported", source_family="musicbrainz")],
+        provider_calls={"_meta": {"lookup_complete": True}},
+    )
+
+    headers = ["Track Name", "Folder", "Genre", "Subgenre", "BPM", "Key", "Artist", "Title", "Fmt", "MB", "Link", "Status", "Conf", "Date", "Drive ID", "Notes"]
+    sheet_rows = [
+        ["Headhunterz - Reignite.flac", "Unsorted", "Unclassified", "Needs Review", "", "", "", "", "FLAC", "20", "", "PENDING", "", "", "fid_elig_1", ""],
+        ["PEYGAN - RELOAD.flac", "Unsorted", "Unclassified", "Needs Review", "", "", "", "", "FLAC", "20", "", "PENDING", "", "", "fid_hdrr_low", ""],
+        ["Wildstylez - Timeless.flac", "Hardstyle", "Hardstyle", "Euphoric", "150", "8A", "", "", "FLAC", "20", "", "MOVED", "", "", "fid_locked_1", "Verified"],
+    ]
+    s_idx = validate_and_index_tracks_sheet(headers, sheet_rows)
+    raw_by_num = {2: sheet_rows[0], 3: sheet_rows[1], 4: sheet_rows[2]}
+
+    preview = build_tracks_write_preview(db, cfg, s_idx, raw_rows_by_num=raw_by_num)
+    assert preview["summary"]["eligible_row_updates"] == 1
+    assert preview["proposed_row_updates"][0]["file_id"] == "fid_elig_1"
+    assert preview["proposed_row_updates"][0]["field_changes"][0]["before"] == "Unclassified"
+    assert preview["proposed_row_updates"][0]["field_changes"][0]["after"] == "Hardstyle"
+    assert preview["proposed_row_updates"][0]["field_changes"][0]["confidence"] == "MEDIUM"
+
+    # Mock ControlledSheetsService in-memory to verify Artist_Rules sync, approval gate, drift abort, apply & rollback
+    class _InMemoryControlledSheets:
+        def __init__(self):
+            self.tabs = {"Tracks": [list(headers)] + [list(r) + [""] * 11 for r in sheet_rows]}
+
+        def get_spreadsheet_metadata(self, sid):
+            return {"sheets": [{"properties": {"title": k, "gridProperties": {"rowCount": 100, "columnCount": 27}}} for k in self.tabs]}
+
+        def ensure_tab_exists(self, sid, tab_name, rows=100, cols=18):
+            self.tabs.setdefault(tab_name, [])
+
+        def read_values(self, sid, rng):
+            tab, a1 = rng.split("!")
+            tab = tab.strip("'")
+            grid = self.tabs.get(tab, [])
+            import re as _re
+            m = _re.match(r"^[A-Z]+(\d+):[A-Z]+(\d+)$", a1)
+            if m:
+                r1, r2 = int(m.group(1)), int(m.group(2))
+                return [list(row) for row in grid[r1 - 1 : r2]]
+            return [list(row) for row in grid]
+
+        def write_values_raw(self, sid, rng, values):
+            tab = rng.split("!")[0].strip("'")
+            self.tabs[tab] = [list(r) for r in values]
+            return {}
+
+        def batch_write_values_raw(self, sid, data):
+            import re as _re
+            for entry in data:
+                tab, cell = entry["range"].split("!")
+                tab = tab.strip("'")
+                m = _re.match(r"^([A-Z]+)(\d+)$", cell)
+                col_s, r_num = m.group(1), int(m.group(2))
+                c_idx = 0
+                for ch in col_s:
+                    c_idx = c_idx * 26 + (ord(ch) - 64)
+                c_idx -= 1
+                while len(self.tabs[tab]) < r_num:
+                    self.tabs[tab].append([""] * 27)
+                while len(self.tabs[tab][r_num - 1]) <= c_idx:
+                    self.tabs[tab][r_num - 1].append("")
+                self.tabs[tab][r_num - 1][c_idx] = entry["values"][0][0]
+            return {}
+
+    mem_sh = _InMemoryControlledSheets()
+    ar_sync = sync_artist_rules_to_sheet(cfg, db, mem_sh)
+    assert ar_sync["tab_created"] is True and ar_sync["rules_written"] == 1
+    assert mem_sh.tabs["Artist_Rules"][1][0] == "AR-PEYGAN-001"
+    # Tracks untouched during Artist_Rules sync!
+    assert mem_sh.tabs["Tracks"][1][2] == "Unclassified"
+
+    # Approval gate: wrong SHA-256 MUST fail closed
+    with pytest.raises(RuntimeError, match="confirm-sha256"):
+        execute_approved_tracks_writes(cfg, db, mem_sh, preview, "bad_sha256")
+
+    # Apply with valid preview_sha256
+    app_res = execute_approved_tracks_writes(cfg, db, mem_sh, preview, preview["preview_sha256"])
+    assert app_res["rows_updated"] == 1
+    assert mem_sh.tabs["Tracks"][1][2] == "Hardstyle"
+    assert mem_sh.tabs["Tracks"][2][2] == "Unclassified"  # HDRR LOW untouched
+    assert mem_sh.tabs["Tracks"][3][2] == "Hardstyle" and mem_sh.tabs["Tracks"][3][3] == "Euphoric"  # Locked untouched
+
+    # Deterministic rollback restores exact 'Unclassified' cell
+    rb_res = rollback_sheets_manifest(cfg, db, mem_sh, app_res["manifest_id"])
+    assert rb_res["status"] == "rolled_back"
+    assert mem_sh.tabs["Tracks"][1][2] == "Unclassified"
