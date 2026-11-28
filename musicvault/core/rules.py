@@ -947,11 +947,30 @@ def planned_row(
             continue
 
         if level == "HIGH" or (level == "MEDIUM" and save_medium):
-            is_rule_override = field in set(effective_proposal.get("artist_rule_override_fields") or [])
-            open_only = manual_override or is_rule_override or _is_open_provenance_only(candidates, field, parent_genre=parent_g)
+            ov_set = set(effective_proposal.get("artist_rule_override_fields") or [])
+            is_rule_override = field in ov_set
+            implied_by_sub_override = (
+                field == "genre"
+                and "subgenre" in ov_set
+                and SUBGENRE_PARENT.get(str(effective_proposal.get("subgenre", ""))) == str(val)
+            )
+            open_only = (
+                manual_override
+                or is_rule_override
+                or implied_by_sub_override
+                or _is_open_provenance_only(candidates, field, parent_genre=parent_g)
+            )
             if not provider_terms_cleared and not open_only:
                 decisions[field] = "TERMS_HOLD"
                 reasons.append(f"{field}: provider retention not cleared")
+                continue
+            if (
+                field == "subgenre"
+                and not manual_override
+                and (not out[COL["genre"]].strip() or is_genre_placeholder(out[COL["genre"]].strip()))
+            ):
+                decisions[field] = "TERMS_HOLD" if decisions.get("genre") == "TERMS_HOLD" else "REVIEW"
+                reasons.append("subgenre: deferred because parent genre remains held")
                 continue
 
             display_val = format_display_bpm(val) if field == "bpm" else str(val)

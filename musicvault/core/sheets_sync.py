@@ -62,7 +62,11 @@ def _disabled_provider_families(config: Config) -> Set[str]:
     return out
 
 
-def _compute_preview_sha256(spreadsheet_id: str, row_updates: List[Dict[str, Any]]) -> str:
+def _compute_preview_sha256(
+    spreadsheet_id: str,
+    row_updates: List[Dict[str, Any]],
+    header_writes: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     canonical_items = [
         {
             "row_num": item["row_num"],
@@ -71,8 +75,12 @@ def _compute_preview_sha256(spreadsheet_id: str, row_updates: List[Dict[str, Any
         }
         for item in sorted(row_updates, key=lambda x: int(x["row_num"]))
     ]
+    canonical_headers = [
+        {"range": hw["range"], "before": hw["before"], "after": hw["after"]}
+        for hw in sorted(header_writes or [], key=lambda x: int(x["col_index_0"]))
+    ]
     blob = json.dumps(
-        {"spreadsheet_id": spreadsheet_id, "updates": canonical_items},
+        {"spreadsheet_id": spreadsheet_id, "headers": canonical_headers, "updates": canonical_items},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -280,7 +288,7 @@ def build_tracks_write_preview(
                             "track_name": tr.name,
                             "field": f_name,
                             "existing_preserved": canon_row[COL[f_name]].strip(),
-                            "unwritten_candidate_value": prop_v or proposal.get("subgenre_hint", ""),
+                            "unwritten_candidate_value": prop_v or (proposal.get("subgenre_hint", "") if f_name == "subgenre" else ""),
                             "hdrr_raw_genres": proposal.get("hdrr_raw_genres", []),
                             "confidence": lvl_l,
                             "reason": rsn_l,
@@ -379,7 +387,7 @@ def build_tracks_write_preview(
         for r in all_configured_rules
         if r.approval_status == "approved"
     ]
-    preview_sha = _compute_preview_sha256(config.sheet_id, proposed_row_updates)
+    preview_sha = _compute_preview_sha256(config.sheet_id, proposed_row_updates, header_writes)
 
     return {
         "schema_valid": True,
@@ -514,7 +522,8 @@ def execute_approved_tracks_writes(
         raise RuntimeError("Refusing live Tracks write: preview spreadsheet_id does not match configured SHEET_ID.")
 
     row_updates = list(preview_payload.get("proposed_row_updates") or [])
-    recomputed_sha = _compute_preview_sha256(spreadsheet_id, row_updates)
+    header_writes = list(preview_payload.get("header_writes") or [])
+    recomputed_sha = _compute_preview_sha256(spreadsheet_id, row_updates, header_writes)
     if recomputed_sha != expected_sha:
         raise RuntimeError("Refusing live Tracks write: preview payload failed integrity SHA-256 verification.")
 
@@ -525,7 +534,6 @@ def execute_approved_tracks_writes(
     live_before_rows: List[Dict[str, Any]] = []
     batch_data: List[Dict[str, Any]] = []
 
-    header_writes = list(preview_payload.get("header_writes") or [])
     if header_writes:
         live_h1 = controlled_sheets.read_values(spreadsheet_id, "Tracks!A1:AA1")
         h1_row = live_h1[0] if live_h1 else []

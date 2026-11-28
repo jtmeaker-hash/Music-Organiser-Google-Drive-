@@ -1066,3 +1066,15 @@ def test_controlled_sheets_writes_rejection_and_approval_gates(tmp_path, monkeyp
     rb_res = rollback_sheets_manifest(cfg, db, mem_sh, app_res["manifest_id"])
     assert rb_res["status"] == "rolled_back"
     assert mem_sh.tabs["Tracks"][1][2] == "Unclassified"
+
+    # Post-merge audit M-1 regression: subgenre MUST NOT populate an orphan cell when parent genre is TERMS_HOLD
+    mb_plus_dc = [
+        Candidate("MusicBrainz", "Infinity", ["Sefa", "D-Block & S-te-Fan"], duration=210.0, genre=["Hardcore", "Frenchcore"], verification="Duration supported", source_family="musicbrainz"),
+        Candidate("Discogs", "Infinity", ["Sefa", "D-Block & S-te-Fan"], duration=210.0, genre=["Hardcore"], verification="Duration supported", source_family="discogs"),
+    ]
+    prop_inf = build_track_proposal(TrackMetadata(artist="Sefa, D-Block & S-te-Fan", title="Infinity", duration=210.0), mb_plus_dc)
+    row_inf = ["Infinity.wav", "Unsorted", "Unclassified", "Needs Review", "", "", "", "", "WAV", "30", "", "PENDING", "", "", "fid_inf", ""]
+    out_inf, dec_inf, chg_inf = planned_row(mb_plus_dc, prop_inf, row_inf, provider_terms_cleared=False)
+    assert dec_inf["genre"] == "TERMS_HOLD"
+    assert dec_inf["subgenre"] == "TERMS_HOLD"
+    assert chg_inf == []
