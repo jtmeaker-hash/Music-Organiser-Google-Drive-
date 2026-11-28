@@ -133,6 +133,9 @@ class Track:
     research_next_retry_utc: str = ""
     research_error: str = ""
     provider_calls_json: str = "{}"
+    research_incomplete: bool = False
+    research_deferrals: int = 0
+    location_ambiguous: bool = False
 
 
 @dataclass
@@ -153,6 +156,12 @@ class Candidate:
     is_stale: bool = False
     match_confidence: str = ""
     source_family: str = ""
+    created_utc: str = ""
+    updated_utc: str = ""
+    raw_source_genre: List[str] = field(default_factory=list)
+    release_year: Optional[int] = None
+    genre_evidence_kind: str = ""
+    source_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

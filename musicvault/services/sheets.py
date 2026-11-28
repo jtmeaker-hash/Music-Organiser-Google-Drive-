@@ -11,8 +11,17 @@ from typing import Any, Dict, List, Optional, Tuple
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+from .read_only import controlled_sheets_request, read_only_request
+
+from ..core.artist_rules import (
+    ARTIST_RULES_HEADERS,
+    ARTIST_RULES_TAB_NAME,
+    ArtistRule,
+    artist_rule_to_sheet_row,
+    parse_artist_rules_sheet,
+)
 from ..core.matcher import norm
-from ..core.rules import COL, EXTRA_HEADERS, FIELDS, parse_lock_states
+from ..core.rules import EXTRA_HEADERS
 
 _VALID_DRIVE_ID_HEADERS = {
     "id", "fileid", "driveid", "drivefileid", "googledriveid", "googlefileid", "trackid",
@@ -20,7 +29,7 @@ _VALID_DRIVE_ID_HEADERS = {
 _EXPECTED_FIELD_HEADER_ALIASES = {
     2: {"genre", "parentgenre", "primarygenre"},
     3: {"subgenre", "subgenres", "secondarygenre", "style"},
-    4: {"bpm", "tempo"},
+    4: {"bpm", "tempo", "bpmfull"},
     5: {"key", "camelot", "camelotkey", "musicalkey", "initialkey"},
 }
 _DRIVE_ID_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{10,80}$")
@@ -38,85 +47,69 @@ class VerifiedSheetIndex:
     verified_identities: Dict[str, Tuple[str, str]] = field(default_factory=dict)
     total_data_rows: int = 0
     drive_id_col: int = 14
+    columns: Dict[int, int] = field(default_factory=dict)
+
+
+def resolve_tracks_headers(header_row: List[Any]) -> VerifiedSheetIndex:
+    """Map explicit aliases to the canonical review layout used by the rules engine."""
+    headers = [str(value or "").strip() for value in header_row]
+    padded = headers + [""] * max(0, 27 - len(headers))
+    if not any(headers):
+        return VerifiedSheetIndex(False, "INCOMPATIBLE_HEADERS: missing Tracks header")
+    for i, expected in enumerate(EXTRA_HEADERS, 16):
+        if padded[i] and padded[i] != expected:
+            return VerifiedSheetIndex(False, f"INCOMPATIBLE_REVIEW_HEADERS: column {i + 1}", headers)
+    normalized = [norm(header) for header in padded]
+    columns = {}
+    aliases = {
+        **_EXPECTED_FIELD_HEADER_ALIASES,
+        14: _VALID_DRIVE_ID_HEADERS,
+        0: {"title", "tracktitle", "songtitle"},
+        1: {"artist", "artists", "primaryartist"},
+        11: {"processingstatus", "status"},
+        12: {"analysisconfidence", "confidence"},
+        15: {"notesoverride", "notes", "override", "manualoverride"},
+    }
+    for canonical, accepted in aliases.items():
+        matches = [i for i, label in enumerate(normalized) if label in accepted and not 16 <= i <= 26]
+        if len(matches) > 1:
+            return VerifiedSheetIndex(False, f"INCOMPATIBLE_HEADERS: ambiguous aliases for field {canonical}", headers)
+        if matches:
+            columns[canonical] = matches[0]
+        elif canonical in (2, 3, 4, 5, 14):
+            if normalized[canonical]:
+                return VerifiedSheetIndex(False, f"INCOMPATIBLE_HEADERS: missing field at column {canonical + 1}", headers)
+            columns[canonical] = canonical
+    if len(set(columns.values())) != len(columns):
+        return VerifiedSheetIndex(False, "INCOMPATIBLE_HEADERS: overlapping field mappings", headers)
+    return VerifiedSheetIndex(True, headers=headers, drive_id_col=columns[14], columns=columns)
+
+
+def normalize_tracks_row(raw, index):
+    original = [str(cell) if cell is not None else "" for cell in raw]
+    padded = original + [""] * max(0, 27 - len(original))
+    canonical = padded[:27]
+    for opt_slot in (0, 1, 11, 12, 15):
+        if opt_slot not in index.columns and opt_slot < len(index.headers) and index.headers[opt_slot].strip():
+            canonical[opt_slot] = ""
+    for dest, source in index.columns.items():
+        canonical[dest] = padded[source] if source < len(padded) else ""
+    return canonical
 
 
 def validate_and_index_tracks_sheet(
     header_row: List[Any], data_rows: List[List[Any]]
 ) -> VerifiedSheetIndex:
-    """
-    Validate real Tracks!A1:AA1 headers and index Tracks!A2:AA rows by exact Drive file ID.
-    Detects incompatible headers, missing IDs, and duplicate Drive IDs without guessing rows.
-    """
-    headers = [str(x or "").strip() for x in (header_row or [])]
-    if not any(headers):
-        return VerifiedSheetIndex(
-            schema_valid=False,
-            schema_error="INCOMPATIBLE_HEADERS: Tracks!A1:AA1 header row is empty or missing",
-            headers=headers,
-        )
-
-    padded_headers = headers + [""] * max(0, 27 - len(headers))
-
-    # 1. Verify Drive File ID column at index 14 (Col O) vs all columns A:P
-    explicit_id_cols = [
-        idx for idx, h in enumerate(padded_headers[:16])
-        if norm(h) in ("driveid", "fileid", "drivefileid", "googledriveid")
-    ]
-    if explicit_id_cols and 14 not in explicit_id_cols:
-        return VerifiedSheetIndex(
-            schema_valid=False,
-            schema_error=f"INCOMPATIBLE_HEADERS: Drive ID header found at column index {explicit_id_cols[0]}, expected index 14 (Col O)",
-            headers=headers,
-        )
-
-    col_o_norm = norm(padded_headers[14])
-    if col_o_norm and col_o_norm not in _VALID_DRIVE_ID_HEADERS:
-        return VerifiedSheetIndex(
-            schema_valid=False,
-            schema_error=f"INCOMPATIBLE_HEADERS: Column O (index 14) header is '{padded_headers[14]}', expected Drive ID",
-            headers=headers,
-        )
-    if not col_o_norm:
-        # Legacy blank O1 header allowed ONLY if populated O2:O cells look like Drive file IDs
-        sample_o = [str(r[14]).strip() for r in data_rows if len(r) > 14 and str(r[14] or "").strip()][:10]
-        if sample_o and not all(_DRIVE_ID_TOKEN_RE.match(v) for v in sample_o):
-            return VerifiedSheetIndex(
-                schema_valid=False,
-                schema_error="INCOMPATIBLE_HEADERS: Column O header is blank and values do not match Drive file ID format",
-                headers=headers,
-            )
-
-    # 2. Verify core metadata headers C1:F1 (indices 2..5) when non-empty
-    for col_idx, allowed in _EXPECTED_FIELD_HEADER_ALIASES.items():
-        h_norm = norm(padded_headers[col_idx])
-        if h_norm and h_norm not in allowed:
-            return VerifiedSheetIndex(
-                schema_valid=False,
-                schema_error=f"INCOMPATIBLE_HEADERS: Column index {col_idx} header '{padded_headers[col_idx]}' conflicts with expected schema",
-                headers=headers,
-            )
-
-    # 3. Verify review columns Q1:AA1 (indices 16..26) are empty or match EXTRA_HEADERS
-    for offset, expected_h in enumerate(EXTRA_HEADERS):
-        actual_h = padded_headers[16 + offset]
-        if actual_h and actual_h != expected_h:
-            return VerifiedSheetIndex(
-                schema_valid=False,
-                schema_error=f"INCOMPATIBLE_REVIEW_HEADERS: Column index {16 + offset} has '{actual_h}', expected '{expected_h}'",
-                headers=headers,
-            )
-
-    # 4. Detect optional explicitly labeled Artist and Title columns in A1:P1
-    artist_col: Optional[int] = None
-    title_col: Optional[int] = None
-    for idx in range(16):
-        if idx in (2, 3, 4, 5, 14):
-            continue
-        hn = norm(padded_headers[idx])
-        if hn in ("artist", "artists", "primaryartist") and artist_col is None:
-            artist_col = idx
-        elif hn in ("title", "tracktitle", "songtitle") and title_col is None:
-            title_col = idx
+    """Validate the Tracks layout and index exact IDs, excluding ambiguous rows."""
+    index = resolve_tracks_headers(header_row)
+    if not index.schema_valid:
+        return index
+    drive_col, headers = index.drive_id_col, index.headers
+    if drive_col >= len(headers) or not headers[drive_col]:
+        sample = [str(r[drive_col]).strip() for r in data_rows
+                  if len(r) > drive_col and str(r[drive_col] or "").strip()][:10]
+        if sample and not all(_DRIVE_ID_TOKEN_RE.fullmatch(value) for value in sample):
+            return VerifiedSheetIndex(False, "INCOMPATIBLE_HEADERS: invalid legacy Drive IDs", headers)
 
     # 5. Index rows starting at real sheet row 2 (never using fake row 999)
     seen_rows: Dict[str, List[Tuple[int, List[str]]]] = {}
@@ -127,11 +120,11 @@ def validate_and_index_tracks_sheet(
         str_row = [str(cell) if cell is not None else "" for cell in raw_r]
         if not any(c.strip() for c in str_row):
             continue
-        fid = str_row[14].strip() if len(str_row) > 14 else ""
+        fid = str_row[drive_col].strip() if len(str_row) > drive_col else ""
         if not fid:
             missing_id_rows.append(row_num)
             continue
-        padded_r = (str_row + [""] * max(0, 27 - len(str_row)))[:27]
+        padded_r = normalize_tracks_row(str_row, index)
         seen_rows.setdefault(fid, []).append((row_num, padded_r))
 
     unique_by_id: Dict[str, Tuple[int, List[str]]] = {}
@@ -144,9 +137,9 @@ def validate_and_index_tracks_sheet(
         else:
             r_num, r_vals = entries[0]
             unique_by_id[fid] = (r_num, r_vals)
-            if artist_col is not None and title_col is not None:
-                s_art = r_vals[artist_col].strip()
-                s_tit = r_vals[title_col].strip()
+            if 1 in index.columns and 0 in index.columns:
+                s_art = r_vals[1].strip()
+                s_tit = r_vals[0].strip()
                 if s_art and s_tit:
                     verified_identities[fid] = (s_art, s_tit)
 
@@ -158,21 +151,31 @@ def validate_and_index_tracks_sheet(
         missing_id_rows=missing_id_rows,
         verified_identities=verified_identities,
         total_data_rows=len(data_rows),
+        drive_id_col=drive_col, columns=index.columns,
     )
+
+
+def _col_letter(index_1_based: int) -> str:
+    result = ""
+    idx = max(1, int(index_1_based))
+    while idx:
+        idx, rem = divmod(idx - 1, 26)
+        result = chr(65 + rem) + result
+    return result
 
 
 class SheetsService:
     """Wrapper around Google Sheets v4 API."""
 
     def __init__(self, credentials: Credentials):
-        self.service = build("sheets", "v4", credentials=credentials)
+        self.service = build("sheets", "v4", credentials=credentials, requestBuilder=read_only_request)
 
-    def fetch_header_row(self, spreadsheet_id: str, range_name: str = "Tracks!A1:AA1") -> List[Any]:
-        """Fetch header row A1:AA1 from master spreadsheet (read-only)."""
+    def fetch_header_row(self, spreadsheet_id: str, range_name: str = "Tracks!1:1") -> List[Any]:
+        """Fetch header row from master spreadsheet (read-only)."""
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=range_name,
-        ).execute()
+        ).execute(num_retries=3)
         vals = resp.get("values", [[]])
         return vals[0] if vals else []
 
@@ -181,13 +184,30 @@ class SheetsService:
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=range_name,
-        ).execute()
+        ).execute(num_retries=3)
         return resp.get("values", [])
+
+    def iter_tracks_rows(self, spreadsheet_id: str, last_column: str, batch_size: int = 1000):
+        """Yield bounded pages using the declared grid bounds, including gaps."""
+        metadata = self.service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(title,gridProperties(rowCount)))",
+        ).execute(num_retries=3)
+        tracks = next((s["properties"] for s in metadata.get("sheets", [])
+                       if s.get("properties", {}).get("title") == "Tracks"), None)
+        if not tracks:
+            raise ValueError("Tracks sheet is missing.")
+        last_row = int(tracks["gridProperties"]["rowCount"])
+        for start in range(2, last_row + 1, batch_size):
+            end = min(last_row, start + batch_size - 1)
+            rows = self.fetch_master_rows(spreadsheet_id, f"Tracks!A{start}:{last_column}{end}")
+            yield from enumerate(rows, start)
 
     def load_verified_index(self, spreadsheet_id: str) -> VerifiedSheetIndex:
         """Fetch headers + rows (read-only) and validate schema, duplicate IDs, and missing IDs."""
-        header_row = self.fetch_header_row(spreadsheet_id)
-        data_rows = self.fetch_master_rows(spreadsheet_id)
+        header_row = self.fetch_header_row(spreadsheet_id, "Tracks!1:1")
+        last_col = _col_letter(max(27, len(header_row)))
+        data_rows = self.fetch_master_rows(spreadsheet_id, f"Tracks!A2:{last_col}")
         return validate_and_index_tracks_sheet(header_row, data_rows)
 
     def fetch_row(self, spreadsheet_id: str, row_num: int) -> List[Any]:
@@ -195,7 +215,7 @@ class SheetsService:
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=f"Tracks!A{row_num}:AA{row_num}",
-        ).execute()
+        ).execute(num_retries=3)
         vals = resp.get("values", [[]])
         return vals[0] if vals else []
 
@@ -204,7 +224,7 @@ class SheetsService:
         resp = self.service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range="Tracks!Q1:AA1",
-        ).execute()
+        ).execute(num_retries=3)
         header = resp.get("values", [[]])[0]
         header = header + [""] * (len(EXTRA_HEADERS) - len(header))
         return not any(v and v != expected for v, expected in zip(header, EXTRA_HEADERS))
@@ -228,72 +248,101 @@ class SheetsService:
             json.dump(data, f, indent=2)
         return backup_path
 
+    def load_artist_rules_tab(
+        self, spreadsheet_id: str, tab_name: str = ARTIST_RULES_TAB_NAME
+    ) -> Tuple[List[ArtistRule], List[str]]:
+        """
+        Read-only fetch of the optional `Artist_Rules` tab from Google Sheets.
+        Returns `([], [])` cleanly if the `Artist_Rules` tab has not been created yet.
+        """
+        metadata = self.service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(title))",
+        ).execute(num_retries=3)
+        titles = {
+            s.get("properties", {}).get("title", "")
+            for s in metadata.get("sheets", [])
+        }
+        if tab_name not in titles:
+            return [], []
+        header_row = self.fetch_header_row(spreadsheet_id, f"'{tab_name}'!1:1")
+        last_col = _col_letter(max(len(ARTIST_RULES_HEADERS), len(header_row)))
+        data_rows = self.fetch_master_rows(spreadsheet_id, f"'{tab_name}'!A2:{last_col}")
+        return parse_artist_rules_sheet(header_row, data_rows)
+
+    @staticmethod
+    def build_artist_rules_tab_payload(rules: List[ArtistRule]) -> List[List[str]]:
+        """Build complete 2D sheet grid (`header + rows`) for staging/exporting the `Artist_Rules` tab."""
+        return [list(ARTIST_RULES_HEADERS)] + [artist_rule_to_sheet_row(r) for r in rules]
+
     def apply_batch_updates(
         self,
         spreadsheet_id: str,
         updates: List[Tuple[int, List[Any], List[Any]]],
         allow_live_writes: bool = False,
     ) -> int:
-        """
-        Future audited batch writer (DISABLED in Music Vault v2.0.1 read-only corrective build).
+        raise RuntimeError("Live Google Sheets writes are disabled in MusicVault.")
 
-        Residual Google Sheets v4 limitation documented for future write reviews:
-        - Pre-write row re-fetch followed by `values.batchUpdate` is NOT atomic across concurrent
-          spreadsheet editors (a narrow TOCTOU window exists).
-        - Fails closed if `allow_live_writes` is False, headers mismatch, lock JSON is malformed,
-          a locked field is touched, or concurrent edits occurred.
-        """
-        if not allow_live_writes:
-            raise RuntimeError(
-                "Live Google Sheets writes are disabled in Music Vault v2.0.1 (read-only corrective build)."
-            )
 
-        if not self.verify_headers(spreadsheet_id):
-            raise RuntimeError("Headers in Q1:AA1 do not match expected review schema.")
+class ControlledSheetsService:
+    """
+    Explicitly opted-in Google Sheets v4 client for controlled writes to `Artist_Rules` and
+    preview-approved `Tracks` cells ONLY (`valueInputOption='RAW'`).
+    Physical Google Drive operations remain 100% blocked via `read_only_request` on `DriveService`.
+    """
 
-        for row_num, old_vals, _ in updates:
-            _, old_lock_err = parse_lock_states(old_vals)
-            if old_lock_err:
-                raise RuntimeError(f"Malformed lock JSON at row {row_num}; refusing write (fail-closed).")
-            current = self.fetch_row(spreadsheet_id, row_num)
-            curr_states, curr_lock_err = parse_lock_states(current)
-            if curr_lock_err:
-                raise RuntimeError(f"Malformed current lock JSON at row {row_num}; refusing write (fail-closed).")
-            curr_padded = [str(x) if x is not None else "" for x in (list(current) + [""] * 27)[:27]]
-            old_padded = [str(x) if x is not None else "" for x in (list(old_vals) + [""] * 27)[:27]]
-            if curr_padded != old_padded:
-                raise RuntimeError(f"Concurrent sheet edit detected at row {row_num}; aborting write.")
+    def __init__(self, credentials: Credentials):
+        self.service = build("sheets", "v4", credentials=credentials, requestBuilder=controlled_sheets_request)
 
-        requests_to_send = [{"range": "Tracks!Q1:AA1", "values": [EXTRA_HEADERS]}]
-        col_letters = {2: "C", 3: "D", 4: "E", 5: "F"}
+    def get_spreadsheet_metadata(self, spreadsheet_id: str) -> Dict[str, Any]:
+        return self.service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="properties(title),sheets(properties(sheetId,title,index,gridProperties(rowCount,columnCount)))",
+        ).execute(num_retries=3)
 
-        for row_num, old_vals, new_vals in updates:
-            old_padded = [str(x) if x is not None else "" for x in (list(old_vals) + [""] * 27)[:27]]
-            new_padded = [str(x) if x is not None else "" for x in (list(new_vals) + [""] * 27)[:27]]
-            states, _ = parse_lock_states(old_padded)
+    def read_values(self, spreadsheet_id: str, range_name: str) -> List[List[Any]]:
+        resp = self.service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+        ).execute(num_retries=3)
+        return resp.get("values", [])
 
-            for field_name in FIELDS:
-                col_idx = COL[field_name]
-                f_state = states.get(field_name, {}).get("state", "")
-                if f_state in ("HIGH_LOCKED", "USER_LOCKED"):
-                    continue
-                if not old_padded[col_idx] and new_padded[col_idx]:
-                    col_letter = col_letters[col_idx]
-                    requests_to_send.append(
-                        {"range": f"Tracks!{col_letter}{row_num}", "values": [[new_padded[col_idx]]]}
-                    )
+    def ensure_tab_exists(self, spreadsheet_id: str, tab_name: str, rows: int = 100, cols: int = 18) -> None:
+        meta = self.get_spreadsheet_metadata(spreadsheet_id)
+        titles = {s.get("properties", {}).get("title", "") for s in meta.get("sheets", [])}
+        if tab_name in titles:
+            return
+        self.service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "addSheet": {
+                            "properties": {
+                                "title": tab_name,
+                                "gridProperties": {
+                                    "rowCount": max(20, int(rows)),
+                                    "columnCount": max(18, int(cols)),
+                                },
+                            }
+                        }
+                    }
+                ]
+            },
+        ).execute(num_retries=3)
 
-            # Write non-empty review cells individually or preserve existing Q:AA values rather than clearing
-            merged_review = [
-                new_padded[i] if new_padded[i] != "" else old_padded[i]
-                for i in range(16, 27)
-            ]
-            requests_to_send.append({"range": f"Tracks!Q{row_num}:AA{row_num}", "values": [merged_review]})
+    def write_values_raw(self, spreadsheet_id: str, range_name: str, values: List[List[Any]]) -> Dict[str, Any]:
+        return self.service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueInputOption="RAW",
+            body={"values": values},
+        ).execute(num_retries=3)
 
-        if requests_to_send:
-            self.service.spreadsheets().values().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body={"valueInputOption": "RAW", "data": requests_to_send},
-            ).execute()
-
-        return len(requests_to_send)
+    def batch_write_values_raw(self, spreadsheet_id: str, data: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not data:
+            return {}
+        return self.service.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"valueInputOption": "RAW", "data": data},
+        ).execute(num_retries=3)

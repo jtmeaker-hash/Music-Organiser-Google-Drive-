@@ -1,31 +1,44 @@
 """
-Package CLI entrypoint for Music Vault Manager v2.0.1.
+Package CLI entrypoint for Music Vault Manager v2.0.4.
 """
 import argparse
 import sys
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from typing import List, Optional
 
 from . import __version__
 from .cli.commands import (
+    run_artist_rules,
     run_backup,
     run_benchmark,
     run_hydrate,
     run_preview,
+    run_recover_research,
     run_research,
     run_scan,
+    run_sheets_sync,
     run_status,
 )
 from .cli.menu import main_menu
 from .cli.wizard import run_setup_wizard
+from .auth import GoogleAuthManager
 from .config import Config
-from .db import Database, DatabaseMigrationError
+from .core.process import run_process, snapshot_database
+from .core.coverage import library_report
+from .core.provider_policy import CAPABILITIES, ProviderPolicy
+from .providers.base import canonical_provider_family
+from .services.drive import DriveService
+from .services.sheets import SheetsService
+from .cli.formatting import export_safe_csv, export_safe_json
+from .db import Database, DatabaseMigrationError, SCHEMA_VERSION
+from .db_lock import database_lock
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="musicvault",
-        description="Music Vault Manager v2.0.1: Read-Only Audio Library Metadata & Organisation Preview Tool",
+        description="Music Vault Manager v2.0.4: Read-Only Audio Library Metadata & Organisation Preview Tool",
     )
     parser.add_argument("--version", action="version", version=f"musicvault {__version__}")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -40,6 +53,14 @@ def build_parser() -> argparse.ArgumentParser:
     bk_p = subparsers.add_parser("backup", help="Create a verified timestamped SQLite online database backup")
     bk_p.add_argument("--label", type=str, default="manual", help="Short label included in backup filename")
 
+    migration = subparsers.add_parser("migrate", help="Back up and migrate the local database")
+    migration.add_argument("--confirm-stopped", required=True, action="store_true",
+                           help="Confirm older MusicVault processes are stopped")
+
+    reset = subparsers.add_parser("clear-quota", help="Clear an unknown quota block after verifying the reset")
+    reset.add_argument("provider", choices=sorted(CAPABILITIES))
+    reset.add_argument("--confirm-reset", required=True, action="store_true")
+
     # scan
     sc_p = subparsers.add_parser("scan", help="Scan Google Drive source folder metadata inventory (read-only)")
     sc_p.add_argument("--hydrate", action="store_true", help="Run bounded metadata hydration after scan")
@@ -47,6 +68,21 @@ def build_parser() -> argparse.ArgumentParser:
     sc_p.add_argument("--max-mib", type=float, default=32.0, help="Byte budget in MiB when --hydrate is enabled (default: 32)")
     sc_p.add_argument("--allow-full-download", action="store_true", help="Explicitly opt in to bounded temp file download on Range fallback")
     sc_p.add_argument("--verbose", action="store_true", help="Show full Drive IDs")
+
+    process = subparsers.add_parser("process", help="Run the resumable read-only library pipeline")
+    process.add_argument("--scope", choices=("source", "destination", "all"), default="all")
+    process.add_argument("--limit", type=int, default=0)
+    process.add_argument("--batch-size", type=int, default=10)
+    process.add_argument("--cooldown", type=float, default=0)
+    process.add_argument("--concurrency", type=int, choices=range(1, 5), default=1)
+    process.add_argument("--resume", action="store_true")
+    process.add_argument("--inventory-only", action="store_true")
+    process.add_argument("--dry-run", action="store_true")
+    process.add_argument("--file-id", action="append", default=[])
+    process.add_argument("--provider", default="", help="Resume enrichment for one provider family")
+    process.add_argument("--verbose", action="store_true", help="Include full file IDs in local exports")
+    process.add_argument("--export-json", default="")
+    process.add_argument("--export-csv", default="")
 
     # hydrate
     hy_p = subparsers.add_parser("hydrate", help="Hydrate audio tags & duration via bounded HTTP Range reads")
@@ -70,6 +106,19 @@ def build_parser() -> argparse.ArgumentParser:
     rs_p.add_argument("--export-json", type=str, default="", help="Export research summary to JSON")
     rs_p.add_argument("--export-csv", type=str, default="", help="Export research status table to safe CSV")
 
+    # recover-research (dry-run default; requires --apply + verified backup to mutate)
+    rc_p = subparsers.add_parser(
+        "recover-research",
+        help="Preview (dry-run) or selectively re-queue tracks with incomplete/failed provider research audits",
+    )
+    rc_p.add_argument("--apply", action="store_true", help="Transactionally apply selective recovery (requires verified backup)")
+    rc_p.add_argument("--create-backup", action="store_true", help="Create and verify a fresh SQLite backup before --apply")
+    rc_p.add_argument("--backup-file", type=str, default="", help="Path to an existing verified SQLite backup file for --apply")
+    rc_p.add_argument("--wide", action="store_true", help="Force wide horizontal table output")
+    rc_p.add_argument("--verbose", action="store_true", help="Show full Drive file IDs")
+    rc_p.add_argument("--export-json", type=str, default="", help="Export recovery audit report to UTF-8 JSON")
+    rc_p.add_argument("--export-csv", type=str, default="", help="Export recovery audit rows to formula-safe UTF-8 CSV")
+
     # preview
     pv_p = subparsers.add_parser("preview", help="Run read-only live Google Sheets & Drive organisation preview")
     pv_p.add_argument("--limit", type=int, default=25, help="Maximum live tracks to preview (0 for all; default: 25)")
@@ -86,6 +135,33 @@ def build_parser() -> argparse.ArgumentParser:
     bm_p.add_argument("--wide", action="store_true", help="Force wide horizontal table output")
     bm_p.add_argument("--verbose", action="store_true", help="Show full Drive file IDs")
 
+    # artist-rules
+    ar_p = subparsers.add_parser(
+        "artist-rules",
+        help="Inspect configurable Artist_Rules, export Artist_Rules sheet CSV, or review learned rule suggestions",
+    )
+    ar_p.add_argument("--learn", action="store_true", help="Scan verified corrections to generate pending_approval rule suggestions")
+    ar_p.add_argument("--approve", type=str, default="", help="Explicitly approve a pending suggestion ID")
+    ar_p.add_argument("--reject", type=str, default="", help="Reject a suggestion ID while retaining it for manual review")
+    ar_p.add_argument("--reason", type=str, default="", help="Optional rationale for suggestion approval/rejection")
+    ar_p.add_argument("--sheet-snapshot", type=str, default="", help="Optional read-only Tracks JSON snapshot for offline learning")
+    ar_p.add_argument("--export-sheet-csv", type=str, default="", help="Export 18-column Artist_Rules Google Sheets tab CSV")
+    ar_p.add_argument("--export-json", type=str, default="", help="Export rules, suggestions, and audit log to UTF-8 JSON")
+
+    # sheets-sync (controlled Google Sheets preview, Artist_Rules sync, approval-gated Tracks write, rollback)
+    ss_p = subparsers.add_parser(
+        "sheets-sync",
+        help="Generate before/after Sheets write preview, sync approved Artist_Rules tab, or execute approved Tracks updates",
+    )
+    ss_p.add_argument("--export-json", type=str, default="", help="Export complete before-and-after write preview JSON")
+    ss_p.add_argument("--export-csv", type=str, default="", help="Export proposed Tracks field changes CSV")
+    ss_p.add_argument("--apply-artist-rules", action="store_true", help="Write approved Artist_Rules tab to Google Sheets (backed up)")
+    ss_p.add_argument("--apply-tracks", action="store_true", help="Execute live Tracks updates (requires --approved-preview and --confirm-sha256)")
+    ss_p.add_argument("--approved-preview", type=str, default="", help="Path to approved write-preview JSON file")
+    ss_p.add_argument("--confirm-sha256", type=str, default="", help="Explicit preview_sha256 confirmation required for --apply-tracks")
+    ss_p.add_argument("--rollback-manifest", type=str, default="", help="Restore pre-write Google Sheets cells from a saved rollback manifest ID")
+    ss_p.add_argument("--verbose", action="store_true", help="Show unmasked Drive IDs in console/exports")
+
     # setup
     subparsers.add_parser("setup", help="Run credential & Google OAuth setup wizard")
 
@@ -96,6 +172,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     """CLI entrypoint."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "process":
+        if args.limit < 0 or args.batch_size < 1 or not 0 <= args.cooldown < float("inf"):
+            parser.error("process requires a non-negative limit and cooldown and a positive batch size")
+        if args.provider and not args.resume:
+            parser.error("--provider requires --resume")
+        if args.dry_run and args.resume:
+            parser.error("--dry-run starts a disposable run")
     config = Config()
 
     if args.command == "setup":
@@ -103,14 +186,77 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     try:
-        db = Database(config.db_path)
-    except DatabaseMigrationError as exc:
-        sys.stderr.write(f"[✗] Database initialization/migration aborted safely: {config.redact(exc)}\n")
+        if args.command == "process" and args.dry_run:
+            with TemporaryDirectory(prefix="musicvault-dry-run-") as directory:
+                target = Path(directory) / "library.db"
+                snapshot_database(config.db_path, target)
+                return run_process_cli(args, config, Database(target))
+        with database_lock(config.db_path):
+            db = Database(config.db_path, initialize=False)
+            version = db.get_schema_version()
+            if version > SCHEMA_VERSION:
+                raise DatabaseMigrationError("Database schema is newer than this build.")
+            if version and version < SCHEMA_VERSION and args.command not in {"status", "backup", "migrate"}:
+                raise DatabaseMigrationError("Run musicvault migrate --confirm-stopped after shutting down old processes.")
+            if args.command == "status" and version == 1:
+                print("Schema 1 database. Back up and migrate after verifying shutdown.")
+                return 0
+            if not version or args.command == "migrate":
+                db = Database(config.db_path)
+            elif version == SCHEMA_VERSION and args.command not in {"status", "backup"}:
+                db._ensure_additive_v3_extensions()
+            if args.command == "migrate":
+                print(f"Local schema version {db.get_schema_version()}")
+                if db.last_backup_path:
+                    print(f"Verified backup: {db.last_backup_path}")
+                return 0
+            return dispatch(args, config, db)
+    except (DatabaseMigrationError, OSError, RuntimeError, ValueError) as exc:
+        sys.stderr.write(f"[✗] {config.redact(exc)}\n")
         return 2
+    except KeyboardInterrupt:
+        return 130
 
+
+def run_process_cli(args, config, db):
+    policy = None if args.inventory_only or args.dry_run else ProviderPolicy(config)
+    creds = GoogleAuthManager(config).get_credentials(
+        allow_interactive=not args.dry_run, persist_refresh=not args.dry_run,
+    )
+    if not creds:
+        print("Google authentication is required to read Drive inventory.")
+        return 2
+    drive = DriveService(creds)
+    preview = None if args.inventory_only else lambda conn, _run_id: library_report(
+        conn, db, config, args, SheetsService(creds), drive,
+    )
+    result = run_process(config, db, drive, args,
+                         drive_factory=lambda: DriveService(creds), policy=policy, preview=preview)
+    print(config.redact(result))
+    if args.export_json and "coverage" not in result:
+        export_safe_json(Path(args.export_json), result, config.known_secrets())
+    if args.export_csv and "coverage" not in result:
+        rows = [{"role": role, **info} for role, info in result["roots"].items()]
+        fields = list(dict.fromkeys(key for row in rows for key in row))
+        export_safe_csv(Path(args.export_csv), fields, rows, config.known_secrets())
+    return {"failed": 1, "interrupted": 130}.get(result["status"], 0)
+
+
+def dispatch(args: argparse.Namespace, config: Config, db: Database) -> int:
     try:
         if not args.command:
             main_menu(config, db)
+        elif args.command == "clear-quota":
+            family = canonical_provider_family(args.provider)
+            state = db.get_provider_operational_state(family) or {}
+            if state.get("last_status") != "quota_exceeded" or state.get("cooldown_until_utc"):
+                print("No unknown quota block to clear for this provider.")
+                return 1
+            requeued = db.clear_provider_quota_block(family)
+            print(f"Cleared the confirmed reset for {family} ({requeued} blocked track(s) re-opened).")
+            return 0
+        elif args.command == "process":
+            return run_process_cli(args, config, db)
         elif args.command == "status":
             run_status(
                 config,
@@ -159,6 +305,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 export_json=Path(args.export_json) if args.export_json else None,
                 export_csv=Path(args.export_csv) if args.export_csv else None,
             )
+        elif args.command == "recover-research":
+            rec_res = run_recover_research(
+                config,
+                db,
+                apply=args.apply,
+                create_backup=args.create_backup,
+                backup_file=Path(args.backup_file) if args.backup_file else None,
+                verbose=args.verbose,
+                wide=args.wide,
+                export_json=Path(args.export_json) if args.export_json else None,
+                export_csv=Path(args.export_csv) if args.export_csv else None,
+            )
+            return 1 if rec_res.get("mode") == "error" else 0
         elif args.command == "preview":
             run_preview(
                 config,
@@ -179,6 +338,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                 checkpoint_path=cp_path,
                 expected_rows_path=exp_path,
                 wide=args.wide,
+                verbose=args.verbose,
+            )
+        elif args.command == "artist-rules":
+            run_artist_rules(
+                config,
+                db,
+                learn=args.learn,
+                approve_id=args.approve,
+                reject_id=args.reject,
+                reason=args.reason,
+                sheet_snapshot=Path(args.sheet_snapshot) if args.sheet_snapshot else None,
+                export_sheet_csv=Path(args.export_sheet_csv) if args.export_sheet_csv else None,
+                export_json=Path(args.export_json) if args.export_json else None,
+            )
+        elif args.command == "sheets-sync":
+            run_sheets_sync(
+                config,
+                db,
+                export_json=Path(args.export_json) if args.export_json else None,
+                export_csv=Path(args.export_csv) if args.export_csv else None,
+                apply_artist_rules=args.apply_artist_rules,
+                apply_tracks=args.apply_tracks,
+                approved_preview_path=Path(args.approved_preview) if args.approved_preview else None,
+                confirm_sha256=args.confirm_sha256,
+                rollback_manifest_id=args.rollback_manifest,
                 verbose=args.verbose,
             )
     except KeyboardInterrupt:

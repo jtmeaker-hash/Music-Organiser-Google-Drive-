@@ -23,6 +23,7 @@ class DiscogsProvider(BaseProvider):
         db: Optional[Any] = None,
         provider_terms_cleared: bool = False,
         default_delay: float = 1.2,
+        **kwargs: Any,
     ):
         super().__init__(
             "Discogs",
@@ -31,9 +32,10 @@ class DiscogsProvider(BaseProvider):
             contact=contact,
             db=db,
             provider_terms_cleared=provider_terms_cleared,
+            **kwargs,
         )
         self.token = (token or "").strip() or None
-        self.register_secret(self.token)
+        self.register_secret(self.token, is_primary_credential=True)
 
     def verify_connectivity(self) -> ProviderCallOutcome:
         """Verify Discogs token authentication and response schema."""
@@ -82,16 +84,20 @@ class DiscogsProvider(BaseProvider):
             )
 
         candidates: List[Candidate] = []
+        incomplete_out: Optional[ProviderCallOutcome] = None
         for hit in results[:3]:
-            if not isinstance(hit, dict) or not self.can_request():
-                break
+            if not isinstance(hit, dict):
+                continue
             release_id = hit.get("id")
             if not release_id:
                 continue
 
             rel_url = f"https://api.discogs.com/releases/{release_id}"
-            rel_out = self.request_detailed(rel_url, headers=headers)
+            rel_out = self.request_detailed(rel_url, headers=headers, allow_404_as_empty=True)
             if rel_out.status != ProviderStatus.OK or not isinstance(rel_out.data, dict):
+                if rel_out.status != ProviderStatus.EMPTY:
+                    incomplete_out = rel_out
+                    break
                 continue
 
             rel_data = rel_out.data
@@ -127,6 +133,9 @@ class DiscogsProvider(BaseProvider):
                             source_family="discogs",
                         )
                     )
+
+        if incomplete_out is not None:
+            return candidates, incomplete_out
 
         if not candidates:
             outcome = ProviderCallOutcome(

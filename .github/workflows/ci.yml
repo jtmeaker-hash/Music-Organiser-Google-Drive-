@@ -4,10 +4,15 @@ on:
   push:
     branches:
       - feature/termux-modular-app
+      - feature/v2.0.3
+      - feature/v2.0.4
+      - "feature/**"
       - "fix/**"
   pull_request:
     branches:
+      - main
       - feature/termux-modular-app
+      - fix/v2.0.2
 
 permissions:
   contents: read
@@ -43,3 +48,4 @@ jobs:
           HOME="$TMP_CI_HOME" MUSICVAULT_CONFIG_DIR="$TMP_CI_HOME/.config/musicvault" pytest -v tests/
           HOME="$TMP_CI_HOME" MUSICVAULT_CONFIG_DIR="$TMP_CI_HOME/.config/musicvault" musicvault --help
           HOME="$TMP_CI_HOME" MUSICVAULT_CONFIG_DIR="$TMP_CI_HOME/.config/musicvault" musicvault status
+          HOME="$TMP_CI_HOME" MUSICVAULT_CONFIG_DIR="$TMP_CI_HOME/.config/musicvault" musicvault process --help

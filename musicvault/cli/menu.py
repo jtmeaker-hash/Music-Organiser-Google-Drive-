@@ -1,7 +1,7 @@
 """
-Responsive Interactive Terminal Interface for Music Vault Manager v2.0.1.
-Preserves options 1-6 workflow slots, adds bounded Hydrate, Local Status, and Backup,
-and enforces read-only cloud safety (no live Drive moves or Sheet writes in v2.0.1).
+Responsive Interactive Terminal Interface for Music Vault Manager v2.0.4.
+Preserves options 1-6 workflow slots, adds bounded Hydrate, Local Status, Backup, and Recovery Preview,
+and enforces read-only cloud safety (no live Drive moves or Sheet writes in v2.0.4).
 """
 from .. import __version__
 from ..config import Config
@@ -12,6 +12,7 @@ from .commands import (
     run_benchmark,
     run_hydrate,
     run_preview,
+    run_recover_research,
     run_research,
     run_scan,
     run_status,
@@ -37,12 +38,13 @@ def main_menu(config: Config, db: Database) -> None:
             print("=" * width)
             print(f"  Env:       {env_info.short_label()}")
             print(
-                f"  Inventory: {inv['live_source_tracks']} live | "
+                f"  Inventory: {inv['live_source_tracks']} source | "
+                f"{inv.get('destination_tracks', 0)} vault | "
                 f"{inv['live_ready_identity']} ready | "
                 f"{inv['quarantined_records']} quarantined"
             )
             print(f"  Providers: SonoVault:{sono_st} | AudioMeta:{am_st} | Discogs:{dc_st}")
-            print("  Safety:    DRY-RUN ENFORCED (Cloud writes disabled in v2.0.1)")
+            print(f"  Safety:    DRY-RUN ENFORCED (Cloud writes disabled in v{__version__})")
             print("-" * width)
             print("  1. Run 10-Track Control Benchmark (Isolated Fixture)")
             print("  2. Run 50-Track Benchmark Check (Isolated Fixture)")
@@ -53,10 +55,11 @@ def main_menu(config: Config, db: Database) -> None:
             print("  7. Hydrate Audio Metadata Tags (Bounded 10 / 32 MiB)")
             print("  8. View Local Status & Diagnostics (No Network)")
             print("  9. Create Verified SQLite Database Backup")
+            print("  R. Preview Selective Research Recovery (Dry-Run)")
             print("  0. Exit")
             print("=" * width)
 
-            choice = input("Select an option [0-9]: ").strip().lower()
+            choice = input("Select an option [0-9, R]: ").strip().lower()
 
             if choice == "1":
                 run_benchmark(config, db, sample_size=10)
@@ -85,12 +88,15 @@ def main_menu(config: Config, db: Database) -> None:
             elif choice in ("9", "b", "backup"):
                 run_backup(config, db, label="menu_manual")
                 input("\nPress ENTER to return to menu...")
+            elif choice in ("r", "recover", "recover-research"):
+                run_recover_research(config, db, apply=False)
+                input("\nPress ENTER to return to menu...")
             elif choice in ("0", "q", "exit"):
                 print("\nExiting Music Vault Manager. Goodbye!\n")
                 break
             else:
                 print(
-                    "[!] Invalid option. Enter 0-9 (note: live write/move toggles are unavailable in read-only v2.0.1)."
+                    f"[!] Invalid option. Enter 0-9 or R (note: live write/move toggles are unavailable in read-only v{__version__})."
                 )
         except (KeyboardInterrupt, EOFError):
             print("\n[i] Interrupted cleanly. Checkpoints preserved. Goodbye!\n")

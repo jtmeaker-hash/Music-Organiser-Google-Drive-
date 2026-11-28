@@ -6,13 +6,16 @@ import json
 import os
 import sqlite3
 import stat
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .core.matcher import extract_version_tokens, norm, parse_artists
 from .models import Candidate, Track, TrackMetadata
+from .providers.base import canonical_provider_family
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _AUDIO_EXTENSIONS = (
     ".mp3", ".wav", ".flac", ".aiff", ".aif",
@@ -28,8 +31,15 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _norm_utc(dt: Optional[datetime] = None) -> datetime:
+    d = dt or _utc_now()
+    if d.tzinfo is None:
+        return d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc)
+
+
 def _utc_iso(dt: Optional[datetime] = None) -> str:
-    return (dt or _utc_now()).isoformat()
+    return _norm_utc(dt).isoformat()
 
 
 def _has_audio_extension(name: str) -> bool:
@@ -74,6 +84,8 @@ _TRACKS_V2_COLUMNS: List[Tuple[str, str]] = [
     ("research_next_retry_utc", "TEXT DEFAULT ''"),
     ("research_error", "TEXT DEFAULT ''"),
     ("provider_calls_json", "TEXT DEFAULT '{}'"),
+    ("research_incomplete", "INTEGER DEFAULT 0"),
+    ("research_deferrals", "INTEGER DEFAULT 0"),
 ]
 
 _CANDIDATES_V2_COLUMNS: List[Tuple[str, str]] = [
@@ -81,17 +93,69 @@ _CANDIDATES_V2_COLUMNS: List[Tuple[str, str]] = [
     ("is_stale", "INTEGER DEFAULT 0"),
     ("match_confidence", "TEXT DEFAULT ''"),
     ("source_family", "TEXT DEFAULT ''"),
+    ("updated_utc", "TEXT DEFAULT ''"),
 ]
+
+_RECOVERABLE_PROVIDER_STATUSES = {
+    "rate_limited",
+    "cooldown_deferred",
+    "budget_exhausted",
+    "server_error",
+    "timeout",
+    "network_error",
+}
+
+_HARD_BLOCKED_PROVIDER_STATUSES = {
+    "auth_error",
+    "quota_exceeded",
+    "unsupported_endpoint",
+    "malformed_json",
+}
+
+
+def _candidate_verification_rank(verification: Optional[str]) -> int:
+    v = (verification or "").strip()
+    if v == "ISRC supported":
+        return 4
+    if v == "Duration supported":
+        return 3
+    if v == "Text only":
+        return 2
+    if v in ("Title-only review", "Review only (inferred)"):
+        return 1
+    return 0
+
+
+def _candidate_edition_identity(
+    provider: str,
+    source_family: str,
+    title: str,
+    artists: List[str],
+    url: Optional[str] = None,
+) -> Tuple[Any, ...]:
+    fam = canonical_provider_family(source_family or provider)
+    if fam == "wikidata":
+        return ("wikidata", (url or "").strip().lower() or norm(title))
+    base_t, ver_tokens, remixer = extract_version_tokens(title or "")
+    artists_tuple = tuple(sorted(set(parse_artists(", ".join(artists or [])))))
+    return (
+        fam,
+        base_t or norm(title),
+        tuple(sorted(ver_tokens)),
+        remixer,
+        artists_tuple,
+    )
 
 
 class Database:
     """Manages persistent SQLite operations, verified migrations, caching, and checkpoints."""
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, initialize: bool = True):
         self.db_path = Path(db_path)
         self.last_backup_path: Optional[Path] = None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_or_migrate()
+        if initialize:
+            self._init_or_migrate()
 
     def _get_connection(self, isolation_level: Optional[str] = "") -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0, isolation_level=isolation_level)
@@ -252,13 +316,213 @@ class Database:
                 return 1
             return 0
 
+    def _ensure_v3_tables(self, conn: sqlite3.Connection) -> None:
+        for statement in (
+            """CREATE TABLE IF NOT EXISTS root_membership (
+                role TEXT NOT NULL, root_id TEXT NOT NULL, file_id TEXT NOT NULL,
+                parent_id TEXT NOT NULL, path_json TEXT NOT NULL, scan_id INTEGER NOT NULL,
+                ambiguous INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (role, root_id, file_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS root_membership_file
+               ON root_membership(file_id, role, root_id)""",
+            """CREATE TABLE IF NOT EXISTS root_observation (
+                scan_id INTEGER NOT NULL, file_id TEXT NOT NULL, item_json TEXT NOT NULL,
+                ambiguous INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (scan_id, file_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS process_runs (
+                id INTEGER PRIMARY KEY, selection TEXT NOT NULL, phase TEXT NOT NULL,
+                state_json TEXT NOT NULL, updated_utc TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS process_work (
+                run_id INTEGER NOT NULL, file_id TEXT NOT NULL, version TEXT NOT NULL,
+                hydrated INTEGER NOT NULL DEFAULT 0, researched INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (run_id, file_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS enrichment_work (
+                file_id TEXT NOT NULL, version TEXT NOT NULL, provider TEXT NOT NULL,
+                query_key TEXT NOT NULL, reason TEXT NOT NULL, due_utc TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(file_id, version, provider, query_key)
+            )""",
+            """CREATE TABLE IF NOT EXISTS scan_folders (
+                scan_id INTEGER NOT NULL,
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                folder_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                visited INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(scan_id, folder_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS scan_folders_pending
+               ON scan_folders(scan_id, visited, sequence)""",
+            """CREATE TABLE IF NOT EXISTS provider_metrics (
+                provider TEXT NOT NULL, metric TEXT NOT NULL, value REAL NOT NULL,
+                PRIMARY KEY(provider, metric)
+            )""",
+            """CREATE TABLE IF NOT EXISTS provider_breakers (
+                provider TEXT PRIMARY KEY, history TEXT NOT NULL, streak INTEGER NOT NULL,
+                level INTEGER NOT NULL, until_utc TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS provider_server_deadlines (
+                provider TEXT PRIMARY KEY, until_utc TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS scheduler_state (
+                name TEXT PRIMARY KEY, value INTEGER NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS hdrr_artists (
+                artist_slug TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                norm_name TEXT NOT NULL,
+                genres_json TEXT NOT NULL DEFAULT '[]',
+                spotify_url TEXT NOT NULL DEFAULT '',
+                followers INTEGER NOT NULL DEFAULT 0,
+                tracked_releases INTEGER NOT NULL DEFAULT 0,
+                total_tracks INTEGER NOT NULL DEFAULT 0,
+                pages_cached INTEGER NOT NULL DEFAULT 0,
+                catalogue_complete INTEGER NOT NULL DEFAULT 0,
+                fetched_utc TEXT NOT NULL,
+                ttl_seconds INTEGER NOT NULL DEFAULT 604800
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_hdrr_artists_norm
+               ON hdrr_artists(norm_name)""",
+            """CREATE TABLE IF NOT EXISTS hdrr_tracks (
+                track_slug TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                norm_title TEXT NOT NULL,
+                base_title TEXT NOT NULL,
+                artists_json TEXT NOT NULL DEFAULT '[]',
+                artist_slugs_json TEXT NOT NULL DEFAULT '[]',
+                raw_genre_slug TEXT NOT NULL DEFAULT '',
+                raw_genre_label TEXT NOT NULL DEFAULT '',
+                release_date TEXT NOT NULL DEFAULT '',
+                release_year INTEGER,
+                popularity INTEGER,
+                isrc TEXT NOT NULL DEFAULT '',
+                spotify_url TEXT NOT NULL DEFAULT '',
+                detail_fetched INTEGER NOT NULL DEFAULT 0,
+                updated_utc TEXT NOT NULL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_hdrr_tracks_base
+               ON hdrr_tracks(base_title)""",
+            """CREATE TABLE IF NOT EXISTS hdrr_artist_tracks (
+                artist_slug TEXT NOT NULL,
+                track_slug TEXT NOT NULL,
+                PRIMARY KEY(artist_slug, track_slug)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_hdrr_artist_tracks_track
+               ON hdrr_artist_tracks(track_slug)""",
+            """CREATE TABLE IF NOT EXISTS hdrr_negative_lookups (
+                lookup_key TEXT PRIMARY KEY,
+                fetched_utc TEXT NOT NULL,
+                ttl_seconds INTEGER NOT NULL DEFAULT 259200
+            )""",
+            """CREATE TABLE IF NOT EXISTS artist_rules (
+                rule_id TEXT PRIMARY KEY,
+                artist_name TEXT NOT NULL,
+                norm_artist TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                approval_status TEXT NOT NULL DEFAULT 'approved',
+                verification_status TEXT NOT NULL DEFAULT 'user_verified',
+                preferred_json TEXT NOT NULL DEFAULT '[]',
+                discouraged_json TEXT NOT NULL DEFAULT '[]',
+                blocked_json TEXT NOT NULL DEFAULT '[]',
+                explicit_override_genre TEXT NOT NULL DEFAULT '',
+                explicit_override_subgenre TEXT NOT NULL DEFAULT '',
+                track_exceptions_json TEXT NOT NULL DEFAULT '[]',
+                year_min INTEGER,
+                year_max INTEGER,
+                collab_policy TEXT NOT NULL DEFAULT 'apply_discouraged_and_blocked',
+                remix_priority TEXT NOT NULL DEFAULT 'remixer_first',
+                confidence_boost INTEGER NOT NULL DEFAULT 0,
+                confidence_penalty INTEGER NOT NULL DEFAULT 1,
+                notes TEXT NOT NULL DEFAULT '',
+                source_origin TEXT NOT NULL DEFAULT 'config',
+                created_utc TEXT NOT NULL,
+                updated_utc TEXT NOT NULL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_artist_rules_norm
+               ON artist_rules(norm_artist, enabled)""",
+            """CREATE TABLE IF NOT EXISTS artist_rule_suggestions (
+                suggestion_id TEXT PRIMARY KEY,
+                artist_name TEXT NOT NULL,
+                norm_artist TEXT NOT NULL,
+                pattern_type TEXT NOT NULL,
+                suggested_rule_json TEXT NOT NULL,
+                supporting_tracks_json TEXT NOT NULL DEFAULT '[]',
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending_approval',
+                created_utc TEXT NOT NULL,
+                updated_utc TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS artist_rules_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT 'system',
+                before_json TEXT NOT NULL DEFAULT '{}',
+                after_json TEXT NOT NULL DEFAULT '{}',
+                notes TEXT NOT NULL DEFAULT '',
+                created_utc TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS candidate_provenance (
+                candidate_id INTEGER PRIMARY KEY,
+                raw_source_genre_json TEXT NOT NULL DEFAULT '[]',
+                release_year INTEGER,
+                genre_evidence_kind TEXT NOT NULL DEFAULT '',
+                source_metadata_json TEXT NOT NULL DEFAULT '{}'
+            )""",
+        ):
+            conn.execute(statement)
+        ew_cols = {r["name"] for r in conn.execute("PRAGMA table_info(enrichment_work)").fetchall()}
+        if ew_cols and "attempts" not in ew_cols:
+            conn.execute("ALTER TABLE enrichment_work ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+
+    def _seed_source_membership(self, conn: sqlite3.Connection) -> None:
+        conn.execute("""
+            INSERT OR IGNORE INTO root_membership
+                (role, root_id, file_id, parent_id, path_json, scan_id)
+            SELECT 'source', configured_source_id, file_id,
+                COALESCE(NULLIF(observed_parent_id, ''), parent_id, ''), '[]', scan_generation
+            FROM tracks WHERE is_live_source = 1 AND quarantined = 0
+                AND COALESCE(configured_source_id, '') != ''
+        """)
+
+    def _migrate_v2_to_v3(self) -> None:
+        conn = self._get_connection(isolation_level=None)
+        try:
+            # A separate reader can take the online backup while this connection
+            # holds the reserved writer lock, including when WAL is active.
+            conn.execute("PRAGMA busy_timeout = 0")
+            conn.execute("BEGIN IMMEDIATE")
+            backup = self.create_verified_backup("pre_v203_migration")
+            self._ensure_auxiliary_tables(conn)
+            self._ensure_v3_tables(conn)
+            self._seed_source_membership(conn)
+            conn.execute(
+                "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
+                (SCHEMA_VERSION, _utc_iso(), backup.name, "multi-root inventory and processing"),
+            )
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("COMMIT")
+        except (Exception, KeyboardInterrupt) as exc:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            raise DatabaseMigrationError(f"Schema v3 migration aborted: {exc}") from exc
+        finally:
+            conn.close()
+
     def _init_or_migrate(self) -> None:
         """Initialize fresh v2 database or transactionally migrate v2.0.0 database after backup."""
         current_ver = self.get_schema_version()
-        if current_ver >= SCHEMA_VERSION:
-            # Ensure auxiliary indexes/tables exist idempotently without re-backing-up
-            with self._get_connection() as conn:
-                self._ensure_auxiliary_tables(conn)
+        if current_ver > SCHEMA_VERSION:
+            raise DatabaseMigrationError("Database schema is newer than this MusicVault build.")
+        if current_ver == SCHEMA_VERSION:
+            self._ensure_additive_v3_extensions()
+            return
+        if current_ver == 2:
+            self._migrate_v2_to_v3()
             return
 
         if current_ver == 0:
@@ -270,8 +534,28 @@ class Database:
             return
 
         # Existing legacy v1 (v2.0.0) database -> create verified online backup BEFORE touching DB!
-        backup_path = self.create_verified_backup(label="pre_v201_migration")
-        self._migrate_v1_to_v2(backup_path)
+        self._migrate_v1_to_v3()
+
+    def _ensure_additive_v3_extensions(self) -> None:
+        """Idempotently ensure additive v3 tables exist on initialized v3 databases without touching read-only DBs."""
+        try:
+            with self._get_connection() as conn:
+                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                needed = not {
+                    "hdrr_artists",
+                    "hdrr_tracks",
+                    "hdrr_artist_tracks",
+                    "hdrr_negative_lookups",
+                    "artist_rules",
+                    "artist_rule_suggestions",
+                    "artist_rules_audit",
+                    "candidate_provenance",
+                } <= tables
+                if needed:
+                    with conn:
+                        self._ensure_v3_tables(conn)
+        except sqlite3.OperationalError:
+            pass
 
     def _create_fresh_v2_schema(self) -> None:
         now = _utc_iso()
@@ -322,14 +606,16 @@ class Database:
             )
             """)
             self._ensure_auxiliary_tables(conn)
+            self._ensure_v3_tables(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO schema_migrations (version, applied_utc, backup_path, notes) VALUES (?, ?, ?, ?)",
-                (SCHEMA_VERSION, now, "", "initial_v2_schema"),
+                (SCHEMA_VERSION, now, "", "initial_v3_schema"),
             )
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
@@ -419,17 +705,48 @@ class Database:
             candidates_json TEXT NOT NULL
         )
         """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS provider_operational_state (
+            provider TEXT PRIMARY KEY,
+            cooldown_until_utc TEXT DEFAULT '',
+            last_request_utc TEXT DEFAULT '',
+            last_status TEXT DEFAULT '',
+            last_http_status INTEGER,
+            error_kind TEXT DEFAULT '',
+            reason TEXT DEFAULT '',
+            cred_fingerprint TEXT DEFAULT '',
+            updated_utc TEXT NOT NULL
+        )
+        """)
+        existing_pos_cols = {r["name"] for r in conn.execute("PRAGMA table_info(provider_operational_state)").fetchall()}
+        if existing_pos_cols and "cred_fingerprint" not in existing_pos_cols:
+            conn.execute("ALTER TABLE provider_operational_state ADD COLUMN cred_fingerprint TEXT DEFAULT ''")
+        # Idempotently ensure v2.0.2 additive columns exist on already-migrated v2 databases
+        existing_t_cols = {r["name"] for r in conn.execute("PRAGMA table_info(tracks)").fetchall()}
+        if existing_t_cols:
+            for col_name, col_ddl in (
+                ("research_incomplete", "INTEGER DEFAULT 0"),
+                ("research_deferrals", "INTEGER DEFAULT 0"),
+            ):
+                if col_name not in existing_t_cols:
+                    conn.execute(f"ALTER TABLE tracks ADD COLUMN {col_name} {col_ddl}")
+        existing_c_cols = {r["name"] for r in conn.execute("PRAGMA table_info(candidates)").fetchall()}
+        if existing_c_cols and "updated_utc" not in existing_c_cols:
+            conn.execute("ALTER TABLE candidates ADD COLUMN updated_utc TEXT DEFAULT ''")
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_candidates_file ON candidates(file_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tracks_live_hydration ON tracks(is_live_source, quarantined, hydration_status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tracks_live_research ON tracks(is_live_source, quarantined, research_status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_conflicts_file ON metadata_conflicts(file_id)")
 
-    def _migrate_v1_to_v2(self, backup_path: Path) -> None:
-        """Transactionally migrate a v2.0.0 database to schema v2 without dropping or losing records."""
+    def _migrate_v1_to_v3(self) -> None:
+        """Migrate the legacy v2.0.0 database with all schema steps in one transaction."""
         now = _utc_iso()
         conn = self._get_connection(isolation_level=None)
         try:
+            conn.execute("PRAGMA busy_timeout = 0")
             conn.execute("BEGIN IMMEDIATE")
+            backup_path = self.create_verified_backup(label="pre_v201_migration")
 
             existing_track_cols = {
                 r["name"] for r in conn.execute("PRAGMA table_info(tracks)").fetchall()
@@ -476,6 +793,10 @@ class Database:
             UPDATE tracks
             SET record_origin = 'live_scan',
                 observed_parent_id = parent_id,
+                configured_source_id = CASE
+                    WHEN COALESCE(configured_source_id, '') = '' THEN parent_id
+                    ELSE configured_source_id
+                END,
                 is_live_source = 1,
                 quarantined = 0,
                 quarantine_reason = ''
@@ -559,6 +880,9 @@ class Database:
               AND (TRIM(COALESCE(artist, '')) = '' OR TRIM(COALESCE(title, '')) = '')
               AND hydration_status != 'permanent_unsupported'
             """)
+
+            self._ensure_v3_tables(conn)
+            self._seed_source_membership(conn)
 
             # 6. Backfill candidate content_version and track research_status
             conn.execute("""
@@ -664,6 +988,8 @@ class Database:
             research_next_retry_utc=row["research_next_retry_utc"] if "research_next_retry_utc" in keys else "",
             research_error=row["research_error"] if "research_error" in keys else "",
             provider_calls_json=row["provider_calls_json"] if "provider_calls_json" in keys else "{}",
+            research_incomplete=bool(row["research_incomplete"]) if "research_incomplete" in keys else False,
+            research_deferrals=int(row["research_deferrals"] or 0) if "research_deferrals" in keys else 0,
         )
 
     # --- Conflict & Evidence Archival Helpers ---
@@ -726,19 +1052,25 @@ class Database:
         old_ver = existing_row["version"] or ""
         cands = [
             dict(r)
-            for r in conn.execute(
-                "SELECT * FROM candidates WHERE file_id = ? AND COALESCE(is_stale, 0) = 0", (fid,)
-            ).fetchall()
+            for r in self._select_candidate_rows_conn(conn, fid, include_stale=False)
         ]
+        f_decs = [
+            dict(r)
+            for r in conn.execute("SELECT * FROM field_decisions WHERE file_id = ?", (fid,)).fetchall()
+        ]
+        snap = dict(existing_row)
+        if f_decs:
+            snap["_archived_field_decisions"] = f_decs
         conn.execute(
             """
             INSERT INTO evidence_history (
                 file_id, old_version, archived_utc, reason, track_snapshot_json, candidates_json
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (fid, old_ver, _utc_iso(), reason, json.dumps(dict(existing_row)), json.dumps(cands)),
+            (fid, old_ver, _utc_iso(), reason, json.dumps(snap), json.dumps(cands)),
         )
         conn.execute("UPDATE candidates SET is_stale = 1 WHERE file_id = ?", (fid,))
+        conn.execute("DELETE FROM field_decisions WHERE file_id = ? AND state != 'USER_LOCKED'", (fid,))
 
     # --- Checkpoints & Safe Track Persistence ---
 
@@ -785,7 +1117,8 @@ class Database:
                         hydration_status, hydration_version, hydration_method, hydration_error,
                         hydration_bytes, hydration_attempts, last_hydrated_utc, next_hydrate_retry_utc,
                         research_status, research_version, research_attempts, research_last_utc,
-                        research_next_retry_utc, research_error, provider_calls_json
+                        research_next_retry_utc, research_error, provider_calls_json,
+                        research_incomplete, research_deferrals
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?,
@@ -798,7 +1131,8 @@ class Database:
                         ?, ?, ?, ?,
                         ?, ?, ?, ?,
                         ?, ?, ?, ?,
-                        ?, ?, ?
+                        ?, ?, ?,
+                        ?, ?
                     )
                     """,
                     (
@@ -818,6 +1152,7 @@ class Database:
                         track.hydration_bytes, track.hydration_attempts, track.last_hydrated_utc, track.next_hydrate_retry_utc,
                         track.research_status, track.research_version, track.research_attempts, track.research_last_utc,
                         track.research_next_retry_utc, track.research_error, track.provider_calls_json,
+                        int(track.research_incomplete), int(track.research_deferrals),
                     ),
                 )
                 return
@@ -970,7 +1305,8 @@ class Database:
             return int(cur.lastrowid)
 
     def reconcile_scanned_file(
-        self, scan_id: int, source_folder_id: str, item: Dict[str, Any]
+        self, scan_id: int, source_folder_id: str, item: Dict[str, Any],
+        connection: Optional[sqlite3.Connection] = None,
     ) -> str:
         """
         Reconcile a Drive file item by exact file_id without touching tags on unchanged files,
@@ -979,7 +1315,7 @@ class Database:
         fid = str(item.get("id") or "").strip()
         now = _utc_iso()
         if not fid:
-            with self._get_connection() as conn:
+            with (nullcontext(connection) if connection is not None else self._get_connection()) as conn:
                 conn.execute(
                     "INSERT INTO audit_log (event_type, file_id, details_json, created_utc) VALUES (?, ?, ?, ?)",
                     ("SCAN_BLANK_FILE_ID", None, json.dumps({"name": item.get("name", "")}), now),
@@ -995,7 +1331,7 @@ class Database:
         parent = str(item.get("scanned_parent") or (parents[0] if parents else "") or "")
         new_ver = md5 or mod
 
-        with self._get_connection() as conn:
+        with (nullcontext(connection) if connection is not None else self._get_connection()) as conn:
             existing = conn.execute("SELECT * FROM tracks WHERE file_id = ?", (fid,)).fetchone()
 
             if existing is None:
@@ -1045,7 +1381,8 @@ class Database:
                         raw_artist = '', raw_title = '', raw_bpm = '', raw_key = '', raw_genre = '', raw_isrc = '',
                         identity_origin = 'unresolved', identity_confidence = 'unresolved',
                         hydration_status = 'pending', hydration_version = '', hydration_method = '', hydration_error = '',
-                        research_status = 'pending', research_version = '', research_error = ''
+                        research_status = 'pending', research_version = '', research_error = '',
+                        research_attempts = 0, research_incomplete = 0, research_deferrals = 0, research_next_retry_utc = ''
                     WHERE file_id = ?
                     """,
                     (name, size, md5, mod, parent, mime, new_ver, now, new_origin, source_folder_id, parent, scan_id, fid),
@@ -1320,10 +1657,373 @@ class Database:
                 )
             conn.execute("COMMIT")
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _row_to_candidate(row: sqlite3.Row) -> Candidate:
+        keys = set(row.keys())
+        return Candidate(
+            provider=row["provider"],
+            title=row["title"],
+            artists=json.loads(row["artists_json"] or "[]"),
+            duration=row["duration"],
+            isrc=row["isrc"],
+            bpm=row["bpm"],
+            key=row["key"],
+            genre=json.loads(row["genre_json"] or "[]"),
+            labels=json.loads(row["labels_json"] or "[]"),
+            url=row["url"],
+            verification=row["verification"],
+            content_version=row["content_version"] if "content_version" in keys else "",
+            is_stale=bool(row["is_stale"]) if "is_stale" in keys else False,
+            match_confidence=row["match_confidence"] if "match_confidence" in keys else "",
+            source_family=row["source_family"] if "source_family" in keys else "",
+            created_utc=row["created_utc"] if "created_utc" in keys else "",
+            updated_utc=row["updated_utc"] if "updated_utc" in keys else "",
+            raw_source_genre=json.loads(row["raw_source_genre_json"] or "[]") if "raw_source_genre_json" in keys else [],
+            release_year=int(row["release_year"]) if ("release_year" in keys and row["release_year"] is not None) else None,
+            genre_evidence_kind=row["genre_evidence_kind"] if "genre_evidence_kind" in keys else "",
+            source_metadata=json.loads(row["source_metadata_json"] or "{}") if "source_metadata_json" in keys else {},
+        )
+
+    @staticmethod
+    def _select_candidate_rows_conn(
+        conn: sqlite3.Connection, file_id: str, include_stale: bool = False
+    ) -> List[sqlite3.Row]:
+        has_prov = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_provenance'"
+        ).fetchone()
+        stale_clause = "" if include_stale else "AND COALESCE(c.is_stale, 0) = 0"
+        if has_prov:
+            return list(
+                conn.execute(
+                    f"""
+                    SELECT c.*, cp.raw_source_genre_json, cp.release_year, cp.genre_evidence_kind, cp.source_metadata_json
+                    FROM candidates c
+                    LEFT JOIN candidate_provenance cp ON cp.candidate_id = c.id
+                    WHERE c.file_id = ? {stale_clause}
+                    ORDER BY c.id ASC
+                    """,
+                    (file_id,),
+                ).fetchall()
+            )
+        return list(
+            conn.execute(
+                f"SELECT c.* FROM candidates c WHERE c.file_id = ? {stale_clause} ORDER BY c.id ASC",
+                (file_id,),
+            ).fetchall()
+        )
+
+    @staticmethod
+    def _upsert_candidate_provenance_conn(
+        conn: sqlite3.Connection,
+        cand_id: int,
+        raw_genres: List[str],
+        rel_year: Optional[int],
+        ev_kind: str,
+        smeta: Dict[str, Any],
+    ) -> None:
+        if not (raw_genres or rel_year is not None or ev_kind or smeta):
+            return
+        conn.execute(
+            """
+            INSERT INTO candidate_provenance(
+                candidate_id, raw_source_genre_json, release_year, genre_evidence_kind, source_metadata_json
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(candidate_id) DO UPDATE SET
+                raw_source_genre_json=excluded.raw_source_genre_json,
+                release_year=COALESCE(excluded.release_year, candidate_provenance.release_year),
+                genre_evidence_kind=CASE WHEN excluded.genre_evidence_kind!='' THEN excluded.genre_evidence_kind ELSE candidate_provenance.genre_evidence_kind END,
+                source_metadata_json=excluded.source_metadata_json
+            """,
+            (
+                int(cand_id),
+                json.dumps(list(dict.fromkeys(raw_genres or []))),
+                rel_year,
+                ev_kind or "",
+                json.dumps(smeta or {}, sort_keys=True),
+            ),
+        )
+
+    def _merge_candidates_conn(
+        self,
+        conn: sqlite3.Connection,
+        file_id: str,
+        current_version: str,
+        incoming_candidates: List[Candidate],
+        now_iso: str,
+    ) -> List[Candidate]:
+        """
+        Non-destructively merge incoming current-version candidates with stored active candidates:
+        1. Marks stored active rows with mismatched non-empty content_version as is_stale=1 (version isolation).
+        2. Rejects incoming candidates with mismatched content_version, Identity mismatch, or Version conflict.
+        3. Matches by (content_version, canonical_source_family, compatible_recording_edition_key) + URL/ISRC:
+           - Preserves all prior candidates from providers that returned empty, failed transiently, or were skipped.
+           - Never lets weaker unverified/inferred incoming evidence downgrade or erase stronger prior evidence.
+           - Replaces/enriches matching recording entries on equal-or-stronger authoritative refresh while
+             preserving original created_utc and setting updated_utc.
+        """
+        ver_clean = (current_version or "").strip()
+        if ver_clean:
+            conn.execute(
+                """
+                UPDATE candidates
+                SET is_stale = 1, updated_utc = ?
+                WHERE file_id = ?
+                  AND COALESCE(is_stale, 0) = 0
+                  AND TRIM(COALESCE(content_version, '')) != ''
+                  AND content_version != ?
+                """,
+                (now_iso, file_id, ver_clean),
+            )
+            # Backfill blank content_version on active same-track rows
+            conn.execute(
+                """
+                UPDATE candidates
+                SET content_version = ?
+                WHERE file_id = ?
+                  AND COALESCE(is_stale, 0) = 0
+                  AND TRIM(COALESCE(content_version, '')) = ''
+                """,
+                (ver_clean, file_id),
+            )
+
+        existing_rows = self._select_candidate_rows_conn(conn, file_id, include_stale=False)
+
+        # Build index of active rows in memory so multiple incoming candidates deduplicate cleanly too
+        active_entries: List[Dict[str, Any]] = []
+        for r in existing_rows:
+            c_obj = self._row_to_candidate(r)
+            ed_key = _candidate_edition_identity(
+                c_obj.provider, c_obj.source_family, c_obj.title, c_obj.artists, c_obj.url
+            )
+            active_entries.append({"row_id": int(r["id"]), "cand": c_obj, "edition_key": ed_key})
+
+        for inc in incoming_candidates or []:
+            inc_ver = (inc.content_version or ver_clean).strip()
+            if ver_clean and inc_ver and inc_ver != ver_clean:
+                continue
+            if (inc.verification or "") in ("Identity mismatch", "Version conflict"):
+                continue
+
+            fam = canonical_provider_family(inc.source_family or inc.provider)
+            inc_ed_key = _candidate_edition_identity(inc.provider, fam, inc.title, inc.artists, inc.url)
+            inc_url = (inc.url or "").strip().lower()
+            inc_isrc = norm(inc.isrc) if inc.isrc else ""
+            inc_rank = _candidate_verification_rank(inc.verification)
+
+            matched_entry: Optional[Dict[str, Any]] = None
+            for entry in active_entries:
+                if entry["edition_key"] != inc_ed_key:
+                    continue
+                ex_c: Candidate = entry["cand"]
+                ex_url = (ex_c.url or "").strip().lower()
+                ex_isrc = norm(ex_c.isrc) if ex_c.isrc else ""
+                # Distinct non-empty URLs for different catalogue recordings stay distinct unless ISRC matches
+                if fam != "wikidata" and inc_url and ex_url and inc_url != ex_url:
+                    if not (inc_isrc and ex_isrc and inc_isrc == ex_isrc):
+                        continue
+                matched_entry = entry
+                break
+
+            if matched_entry is None:
+                cur = conn.execute(
+                    """
+                    INSERT INTO candidates (
+                        file_id, provider, title, artists_json, duration,
+                        isrc, bpm, key, genre_json, labels_json, url, verification,
+                        created_utc, content_version, is_stale, match_confidence, source_family, updated_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                    """,
+                    (
+                        file_id,
+                        inc.provider,
+                        inc.title,
+                        json.dumps(inc.artists or []),
+                        inc.duration,
+                        inc.isrc,
+                        inc.bpm,
+                        inc.key,
+                        json.dumps(list(dict.fromkeys(inc.genre or []))),
+                        json.dumps(list(dict.fromkeys(inc.labels or []))),
+                        inc.url,
+                        inc.verification,
+                        inc.created_utc or now_iso,
+                        inc_ver,
+                        inc.match_confidence or "",
+                        fam,
+                        now_iso,
+                    ),
+                )
+                new_cid = int(cur.lastrowid)
+                self._upsert_candidate_provenance_conn(
+                    conn,
+                    new_cid,
+                    list(inc.raw_source_genre or []),
+                    inc.release_year,
+                    inc.genre_evidence_kind or "",
+                    dict(inc.source_metadata or {}),
+                )
+                stored_c = Candidate(
+                    provider=inc.provider,
+                    title=inc.title,
+                    artists=list(inc.artists or []),
+                    duration=inc.duration,
+                    isrc=inc.isrc,
+                    bpm=inc.bpm,
+                    key=inc.key,
+                    genre=list(dict.fromkeys(inc.genre or [])),
+                    labels=list(dict.fromkeys(inc.labels or [])),
+                    url=inc.url,
+                    verification=inc.verification,
+                    content_version=inc_ver,
+                    is_stale=False,
+                    match_confidence=inc.match_confidence or "",
+                    source_family=fam,
+                    created_utc=inc.created_utc or now_iso,
+                    updated_utc=now_iso,
+                    raw_source_genre=list(dict.fromkeys(inc.raw_source_genre or [])),
+                    release_year=inc.release_year,
+                    genre_evidence_kind=inc.genre_evidence_kind or "",
+                    source_metadata=dict(inc.source_metadata or {}),
+                )
+                active_entries.append({"row_id": new_cid, "cand": stored_c, "edition_key": inc_ed_key})
+                continue
+
+            # Merge onto matched existing candidate without downgrading verification or erasing fields
+            ex_c = matched_entry["cand"]
+            ex_rank = _candidate_verification_rank(ex_c.verification)
+
+            if inc_rank < ex_rank:
+                # Incoming is weaker than stored evidence: preserve stronger verification & all populated fields;
+                # only backfill completely missing supplementary fields if incoming is catalogue-matched (rank >= 2).
+                if inc_rank >= 2:
+                    merged_bpm = ex_c.bpm if ex_c.bpm is not None else inc.bpm
+                    merged_key = ex_c.key or inc.key
+                    merged_isrc = ex_c.isrc or inc.isrc
+                    merged_url = ex_c.url or inc.url
+                    merged_genres = list(ex_c.genre) if ex_c.genre else list(dict.fromkeys(inc.genre or []))
+                    merged_labels = list(ex_c.labels) if ex_c.labels else list(dict.fromkeys(inc.labels or []))
+                    conn.execute(
+                        """
+                        UPDATE candidates SET
+                            isrc = ?, bpm = ?, key = ?, genre_json = ?, labels_json = ?, url = ?, updated_utc = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            merged_isrc,
+                            merged_bpm,
+                            merged_key,
+                            json.dumps(merged_genres),
+                            json.dumps(merged_labels),
+                            merged_url,
+                            now_iso,
+                            matched_entry["row_id"],
+                        ),
+                    )
+                    ex_c.isrc = merged_isrc
+                    ex_c.bpm = merged_bpm
+                    ex_c.key = merged_key
+                    ex_c.genre = merged_genres
+                    ex_c.labels = merged_labels
+                    ex_c.url = merged_url
+                    ex_c.updated_utc = now_iso
+                continue
+
+            # Equal or stronger authoritative refresh: update while preserving non-blank fields omitted by refresh,
+            # NEVER carrying over unverified/conflicting fields (ex_rank < 3) onto recording-verified evidence (inc_rank >= 3).
+            can_inherit_prior_fields = not (inc_rank >= 3 and ex_rank < 3)
+            merged_provider = inc.provider or ex_c.provider
+            merged_title = inc.title or ex_c.title
+            merged_artists = list(inc.artists) if inc.artists else list(ex_c.artists or [])
+            merged_dur = inc.duration if inc.duration is not None else (ex_c.duration if can_inherit_prior_fields else None)
+            merged_isrc = inc.isrc or (ex_c.isrc if can_inherit_prior_fields else None)
+            merged_bpm = inc.bpm if inc.bpm is not None else (ex_c.bpm if can_inherit_prior_fields else None)
+            merged_key = inc.key or (ex_c.key if can_inherit_prior_fields else None)
+            if inc_rank > ex_rank:
+                merged_genres = (
+                    list(dict.fromkeys(inc.genre))
+                    if inc.genre
+                    else (list(dict.fromkeys(ex_c.genre or [])) if can_inherit_prior_fields else [])
+                )
+                merged_labels = (
+                    list(dict.fromkeys(inc.labels))
+                    if inc.labels
+                    else (list(dict.fromkeys(ex_c.labels or [])) if can_inherit_prior_fields else [])
+                )
+            else:
+                merged_genres = list(dict.fromkeys((inc.genre or []) + (ex_c.genre or [])))
+                merged_labels = list(dict.fromkeys((inc.labels or []) + (ex_c.labels or [])))
+            merged_url = inc.url or ex_c.url
+            merged_verif = inc.verification if inc_rank >= ex_rank else ex_c.verification
+            merged_mconf = inc.match_confidence or (ex_c.match_confidence if can_inherit_prior_fields else "")
+            merged_raw_src_g = list(dict.fromkeys((inc.raw_source_genre or []) + (ex_c.raw_source_genre or [])))
+            merged_rel_year = inc.release_year if inc.release_year is not None else ex_c.release_year
+            merged_ev_kind = inc.genre_evidence_kind or ex_c.genre_evidence_kind or ""
+            merged_smeta = {**(ex_c.source_metadata or {}), **(inc.source_metadata or {})}
+
+            conn.execute(
+                """
+                UPDATE candidates SET
+                    provider = ?, title = ?, artists_json = ?, duration = ?,
+                    isrc = ?, bpm = ?, key = ?, genre_json = ?, labels_json = ?,
+                    url = ?, verification = ?, content_version = ?,
+                    match_confidence = ?, source_family = ?, updated_utc = ?
+                WHERE id = ?
+                """,
+                (
+                    merged_provider,
+                    merged_title,
+                    json.dumps(merged_artists),
+                    merged_dur,
+                    merged_isrc,
+                    merged_bpm,
+                    merged_key,
+                    json.dumps(merged_genres),
+                    json.dumps(merged_labels),
+                    merged_url,
+                    merged_verif,
+                    inc_ver or ex_c.content_version,
+                    merged_mconf,
+                    fam,
+                    now_iso,
+                    matched_entry["row_id"],
+                ),
+            )
+            self._upsert_candidate_provenance_conn(
+                conn,
+                matched_entry["row_id"],
+                merged_raw_src_g,
+                merged_rel_year,
+                merged_ev_kind,
+                merged_smeta,
+            )
+            ex_c.provider = merged_provider
+            ex_c.title = merged_title
+            ex_c.artists = merged_artists
+            ex_c.duration = merged_dur
+            ex_c.isrc = merged_isrc
+            ex_c.bpm = merged_bpm
+            ex_c.key = merged_key
+            ex_c.genre = merged_genres
+            ex_c.labels = merged_labels
+            ex_c.url = merged_url
+            ex_c.verification = merged_verif
+            ex_c.content_version = inc_ver or ex_c.content_version
+            ex_c.match_confidence = merged_mconf
+            ex_c.source_family = fam
+            ex_c.updated_utc = now_iso
+            ex_c.raw_source_genre = merged_raw_src_g
+            ex_c.release_year = merged_rel_year
+            ex_c.genre_evidence_kind = merged_ev_kind
+            ex_c.source_metadata = merged_smeta
+
+        final_rows = self._select_candidate_rows_conn(conn, file_id, include_stale=False)
+        return [self._row_to_candidate(r) for r in final_rows]
 
     def update_research_result(
         self,
@@ -1333,54 +2033,58 @@ class Database:
         candidates: Optional[List[Candidate]],
         provider_calls: Dict[str, Any],
         error_msg: str = "",
-        retry_delay_seconds: int = 0,
+        retry_delay_seconds: float = 0.0,
+        retry_until_utc: str = "",
         preserve_existing_candidates_on_failure: bool = True,
-    ) -> None:
+        research_incomplete: bool = False,
+        consume_attempt: bool = True,
+        increment_deferral: bool = False,
+        now_utc: Optional[datetime] = None,
+    ) -> List[Candidate]:
         """
-        Transactionally persist per-track research status, provider call audit, and candidates.
-        Preserves prior valid candidates on transient/retryable failures.
+        Transactionally persist per-track research status, provider call audit, and non-destructively
+        merged candidates. Never shortens server-required retry waits and never consumes track attempts
+        for pure cooldown/budget deferrals.
         """
-        now_dt = _utc_now()
+        now_dt = _norm_utc(now_utc)
         now = _utc_iso(now_dt)
-        next_retry = _utc_iso(now_dt + timedelta(seconds=retry_delay_seconds)) if retry_delay_seconds > 0 else ""
+
+        computed_retry_dt: Optional[datetime] = None
+        if retry_delay_seconds and float(retry_delay_seconds) > 0.0:
+            computed_retry_dt = now_dt + timedelta(seconds=float(retry_delay_seconds))
+        if retry_until_utc and retry_until_utc.strip():
+            try:
+                parsed_ru = _norm_utc(datetime.fromisoformat(retry_until_utc.strip().replace("Z", "+00:00")))
+                if computed_retry_dt is None or parsed_ru > computed_retry_dt:
+                    computed_retry_dt = parsed_ru
+            except ValueError:
+                pass
+        next_retry = _utc_iso(computed_retry_dt) if computed_retry_dt is not None else ""
 
         conn = self._get_connection(isolation_level=None)
         try:
             conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute("SELECT research_attempts FROM tracks WHERE file_id = ?", (file_id,)).fetchone()
+            existing = conn.execute(
+                "SELECT research_attempts, research_deferrals FROM tracks WHERE file_id = ?",
+                (file_id,),
+            ).fetchone()
             if existing is None:
-                conn.execute("ROLLBACK")
-                return
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                return []
 
-            attempts = int(existing["research_attempts"] or 0) + 1
-            should_replace_candidates = candidates is not None and not (
-                preserve_existing_candidates_on_failure
-                and status == "retryable_failure"
-                and len(candidates) == 0
+            prev_attempts = int(existing["research_attempts"] or 0)
+            prev_deferrals = int(existing["research_deferrals"] or 0)
+            attempts = prev_attempts + (1 if consume_attempt else 0)
+            deferrals = prev_deferrals + (1 if increment_deferral else 0)
+
+            merged_cands = self._merge_candidates_conn(
+                conn=conn,
+                file_id=file_id,
+                current_version=version,
+                incoming_candidates=candidates or [],
+                now_iso=now,
             )
-
-            if should_replace_candidates and candidates is not None:
-                conn.execute(
-                    "DELETE FROM candidates WHERE file_id = ? AND COALESCE(is_stale, 0) = 0",
-                    (file_id,),
-                )
-                for c in candidates:
-                    conn.execute(
-                        """
-                        INSERT INTO candidates (
-                            file_id, provider, title, artists_json, duration,
-                            isrc, bpm, key, genre_json, labels_json, url, verification,
-                            created_utc, content_version, is_stale, match_confidence, source_family
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-                        """,
-                        (
-                            file_id, c.provider, c.title, json.dumps(c.artists),
-                            c.duration, c.isrc, c.bpm, c.key,
-                            json.dumps(c.genre), json.dumps(c.labels),
-                            c.url, c.verification,
-                            now, c.content_version or version, c.match_confidence, c.source_family,
-                        ),
-                    )
 
             conn.execute(
                 """
@@ -1391,7 +2095,9 @@ class Database:
                     research_last_utc = ?,
                     research_next_retry_utc = ?,
                     research_error = ?,
-                    provider_calls_json = ?
+                    provider_calls_json = ?,
+                    research_incomplete = ?,
+                    research_deferrals = ?
                 WHERE file_id = ?
                 """,
                 (
@@ -1402,23 +2108,114 @@ class Database:
                     next_retry,
                     error_msg[:500],
                     json.dumps(provider_calls, sort_keys=True),
+                    int(bool(research_incomplete)),
+                    deferrals,
                     file_id,
                 ),
             )
             conn.execute("COMMIT")
+            return merged_cands
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def record_research_deferral(
+        self,
+        file_id: str,
+        retry_until_utc: str,
+        provider_calls: Optional[Dict[str, Any]] = None,
+        reason: str = "",
+        now_utc: Optional[datetime] = None,
+    ) -> None:
+        """
+        Record a pure provider cooldown/budget deferral WITHOUT incrementing research_attempts
+        and WITHOUT altering candidates or overwriting stronger existing status.
+        """
+        now_dt = _norm_utc(now_utc)
+        now = _utc_iso(now_dt)
+
+        conn = self._get_connection(isolation_level=None)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT research_deferrals, research_next_retry_utc, provider_calls_json, research_error FROM tracks WHERE file_id = ?",
+                (file_id,),
+            ).fetchone()
+            if row is None:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                return
+            deferrals = int(row["research_deferrals"] or 0) + 1
+            next_r = retry_until_utc or row["research_next_retry_utc"] or ""
+            p_json = (
+                json.dumps(provider_calls, sort_keys=True)
+                if provider_calls is not None
+                else (row["provider_calls_json"] or "{}")
+            )
+            err = (reason[:500] if reason else (row["research_error"] or ""))
+            conn.execute(
+                """
+                UPDATE tracks SET
+                    research_deferrals = ?,
+                    research_next_retry_utc = ?,
+                    provider_calls_json = ?,
+                    research_error = ?,
+                    research_last_utc = ?
+                WHERE file_id = ?
+                """,
+                (deferrals, next_r, p_json, err, now, file_id),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
         finally:
             conn.close()
 
     # --- Queries ---
 
+    @staticmethod
+    def _ambiguous_membership_ids(conn: sqlite3.Connection) -> Set[str]:
+        has_rm = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+        ).fetchone()
+        if not has_rm:
+            return set()
+        return {
+            r[0]
+            for r in conn.execute(
+                """
+                SELECT file_id FROM root_membership
+                GROUP BY file_id
+                HAVING COUNT(DISTINCT role) > 1 OR MAX(ambiguous) = 1
+                """
+            ).fetchall()
+        }
+
     def get_track(self, file_id: str) -> Optional[Track]:
         """Fetch a track by its exact Google Drive file ID."""
         with self._get_connection() as conn:
             row = conn.execute("SELECT * FROM tracks WHERE file_id = ?", (file_id,)).fetchone()
-            return self._row_to_track(row) if row else None
+            if not row:
+                return None
+            tr = self._row_to_track(row)
+            has_rm = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+            ).fetchone()
+            if has_rm:
+                amb = conn.execute(
+                    """
+                    SELECT COUNT(DISTINCT role) > 1 OR COALESCE(MAX(ambiguous), 0) = 1
+                    FROM root_membership WHERE file_id = ?
+                    """,
+                    (file_id,),
+                ).fetchone()
+                tr.location_ambiguous = bool(amb and amb[0])
+            return tr
 
     def get_all_tracks(self, live_only: bool = False) -> List[Track]:
         """Fetch stored tracks (optionally restricted to live non-quarantined source tracks)."""
@@ -1429,7 +2226,25 @@ class Database:
                 ).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM tracks ORDER BY name ASC, file_id ASC").fetchall()
-            return [self._row_to_track(r) for r in rows]
+            amb_ids = self._ambiguous_membership_ids(conn)
+            tracks_out = []
+            for r in rows:
+                tr = self._row_to_track(r)
+                tr.location_ambiguous = tr.file_id in amb_ids
+                tracks_out.append(tr)
+            return tracks_out
+
+    @staticmethod
+    def _work_scope(process_run: Optional[Tuple[int, int]], stage: str, claimed_only: bool = False) -> str:
+        if process_run is None:
+            return "is_live_source = 1"
+        run_id, epoch = map(int, process_run)
+        claimed = f"AND w.hydrated={epoch}" if claimed_only else ""
+        return f"""EXISTS (
+            SELECT 1 FROM process_work w
+            WHERE w.run_id={run_id} AND w.file_id=tracks.file_id
+              AND w.version=tracks.version AND w.{stage} != {epoch} {claimed}
+        )"""
 
     def get_live_tracks_for_hydration(
         self,
@@ -1438,19 +2253,22 @@ class Database:
         max_attempts: int = 4,
         force_rehydrate: bool = False,
         use_sheet_uninspected: bool = False,
-    ) -> List[Track]:
+        process_run: Optional[Tuple[int, int]] = None,
+        count_only: bool = False,
+    ) -> List[Track] | int:
         """
         Select live source tracks needing metadata hydration or retry.
         Excludes tagless/partial tracks whose audio stream was already inspected at the current
         file version unless force_rehydrate=True or sheet identity lookup is newly requested.
         """
         now = _utc_iso()
+        live_clause = self._work_scope(process_run, "hydrated")
         with self._get_connection() as conn:
             if force_rehydrate:
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM tracks
-                    WHERE is_live_source = 1
+                    WHERE {live_clause}
                       AND quarantined = 0
                       AND hydration_status != 'permanent_unsupported'
                     ORDER BY content_stale DESC, hydration_attempts ASC, file_id ASC
@@ -1476,14 +2294,13 @@ class Database:
                 params.extend([max_attempts, now])
             params.extend([1 if use_sheet_uninspected else 0, limit])
 
-            rows = conn.execute(
-                f"""
+            query = f"""
                 SELECT * FROM tracks
-                WHERE is_live_source = 1
+                WHERE {live_clause}
                   AND quarantined = 0
                   AND hydration_status != 'permanent_unsupported'
                   AND (
-                      content_stale = 1
+                      (content_stale = 1 AND hydration_status NOT IN ('retryable_failure','success'))
                       OR hydration_status = 'pending'
                       {retry_clause}
                       OR (
@@ -1502,9 +2319,10 @@ class Database:
                   )
                 ORDER BY content_stale DESC, hydration_attempts ASC, file_id ASC
                 LIMIT ?
-                """,
-                tuple(params),
-            ).fetchall()
+                """
+            if count_only:
+                return conn.execute("SELECT COUNT(*) FROM (" + query + ")", (*params[:-1], -1)).fetchone()[0]
+            rows = conn.execute(query, tuple(params)).fetchall()
             return [self._row_to_track(r) for r in rows]
 
     def get_live_tracks_for_research(
@@ -1513,12 +2331,25 @@ class Database:
         force_refresh: bool = False,
         include_title_only: bool = False,
         max_attempts: int = 3,
-    ) -> List[Track]:
+        now_utc: Optional[datetime] = None,
+        process_run: Optional[Tuple[int, int]] = None,
+        count_only: bool = False,
+        queue_class: str = "",
+        enrichment_condition: str = "0",
+        only_enrichment: bool = False,
+        claimed_only: bool = False,
+    ) -> List[Track] | int:
         """
         Select next batch of live, non-stale tracks with searchable identity for online research.
-        Advances cleanly across batches rather than repeating alphabetical top tracks.
+        Includes pending tracks, version-changed tracks, due retryable_failure tracks, and
+        incomplete tracks (research_incomplete=1) whose retry deadline has arrived.
         """
-        now = _utc_iso()
+        live_clause = self._work_scope(process_run, "researched", claimed_only)
+        first_pass = "(research_status = 'pending' AND research_attempts = 0 AND research_deferrals = 0 AND research_last_utc = '')"
+        queue_filter = {"first": first_pass, "retry": f"NOT {first_pass}"}.get(queue_class, "1")
+        retry_order = "COALESCE(NULLIF(research_last_utc, ''), research_next_retry_utc), " if queue_class == "retry" else ""
+        now_dt = _norm_utc(now_utc)
+        now = _utc_iso(now_dt)
         with self._get_connection() as conn:
             if include_title_only:
                 identity_clause = """
@@ -1536,31 +2367,135 @@ class Database:
             else:
                 status_clause = """
                 (
-                    research_status = 'pending'
+                    (research_status = 'pending' AND (research_next_retry_utc = '' OR research_next_retry_utc <= ?))
                     OR (research_version != '' AND version != '' AND research_version != version)
                     OR (
                         research_status = 'retryable_failure'
                         AND research_attempts < ?
                         AND (research_next_retry_utc = '' OR research_next_retry_utc <= ?)
                     )
+                    OR (
+                        COALESCE(research_incomplete, 0) = 1
+                        AND research_status NOT IN ('unresolved', 'permanent_unsupported')
+                        AND research_attempts < ?
+                        AND (research_next_retry_utc = '' OR research_next_retry_utc <= ?)
+                    )
                 )
                 """
-                params = (max_attempts, now, limit)
+                params = (now, max_attempts, now, max_attempts, now, limit)
 
-            rows = conn.execute(
-                f"""
+            if only_enrichment:
+                status_clause, params = "0", (limit,)
+
+            query = f"""
                 SELECT * FROM tracks
-                WHERE is_live_source = 1
+                WHERE {live_clause}
                   AND quarantined = 0
                   AND content_stale = 0
                   AND {identity_clause}
-                  AND {status_clause}
-                ORDER BY research_attempts ASC, file_id ASC
+                  AND ({status_clause} OR ({enrichment_condition}))
+                  AND ({queue_filter})
+                ORDER BY
+                    {retry_order}CASE WHEN research_status = 'pending' THEN 0 ELSE 1 END ASC,
+                    research_attempts ASC,
+                    COALESCE(research_deferrals, 0) ASC,
+                    file_id ASC
                 LIMIT ?
-                """,
-                params,
-            ).fetchall()
+                """
+            if count_only:
+                return conn.execute("SELECT COUNT(*) FROM (" + query + ")", (*params[:-1], -1)).fetchone()[0]
+            rows = conn.execute(query, params).fetchall()
             return [self._row_to_track(r) for r in rows]
+
+    def get_research_queue_diagnostics(
+        self,
+        include_title_only: bool = False,
+        max_attempts: int = 3,
+        now_utc: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Return exact counts of deferred retries, exhausted tracks, blocked tracks, and earliest next_retry_utc."""
+        now_dt = _norm_utc(now_utc)
+        now = _utc_iso(now_dt)
+
+        with self._get_connection() as conn:
+            if include_title_only:
+                id_sql = """
+                (
+                    (TRIM(COALESCE(artist, '')) != '' AND TRIM(COALESCE(title, '')) != '')
+                    OR (TRIM(COALESCE(filename_title_hint, '')) != '' OR TRIM(COALESCE(title, '')) != '')
+                )
+                """
+            else:
+                id_sql = "(TRIM(COALESCE(artist, '')) != '' AND TRIM(COALESCE(title, '')) != '')"
+
+            rows = conn.execute(
+                f"""
+                SELECT research_status, research_attempts, research_incomplete, research_next_retry_utc,
+                       research_version, version
+                FROM tracks
+                WHERE is_live_source = 1
+                  AND quarantined = 0
+                  AND content_stale = 0
+                  AND {id_sql}
+                  AND research_status != 'permanent_unsupported'
+                """
+            ).fetchall()
+
+        due_now = 0
+        deferred_not_due = 0
+        exhausted = 0
+        unresolved_blocked = 0
+        completed_clean = 0
+        future_retries: List[str] = []
+
+        for r in rows:
+            st = str(r["research_status"] or "pending")
+            att = int(r["research_attempts"] or 0)
+            inc = bool(r["research_incomplete"])
+            nr = str(r["research_next_retry_utc"] or "").strip()
+            ver_mismatch = bool(r["research_version"] and r["version"] and r["research_version"] != r["version"])
+
+            if ver_mismatch:
+                due_now += 1
+                continue
+            if st == "unresolved":
+                unresolved_blocked += 1
+                continue
+            if st == "pending":
+                if nr and nr > now:
+                    deferred_not_due += 1
+                    future_retries.append(nr)
+                else:
+                    due_now += 1
+                continue
+            if st == "retryable_failure" or inc:
+                if att >= max_attempts:
+                    exhausted += 1
+                elif nr and nr > now:
+                    deferred_not_due += 1
+                    future_retries.append(nr)
+                else:
+                    due_now += 1
+                continue
+            if st in ("success", "partial", "no_match"):
+                completed_clean += 1
+
+        active_cds = self.get_all_provider_operational_states(now_utc=now_dt, active_only=True)
+        for p_info in active_cds.values():
+            cd_u = str(p_info.get("cooldown_until_utc") or "").strip()
+            if cd_u and cd_u > now:
+                future_retries.append(cd_u)
+
+        earliest_retry = min(future_retries) if future_retries else ""
+        return {
+            "due_now": due_now,
+            "deferred_retry_not_due": deferred_not_due,
+            "exhausted_retry_limit": exhausted,
+            "unresolved_blocked": unresolved_blocked,
+            "completed_clean": completed_clean,
+            "earliest_next_retry_utc": earliest_retry,
+            "active_provider_cooldowns": active_cds,
+        }
 
     def import_json_checkpoint(self, json_path: Path) -> int:
         """
@@ -1717,41 +2652,200 @@ class Database:
     def get_candidates(self, file_id: str, include_stale: bool = False) -> List[Candidate]:
         """Fetch stored active candidates for a track (excluding stale candidates by default)."""
         with self._get_connection() as conn:
-            if include_stale:
-                cur = conn.execute("SELECT * FROM candidates WHERE file_id = ? ORDER BY id ASC", (file_id,))
+            rows = self._select_candidate_rows_conn(conn, file_id, include_stale=include_stale)
+            return [self._row_to_candidate(row) for row in rows]
+
+    # --- Provider Operational Cooldown State & Cache ---
+
+    def get_provider_operational_state(self, provider: str) -> Optional[Dict[str, Any]]:
+        """Fetch minimal persisted operational state (cooldown/last_request_utc) for a provider."""
+        fam = canonical_provider_family(provider)
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM provider_operational_state WHERE provider = ?",
+                (fam,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def set_provider_operational_state(
+        self,
+        provider: str,
+        cooldown_until_utc: Optional[str] = None,
+        last_request_utc: Optional[str] = None,
+        last_status: str = "",
+        last_http_status: Optional[int] = None,
+        error_kind: str = "",
+        reason: str = "",
+        cred_fingerprint: Optional[str] = None,
+        now_utc: Optional[datetime] = None,
+    ) -> None:
+        """Persist minimal operational cooldown/pacing state (never stores restricted API payloads or raw keys)."""
+        fam = canonical_provider_family(provider)
+        now_dt = _norm_utc(now_utc)
+        now = _utc_iso(now_dt)
+
+        with self._get_connection() as conn:
+            existing = conn.execute(
+                "SELECT * FROM provider_operational_state WHERE provider = ?",
+                (fam,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO provider_operational_state (
+                        provider, cooldown_until_utc, last_request_utc,
+                        last_status, last_http_status, error_kind, reason, cred_fingerprint, updated_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        fam,
+                        cooldown_until_utc or "",
+                        last_request_utc or "",
+                        last_status or "",
+                        last_http_status,
+                        error_kind or "",
+                        (reason or "")[:300],
+                        cred_fingerprint or "",
+                        now,
+                    ),
+                )
             else:
-                cur = conn.execute(
-                    "SELECT * FROM candidates WHERE file_id = ? AND COALESCE(is_stale, 0) = 0 ORDER BY id ASC",
-                    (file_id,),
+                new_cd = cooldown_until_utc if cooldown_until_utc is not None else (existing["cooldown_until_utc"] or "")
+                new_lr = last_request_utc if last_request_utc is not None else (existing["last_request_utc"] or "")
+                new_st = last_status if last_status else (existing["last_status"] or "")
+                new_http = last_http_status if last_http_status is not None else existing["last_http_status"]
+                new_ek = error_kind if cooldown_until_utc is not None or error_kind else (existing["error_kind"] or "")
+                new_rsn = (reason[:300] if (cooldown_until_utc is not None or reason) else (existing["reason"] or ""))
+                ex_fp = existing["cred_fingerprint"] if "cred_fingerprint" in existing.keys() else ""
+                new_fp = cred_fingerprint if cred_fingerprint is not None else (ex_fp or "")
+                conn.execute(
+                    """
+                    UPDATE provider_operational_state SET
+                        cooldown_until_utc = ?,
+                        last_request_utc = ?,
+                        last_status = ?,
+                        last_http_status = ?,
+                        error_kind = ?,
+                        reason = ?,
+                        cred_fingerprint = ?,
+                        updated_utc = ?
+                    WHERE provider = ?
+                    """,
+                    (new_cd, new_lr, new_st, new_http, new_ek, new_rsn, new_fp, now, fam),
                 )
-            results = []
-            for row in cur.fetchall():
-                keys = set(row.keys())
-                results.append(
-                    Candidate(
-                        provider=row["provider"],
-                        title=row["title"],
-                        artists=json.loads(row["artists_json"] or "[]"),
-                        duration=row["duration"],
-                        isrc=row["isrc"],
-                        bpm=row["bpm"],
-                        key=row["key"],
-                        genre=json.loads(row["genre_json"] or "[]"),
-                        labels=json.loads(row["labels_json"] or "[]"),
-                        url=row["url"],
-                        verification=row["verification"],
-                        content_version=row["content_version"] if "content_version" in keys else "",
-                        is_stale=bool(row["is_stale"]) if "is_stale" in keys else False,
-                        match_confidence=row["match_confidence"] if "match_confidence" in keys else "",
-                        source_family=row["source_family"] if "source_family" in keys else "",
+
+    def clear_provider_quota_block(self, provider: str) -> int:
+        """
+        Clear a confirmed unknown quota block on `provider`, reset breaker/server deadline rows,
+        reset enrichment attempt counters for `provider`, and re-open non-quarantined tracks that
+        were parked in `unresolved` solely due to `quota_exceeded` on `provider`.
+        """
+        fam = canonical_provider_family(provider)
+        now = _utc_iso()
+        requeued = 0
+        with self._get_connection() as conn:
+            self.set_provider_operational_state(
+                fam,
+                cooldown_until_utc="",
+                last_status="ok",
+                error_kind="",
+                reason="",
+            )
+            has_brk = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_breakers'"
+            ).fetchone()
+            if has_brk:
+                conn.execute("DELETE FROM provider_breakers WHERE provider = ?", (fam,))
+                conn.execute("DELETE FROM provider_server_deadlines WHERE provider = ?", (fam,))
+                conn.execute("UPDATE enrichment_work SET attempts = 0, due_utc = '' WHERE provider = ?", (fam,))
+            rows = conn.execute(
+                """
+                SELECT file_id, provider_calls_json FROM tracks
+                WHERE quarantined = 0 AND research_status = 'unresolved'
+                """
+            ).fetchall()
+            still_blocked = {
+                r["provider"]
+                for r in conn.execute(
+                    "SELECT provider FROM provider_operational_state WHERE last_status IN ('auth_error','quota_exceeded','unsupported_endpoint') AND provider != ?",
+                    (fam,),
+                ).fetchall()
+            }
+            for row in rows:
+                try:
+                    audit = json.loads(row["provider_calls_json"] or "{}")
+                except ValueError:
+                    continue
+                if not isinstance(audit, dict):
+                    continue
+                had_cleared_quota = False
+                other_hard = False
+                for p_key, p_val in audit.items():
+                    if p_key == "_meta" or not isinstance(p_val, dict):
+                        continue
+                    pfam = canonical_provider_family(p_key)
+                    st = str(p_val.get("status") or "").strip().lower()
+                    if pfam == fam and st == "quota_exceeded":
+                        had_cleared_quota = True
+                    elif st in ("auth_error", "unsupported_endpoint") or (st == "quota_exceeded" and pfam in still_blocked):
+                        other_hard = True
+                if had_cleared_quota and not other_hard:
+                    conn.execute(
+                        """
+                        UPDATE tracks
+                        SET research_status = 'retryable_failure',
+                            research_incomplete = 1,
+                            research_attempts = CASE WHEN research_attempts >= 3 THEN 2 ELSE research_attempts END,
+                            research_next_retry_utc = '',
+                            research_error = ?,
+                            research_last_utc = ?
+                        WHERE file_id = ?
+                        """,
+                        (f"Quota reset confirmed for {fam}; queued for retry", now, row["file_id"]),
                     )
-                )
-            return results
+                    requeued += 1
+        return requeued
 
-    # --- Provider Cache (with strict UTC TTL enforcement) ---
+    def get_all_provider_operational_states(
+        self,
+        now_utc: Optional[datetime] = None,
+        active_only: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Inspect persisted provider cooldowns and remaining wait seconds."""
+        now_dt = _norm_utc(now_utc)
+        out: Dict[str, Dict[str, Any]] = {}
+        with self._get_connection() as conn:
+            has_pos = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='provider_operational_state'"
+            ).fetchone()
+            if not has_pos:
+                return out
+            rows = conn.execute("SELECT * FROM provider_operational_state ORDER BY provider ASC").fetchall()
+        for r in rows:
+            d = dict(r)
+            rem = 0.0
+            cd_raw = str(d.get("cooldown_until_utc") or "").strip()
+            if cd_raw:
+                try:
+                    cd_dt = _norm_utc(datetime.fromisoformat(cd_raw.replace("Z", "+00:00")))
+                    rem = max(0.0, (cd_dt - now_dt).total_seconds())
+                except ValueError:
+                    rem = 0.0
+            d["remaining_cooldown_seconds"] = round(rem, 1)
+            d["cooldown_active"] = rem > 0.0
+            if active_only and not d["cooldown_active"]:
+                continue
+            out[str(d["provider"])] = d
+        return out
 
-    def get_cache(self, provider: str, cache_key: str) -> Optional[Any]:
+    def get_cache(
+        self,
+        provider: str,
+        cache_key: str,
+        now_utc: Optional[datetime] = None,
+    ) -> Optional[Any]:
         """Retrieve cached provider response only if within UTC TTL window."""
+        ref_now = _norm_utc(now_utc)
         with self._get_connection() as conn:
             row = conn.execute(
                 "SELECT response_json, created_utc, ttl_seconds FROM provider_cache WHERE provider = ? AND cache_key = ?",
@@ -1767,17 +2861,25 @@ class Database:
                 created_dt = datetime.fromisoformat(created_raw)
                 if created_dt.tzinfo is None:
                     created_dt = created_dt.replace(tzinfo=timezone.utc)
-                if (_utc_now() - created_dt).total_seconds() > ttl:
+                if (ref_now - created_dt).total_seconds() > ttl:
                     return None
             except ValueError:
                 return None
             return json.loads(row["response_json"])
 
-    def set_cache(self, provider: str, cache_key: str, data: Any, ttl_seconds: int = 86400) -> None:
+    def set_cache(
+        self,
+        provider: str,
+        cache_key: str,
+        data: Any,
+        ttl_seconds: int = 86400,
+        now_utc: Optional[datetime] = None,
+    ) -> None:
         """Cache provider response with UTC timestamp and explicit TTL."""
         if ttl_seconds <= 0:
             return
-        now = _utc_iso()
+        ref_now = _norm_utc(now_utc)
+        now = _utc_iso(ref_now)
         with self._get_connection() as conn:
             conn.execute(
                 """
@@ -1786,6 +2888,407 @@ class Database:
                 """,
                 (provider, cache_key, json.dumps(data), now, int(ttl_seconds)),
             )
+
+    # --- Selective Dry-Run-First Research Recovery ---
+
+    def inspect_or_apply_research_recovery(
+        self,
+        configured_providers: Optional[Set[str]] = None,
+        apply: bool = False,
+        verified_backup_path: Optional[Path] = None,
+        create_backup: bool = False,
+        max_attempts: int = 3,
+        now_utc: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        Inspect (dry-run default) or transactionally re-queue live, non-quarantined, current-content
+        tracks stranded in no_match/partial/success or exhausted attempts due to demonstrable
+        transient/cooldown/budget provider failures in provider_calls_json.
+        - Reports ambiguous historical records separately without resetting them.
+        - Never alters quarantined, non-live, stale, or permanent_unsupported records.
+        - Preserves all stored candidates and hydration metadata.
+        - Requires a verified SQLite backup (--create-backup or --backup-file) when apply=True.
+        - Respects active provider cooldowns and is strictly idempotent.
+        """
+        now_dt = _norm_utc(now_utc)
+        now_iso = _utc_iso(now_dt)
+        cfg_families = {canonical_provider_family(p) for p in (configured_providers or set()) if p}
+
+        active_cooldowns = self.get_all_provider_operational_states(now_utc=now_dt, active_only=True)
+
+        counts: Dict[str, int] = {
+            "total_records_inspected": 0,
+            "excluded_quarantined_or_nonlive": 0,
+            "excluded_permanent_unsupported": 0,
+            "excluded_stale_or_version_mismatch": 0,
+            "excluded_missing_identity": 0,
+            "already_queued_or_recovered": 0,
+            "clean_completed_no_action": 0,
+            "recoverable_total": 0,
+            "ambiguous_total": 0,
+            "applied_count": 0,
+        }
+        recoverable_reasons: Dict[str, int] = {}
+        ambiguous_reasons: Dict[str, int] = {}
+        recoverable_items: List[Dict[str, Any]] = []
+        ambiguous_items: List[Dict[str, Any]] = []
+
+        with self._get_connection() as conn:
+            all_rows = conn.execute("SELECT * FROM tracks ORDER BY file_id ASC").fetchall()
+            has_rm = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+            ).fetchone()
+            active_dest_ids = (
+                {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT DISTINCT file_id FROM root_membership WHERE role = 'destination'"
+                    ).fetchall()
+                }
+                if has_rm
+                else set()
+            )
+            active_hard_quota_fams = {
+                r["provider"]
+                for r in conn.execute(
+                    "SELECT provider FROM provider_operational_state WHERE last_status = 'quota_exceeded'"
+                ).fetchall()
+            }
+            cand_counts = {
+                r["file_id"]: int(r["cnt"])
+                for r in conn.execute(
+                    "SELECT file_id, COUNT(*) AS cnt FROM candidates WHERE COALESCE(is_stale, 0) = 0 GROUP BY file_id"
+                ).fetchall()
+            }
+            verified_ids = {
+                r["file_id"]
+                for r in conn.execute(
+                    """
+                    SELECT DISTINCT file_id FROM candidates
+                    WHERE COALESCE(is_stale, 0) = 0
+                      AND verification IN ('ISRC supported', 'Duration supported')
+                      AND COALESCE(source_family, '') != 'wikidata'
+                    """
+                ).fetchall()
+            }
+
+        for row in all_rows:
+            counts["total_records_inspected"] += 1
+            fid = str(row["file_id"] or "")
+            is_active_member = bool(row["is_live_source"]) or (fid in active_dest_ids)
+            if not is_active_member or bool(row["quarantined"]):
+                counts["excluded_quarantined_or_nonlive"] += 1
+                continue
+            r_status = str(row["research_status"] or "pending")
+            h_status = str(row["hydration_status"] or "pending")
+            if r_status == "permanent_unsupported" or h_status == "permanent_unsupported":
+                counts["excluded_permanent_unsupported"] += 1
+                continue
+            r_ver = str(row["research_version"] or "")
+            t_ver = str(row["version"] or "")
+            if bool(row["content_stale"]) or (r_ver and t_ver and r_ver != t_ver):
+                counts["excluded_stale_or_version_mismatch"] += 1
+                continue
+            artist = str(row["artist"] or "").strip()
+            title = str(row["title"] or "").strip()
+            if not (artist and title):
+                counts["excluded_missing_identity"] += 1
+                continue
+
+            attempts = int(row["research_attempts"] or 0)
+            incomplete_flag = bool(row["research_incomplete"]) if "research_incomplete" in row.keys() else False
+
+            # Already in normal research queue (pending, due/deferred retryable < max_attempts, or already marked incomplete < max_attempts)
+            if (
+                r_status == "pending"
+                or (r_status == "retryable_failure" and attempts < max_attempts)
+                or (incomplete_flag and r_status != "unresolved" and attempts < max_attempts)
+            ):
+                counts["already_queued_or_recovered"] += 1
+                continue
+
+            raw_audit = str(row["provider_calls_json"] or "").strip()
+            if not raw_audit or raw_audit == "{}":
+                amb_reason = "ambiguous_missing_or_legacy_audit"
+                counts["ambiguous_total"] += 1
+                ambiguous_reasons[amb_reason] = ambiguous_reasons.get(amb_reason, 0) + 1
+                ambiguous_items.append(
+                    {
+                        "file_id": fid,
+                        "name": row["name"] or "",
+                        "research_status": r_status,
+                        "attempts": attempts,
+                        "reason": amb_reason,
+                    }
+                )
+                continue
+
+            try:
+                parsed_audit = json.loads(raw_audit)
+            except ValueError:
+                amb_reason = "ambiguous_corrupt_audit_json"
+                counts["ambiguous_total"] += 1
+                ambiguous_reasons[amb_reason] = ambiguous_reasons.get(amb_reason, 0) + 1
+                ambiguous_items.append(
+                    {
+                        "file_id": fid,
+                        "name": row["name"] or "",
+                        "research_status": r_status,
+                        "attempts": attempts,
+                        "reason": amb_reason,
+                    }
+                )
+                continue
+
+            if not isinstance(parsed_audit, dict):
+                amb_reason = "ambiguous_corrupt_audit_json"
+                counts["ambiguous_total"] += 1
+                ambiguous_reasons[amb_reason] = ambiguous_reasons.get(amb_reason, 0) + 1
+                ambiguous_items.append(
+                    {
+                        "file_id": fid,
+                        "name": row["name"] or "",
+                        "research_status": r_status,
+                        "attempts": attempts,
+                        "reason": amb_reason,
+                    }
+                )
+                continue
+
+            failed_transient_fams: List[str] = []
+            hard_blocked_fams: List[str] = []
+            recorded_clean_fams: Set[str] = set()
+            not_configured_fams: Set[str] = set()
+
+            for p_key, p_val in parsed_audit.items():
+                if p_key == "_meta" or not isinstance(p_val, dict):
+                    continue
+                fam = canonical_provider_family(p_key)
+                if fam == "wikidata":
+                    continue
+                st_p = str(p_val.get("status") or "").strip().lower()
+                alt_node = p_val.get("alternate_query")
+                alt_st = str(alt_node.get("status") or "").strip().lower() if isinstance(alt_node, dict) else ""
+
+                if st_p == "not_configured":
+                    not_configured_fams.add(fam)
+                    continue
+
+                if (
+                    st_p in _RECOVERABLE_PROVIDER_STATUSES
+                    or st_p == "deferred_primary_incomplete"
+                    or alt_st in (_RECOVERABLE_PROVIDER_STATUSES | {"skipped_cooldown_or_budget"})
+                    or (st_p == "quota_exceeded" and fam not in active_hard_quota_fams)
+                    or (p_val.get("lookup_completed") is False and p_val.get("retryable") is True)
+                ):
+                    failed_transient_fams.append(fam)
+                elif st_p in _HARD_BLOCKED_PROVIDER_STATUSES or alt_st in _HARD_BLOCKED_PROVIDER_STATUSES:
+                    hard_blocked_fams.append(fam)
+                elif st_p in ("ok", "empty"):
+                    recorded_clean_fams.add(fam)
+
+            if failed_transient_fams:
+                if r_status == "retryable_failure" and attempts >= max_attempts:
+                    rec_reason = "recoverable_exhausted_attempts"
+                elif r_status == "no_match":
+                    rec_reason = "recoverable_no_match_incomplete_audit"
+                elif r_status == "partial":
+                    rec_reason = "recoverable_partial_incomplete_audit"
+                elif r_status == "success":
+                    rec_reason = "recoverable_success_incomplete_audit"
+                else:
+                    rec_reason = f"recoverable_{r_status}_incomplete_audit"
+
+                # Respect active cooldowns: if all failed providers for this track are cooling down, defer until earliest expiry
+                cd_deadlines = [
+                    str(active_cooldowns[f]["cooldown_until_utc"])
+                    for f in failed_transient_fams
+                    if f in active_cooldowns and active_cooldowns[f].get("cooldown_until_utc")
+                ]
+                next_retry_for_track = (
+                    min(cd_deadlines) if (cd_deadlines and len(cd_deadlines) == len(failed_transient_fams)) else ""
+                )
+
+                counts["recoverable_total"] += 1
+                recoverable_reasons[rec_reason] = recoverable_reasons.get(rec_reason, 0) + 1
+                recoverable_items.append(
+                    {
+                        "file_id": fid,
+                        "name": row["name"] or "",
+                        "prior_status": r_status,
+                        "prior_attempts": attempts,
+                        "preserved_candidates": cand_counts.get(fid, 0),
+                        "has_verified_recording": fid in verified_ids,
+                        "failed_providers": sorted(set(failed_transient_fams)),
+                        "next_retry_utc": next_retry_for_track,
+                        "reason": rec_reason,
+                        "_audit": parsed_audit,
+                    }
+                )
+                continue
+
+            # Not demonstrably transient-failed -> check historical/config ambiguities
+            if hard_blocked_fams or r_status == "unresolved":
+                amb_reason = "ambiguous_hard_blocked_provider_audit"
+                counts["ambiguous_total"] += 1
+                ambiguous_reasons[amb_reason] = ambiguous_reasons.get(amb_reason, 0) + 1
+                ambiguous_items.append(
+                    {
+                        "file_id": fid,
+                        "name": row["name"] or "",
+                        "research_status": r_status,
+                        "attempts": attempts,
+                        "blocked_providers": sorted(set(hard_blocked_fams)),
+                        "reason": amb_reason,
+                    }
+                )
+                continue
+
+            has_v202_meta = isinstance(parsed_audit.get("_meta"), dict)
+            id_conf = str(row["identity_confidence"] or "")
+            if (
+                not has_v202_meta
+                and id_conf == "filename_ambiguous"
+                and (r_status == "no_match" or (r_status == "partial" and fid not in verified_ids))
+            ):
+                amb_reason = "ambiguous_v201_unrecorded_alt_orientation"
+                counts["ambiguous_total"] += 1
+                ambiguous_reasons[amb_reason] = ambiguous_reasons.get(amb_reason, 0) + 1
+                ambiguous_items.append(
+                    {
+                        "file_id": fid,
+                        "name": row["name"] or "",
+                        "research_status": r_status,
+                        "attempts": attempts,
+                        "reason": amb_reason,
+                    }
+                )
+                continue
+
+            newly_cfg = cfg_families - recorded_clean_fams
+            if newly_cfg and (newly_cfg & not_configured_fams or not has_v202_meta):
+                # Only report if at least one currently configured catalogue provider was not_configured/absent then
+                missing_then = [f for f in sorted(cfg_families) if f not in recorded_clean_fams]
+                if missing_then:
+                    amb_reason = "ambiguous_newly_configured_provider"
+                    counts["ambiguous_total"] += 1
+                    ambiguous_reasons[amb_reason] = ambiguous_reasons.get(amb_reason, 0) + 1
+                    ambiguous_items.append(
+                        {
+                            "file_id": fid,
+                            "name": row["name"] or "",
+                            "research_status": r_status,
+                            "attempts": attempts,
+                            "unqueried_configured_providers": missing_then,
+                            "reason": amb_reason,
+                        }
+                    )
+                    continue
+
+            counts["clean_completed_no_action"] += 1
+
+        used_backup_str = ""
+        if apply:
+            if create_backup:
+                created_bak = self.create_verified_backup(label="pre_v202_recovery")
+                used_backup_str = str(created_bak)
+            elif verified_backup_path is not None:
+                bpath = Path(verified_backup_path).expanduser().resolve()
+                if not bpath.exists() or bpath.stat().st_size == 0:
+                    raise DatabaseMigrationError(f"Verified backup file does not exist or is empty: {bpath}")
+                if bpath == self.db_path.resolve():
+                    raise DatabaseMigrationError("Backup path must be a separate SQLite backup file, not the active database.")
+                with sqlite3.connect(str(bpath), timeout=30.0) as bconn:
+                    ok, msg = self._check_connection_integrity(bconn)
+                    if not ok:
+                        raise DatabaseMigrationError(f"Backup failed PRAGMA integrity_check ({msg}): {bpath}")
+                    tbl_row = bconn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='tracks'"
+                    ).fetchone()
+                    if not tbl_row:
+                        raise DatabaseMigrationError(f"Backup file lacks 'tracks' table: {bpath}")
+                used_backup_str = str(bpath)
+            else:
+                raise DatabaseMigrationError(
+                    "Refusing to apply research recovery without a verified backup. "
+                    "Pass --create-backup or --backup-file <VERIFIED_SQLITE_BACKUP>."
+                )
+
+            if recoverable_items:
+                conn = self._get_connection(isolation_level=None)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    for item in recoverable_items:
+                        fid = item["file_id"]
+                        has_cands = item["preserved_candidates"] > 0
+                        has_ver = item["has_verified_recording"]
+                        new_status = (
+                            "success" if has_ver else ("partial" if has_cands else "retryable_failure")
+                        )
+                        audit_copy = dict(item["_audit"])
+                        meta_node = dict(audit_copy.get("_meta")) if isinstance(audit_copy.get("_meta"), dict) else {}
+                        meta_node["recovered_in_v202_utc"] = now_iso
+                        meta_node["prior_status_before_recovery"] = item["prior_status"]
+                        meta_node["prior_attempts_before_recovery"] = item["prior_attempts"]
+                        audit_copy["_meta"] = meta_node
+
+                        conn.execute(
+                            """
+                            UPDATE tracks SET
+                                research_status = ?,
+                                research_incomplete = 1,
+                                research_attempts = 0,
+                                research_next_retry_utc = ?,
+                                research_error = ?,
+                                provider_calls_json = ?
+                            WHERE file_id = ?
+                              AND quarantined = 0
+                              AND research_status != 'permanent_unsupported'
+                            """,
+                            (
+                                new_status,
+                                item["next_retry_utc"],
+                                f"Selective recovery ({item['reason']}); candidates preserved",
+                                json.dumps(audit_copy, sort_keys=True),
+                                fid,
+                            ),
+                        )
+                        counts["applied_count"] += 1
+
+                    conn.execute(
+                        "INSERT INTO audit_log (event_type, file_id, details_json, created_utc) VALUES (?, ?, ?, ?)",
+                        (
+                            "RESEARCH_SELECTIVE_RECOVERY",
+                            None,
+                            json.dumps(
+                                {
+                                    "applied_count": counts["applied_count"],
+                                    "reasons": recoverable_reasons,
+                                    "backup_verified": used_backup_str,
+                                }
+                            ),
+                            now_iso,
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+                finally:
+                    conn.close()
+
+        # Strip internal _audit dict before returning public report
+        clean_recoverable = [{k: v for k, v in it.items() if k != "_audit"} for it in recoverable_items]
+        return {
+            "mode": "applied" if apply else "dry_run_preview",
+            "verified_backup": used_backup_str,
+            "counts": counts,
+            "recoverable_reasons": recoverable_reasons,
+            "ambiguous_reasons": ambiguous_reasons,
+            "active_provider_cooldowns": active_cooldowns,
+            "recoverable_tracks": clean_recoverable,
+            "ambiguous_tracks": ambiguous_items,
+        }
 
     # --- Local Read-Only Diagnostic Summary (Zero Network Calls) ---
 
@@ -1878,7 +3381,15 @@ class Database:
                   AND (
                       research_status = 'pending'
                       OR (research_status = 'retryable_failure' AND research_attempts < 3)
+                      OR (COALESCE(research_incomplete, 0) = 1 AND research_status NOT IN ('unresolved', 'permanent_unsupported') AND research_attempts < 3)
                   )
+                """
+            ).fetchone()[0]
+            incomplete_research_cnt = conn.execute(
+                """
+                SELECT COUNT(*) FROM tracks
+                WHERE is_live_source = 1 AND quarantined = 0 AND content_stale = 0
+                  AND COALESCE(research_incomplete, 0) = 1
                 """
             ).fetchone()[0]
             conflicts_cnt = conn.execute(
@@ -1893,12 +3404,34 @@ class Database:
             mig_row = conn.execute(
                 "SELECT * FROM schema_migrations ORDER BY version DESC LIMIT 1"
             ).fetchone()
+            has_rm = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_membership'"
+            ).fetchone()
+            if has_rm:
+                src_mem = conn.execute(
+                    "SELECT COUNT(DISTINCT file_id) FROM root_membership WHERE role = 'source'"
+                ).fetchone()[0]
+                dst_mem = conn.execute(
+                    "SELECT COUNT(DISTINCT file_id) FROM root_membership WHERE role = 'destination'"
+                ).fetchone()[0]
+                uniq_mem = conn.execute(
+                    "SELECT COUNT(DISTINCT file_id) FROM root_membership"
+                ).fetchone()[0]
+                ovl_mem = conn.execute(
+                    "SELECT COUNT(*) FROM (SELECT file_id FROM root_membership GROUP BY file_id HAVING COUNT(DISTINCT role) > 1)"
+                ).fetchone()[0]
+            else:
+                src_mem, dst_mem, uniq_mem, ovl_mem = int(live), 0, int(live), 0
 
             return {
                 "schema_version": int(mig_row["version"]) if mig_row else 1,
                 "last_migration_backup": (mig_row["backup_path"] or "") if mig_row else "",
                 "total_records": int(total),
                 "live_source_tracks": int(live),
+                "source_membership_tracks": int(src_mem),
+                "destination_tracks": int(dst_mem),
+                "unique_library_tracks": int(uniq_mem),
+                "overlapping_root_tracks": int(ovl_mem),
                 "quarantined_records": int(quarantined),
                 "checkpoint_only_records": int(checkpoint_only),
                 "stale_live_tracks": int(stale),
@@ -1906,6 +3439,8 @@ class Database:
                 "live_missing_identity": int(live_incomplete),
                 "eligible_for_hydration": int(eligible_hydration),
                 "eligible_for_research": int(eligible_research),
+                "incomplete_research_tracks": int(incomplete_research_cnt),
+                "active_provider_cooldowns": self.get_all_provider_operational_states(active_only=True),
                 "hydration_status_counts": hyd_counts,
                 "research_status_counts": res_counts,
                 "identity_confidence_counts": conf_counts,

@@ -41,6 +41,7 @@ class SonoVaultProvider(BaseProvider):
         db: Optional[Any] = None,
         provider_terms_cleared: bool = False,
         default_delay: float = 3.2,
+        **kwargs: Any,
     ):
         super().__init__(
             "SonoVault",
@@ -49,9 +50,10 @@ class SonoVaultProvider(BaseProvider):
             contact=contact,
             db=db,
             provider_terms_cleared=provider_terms_cleared,
+            **kwargs,
         )
         self.api_key = (api_key or "").strip() or None
-        self.register_secret(self.api_key)
+        self.register_secret(self.api_key, is_primary_credential=True)
 
     def _parse_item_to_candidate(self, item: dict) -> Candidate:
         artists = [
@@ -138,15 +140,18 @@ class SonoVaultProvider(BaseProvider):
                         candidates.append(cand)
 
         # 2. Exact ISRC lookup fallback when local ISRC is known and search found nothing
-        if not candidates and isrc and self.can_request() and outcome.status in (ProviderStatus.OK, ProviderStatus.EMPTY):
+        if not candidates and isrc and outcome.status in (ProviderStatus.OK, ProviderStatus.EMPTY):
             isrc_url = f"https://api.sonovault.now/v1/tracks/isrc/{urllib.parse.quote(isrc.strip(), safe='')}"
-            isrc_out = self.request_detailed(isrc_url, headers=headers)
+            isrc_out = self.request_detailed(isrc_url, headers=headers, allow_404_as_empty=True)
             if isrc_out.status == ProviderStatus.OK and isinstance(isrc_out.data, dict):
                 item_obj = isrc_out.data.get("track") if isinstance(isrc_out.data.get("track"), dict) else isrc_out.data
                 if isinstance(item_obj, dict) and item_obj.get("title"):
                     cand = self._parse_item_to_candidate(item_obj)
                     if match_track(artist, title, cand.title, cand.artists):
                         candidates.append(cand)
+                        outcome = isrc_out
+            elif isrc_out.status not in (ProviderStatus.OK, ProviderStatus.EMPTY):
+                return [], isrc_out
 
         if outcome.status == ProviderStatus.OK and not candidates:
             outcome = ProviderCallOutcome(

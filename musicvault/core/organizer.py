@@ -12,7 +12,13 @@ from ..models import Candidate, MovePlanItem, RoutingConfidence, Track
 from ..providers.base import canonical_provider_family
 from .genre import GENERIC_TAGS, SUBGENRE_PARENT, canonical_genre, classify_track_genres, decide_genre
 from .matcher import norm
-from .rules import build_track_proposal, load_existing_states, parse_lock_states, planned_row
+from .rules import (
+    build_track_proposal,
+    inspect_sheet_row_semantics,
+    load_existing_states,
+    parse_lock_states,
+    planned_row,
+)
 
 
 # Strict parent-only spelling aliases for Vault folder matching (never maps subgenres like Rawstyle/Jump Up!)
@@ -32,8 +38,15 @@ _PARENT_FOLDER_SPELLING_ALIASES: Dict[str, str] = {
     "ukgarage": "UK Garage",
     "garage": "UK Garage",
     "dubstep": "Dubstep",
+    "dubstepandbass": "Dubstep",
+    "dubstepbass": "Dubstep",
     "pop": "Pop",
+    "popandalternative": "Pop",
+    "popalternative": "Pop",
     "rock": "Rock",
+    "country": "Country",
+    "contemporarycountry": "Country",
+    "hardbounce": "Hard Bounce",
     "reggae": "Reggae",
     "jungle": "Jungle",
     "bassline": "Bassline",
@@ -119,13 +132,6 @@ def build_move_plan(
     eligible = bool(parts) and row_num is not None
     provisional = eligible and (confidence == "PROVISIONAL_REVIEW")
 
-    if dry_run or read_only_build:
-        authorized = False
-        executable = False
-    else:
-        authorized = eligible and (not provisional or allow_provisional)
-        executable = authorized
-
     return MovePlanItem(
         row_num=row_num,
         file_id=file_id,
@@ -135,9 +141,9 @@ def build_move_plan(
         reason=reason,
         routing_confidence=RoutingConfidence(confidence),
         eligible=eligible,
-        move_authorized=authorized,
+        move_authorized=False,
         provisional=provisional,
-        executable=executable,
+        executable=False,
         existing_genre=str(sheet_row[2]).strip() if len(sheet_row) > 2 else "",
     )
 
@@ -196,6 +202,7 @@ def evaluate_live_preview(
     save_medium: bool = True,
     provider_terms_cleared: bool = False,
     quarantined_count: int = 0,
+    artist_rules: Optional[List[Any]] = None,
 ) -> LivePreviewSummary:
     """
     Build real read-only organisation & spreadsheet preview from live source inventory.
@@ -231,7 +238,7 @@ def evaluate_live_preview(
             continue
         summary.evaluated_count += 1
         cands = candidates_by_id.get(t.file_id, [])
-        proposal = build_track_proposal(t.metadata, cands)
+        proposal = build_track_proposal(t.metadata, cands, artist_rules=artist_rules, file_id=t.file_id)
 
         # Build concise provenance/evidence summary
         ev_parts: List[str] = []
@@ -283,6 +290,12 @@ def evaluate_live_preview(
         if source_vault_invalid:
             summary.rows.append(
                 _make_hold_row(None, empty_existing, {}, "INVALID_SOURCE_VAULT_SEPARATION")
+            )
+            continue
+
+        if getattr(t, "location_ambiguous", False):
+            summary.rows.append(
+                _make_hold_row(None, empty_existing, {}, "AMBIGUOUS_OVERLAPPING_ROOT_MEMBERSHIP")
             )
             continue
 
@@ -355,24 +368,26 @@ def evaluate_live_preview(
             old_row=old_row,
             save_medium=save_medium,
             provider_terms_cleared=provider_terms_cleared,
+            artist_rules=artist_rules,
         )
 
         # Collect recording-supported catalogue genres and check novel 2-provider proposals
         known_cat_genres: List[str] = []
         novel_by_tag: Dict[str, Set[str]] = {}
+        is_umbrella_row = (norm(existing_vals["genre"]) in ("danceclub", "danceandclub"))
         for c in cands:
             v_low = (c.verification or "").lower()
             if "conflict" in v_low or "mismatch" in v_low or "inferred" in v_low or "title-only" in v_low:
                 continue
             fam = c.source_family or canonical_provider_family(c.provider)
-            if fam == "wikidata":
+            if fam in ("wikidata", "hdrr") or getattr(c, "genre_evidence_kind", "") == "artist_derived":
                 continue
             is_rec_verified = c.verification in ("ISRC supported", "Duration supported")
             for raw_tag in (c.genre or []):
                 if not isinstance(raw_tag, str) or not raw_tag.strip():
                     continue
                 cg = canonical_genre(raw_tag)
-                if cg and (is_rec_verified or c.provider == "Discogs release"):
+                if cg and (is_rec_verified or (c.provider == "Discogs release" and not is_umbrella_row)):
                     known_cat_genres.append(cg)
                 elif (
                     not cg
@@ -384,10 +399,25 @@ def evaluate_live_preview(
 
         gs = states.get("genre", {}).get("state", "")
         ss = states.get("subgenre", {}).get("state", "")
-        if gs in ("CONFLICT", "LOW_CONFLICT", "REJECTED") or ss in ("CONFLICT", "LOW_CONFLICT", "REJECTED"):
+        sem = inspect_sheet_row_semantics(old_row)
+        r_eval = proposal.get("artist_rule_eval") or {}
+        if (
+            gs in ("CONFLICT", "LOW_CONFLICT", "REJECTED", "REVIEW_HOLD")
+            or ss in ("CONFLICT", "LOW_CONFLICT", "REJECTED")
+            or r_eval.get("genre_blocked_conflict")
+            or any(
+                fl in sem["row_flags"]
+                for fl in (
+                    "potential_duplicate_hold",
+                    "keep_in_source_hold",
+                    "human_genre_conflict_hold",
+                    "sheet_status_review_hold",
+                )
+            )
+        ):
             summary.conflict_holds += 1
             summary.rows.append(
-                _make_hold_row(row_num, existing_vals, f_decisions, "METADATA_LOCK_CONFLICT", star_val=new_row[16] or "★")
+                _make_hold_row(row_num, existing_vals, f_decisions, "METADATA_OR_HUMAN_REVIEW_HOLD", star_val=new_row[16] or "★")
             )
             continue
 

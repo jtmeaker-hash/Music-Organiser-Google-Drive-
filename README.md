@@ -1,11 +1,37 @@
-# Music Vault Manager (`v2.0.1` — Corrective Development Candidate)
+# Music Vault Manager (`v2.0.4` — Full-Vault Inventory & Spreadsheet Intelligence)
+
+## MusicVault 2.0.4
+
+MusicVault inventories the configured source and destination vault by exact Drive file ID, with folder-level resume checkpoints and atomic per-root publication. Unified processing (`musicvault process`) resumes bounded hydration, field-aware research with SonoVault quota protection, spreadsheet lock/placeholder/provenance reconciliation (honoring `Processing Status`, `Analysis Confidence`, and `Notes / Override` in `L/M/P` alongside `Q:AA`), recording-verified granular subgenre classification (`Euphoric`, `Rawstyle`, `Slowtempo`, etc.), evidence-backed `Dance/Club` $\to$ `Hardstyle` upgrades, integer BPM clustering with corroborated octave reconciliation, and local coverage/Sheets/routing previews. All Google Drive and Google Sheets mutations remain unconditionally blocked at the service request boundary.
+
+- Use `musicvault process --scope all --inventory-only --dry-run` to preview inventory.
+- Use `musicvault process --scope all` for unified processing and add `--resume` to continue a paused or interrupted run.
+- On an existing database, verify shutdown and run `musicvault migrate --confirm-stopped` before processing.
+
+[Debian PRoot upgrade, provider settings, and rollback](docs/V203_TERMUX.md) · [Changelog](CHANGELOG.md)
+
 
 A modular Python CLI and terminal application for **Android (Termux & Debian/Ubuntu PRoot)** and Linux to inventory, hydrate audio tags, research recording metadata, and preview parent-genre organisation for DJ libraries stored on **Google Drive** and indexed in **Google Sheets**.
 
-> **Safety Notice (`v2.0.1` Read-Only Corrective Build):**
-> `v2.0.1` is strictly **read-only against Google Drive and Google Sheets**. It never moves Drive files, creates Drive folders, renames files, modifies/transcodes audio, edits embedded tags, or writes to Google Sheets. `preview` forces `DRY_RUN=True`, `move_authorized=False`, and `executable=False` unconditionally regardless of `.env` flags.
+> **Safety Notice (`v2.0.3` Read-Only Build):**
+> `v2.0.3` enforces **unconditional read-only protection against Google Drive and Google Sheets** (`GET`/`HEAD` only at the Google API request builder boundary). It never moves Drive files, creates Drive folders, renames files, modifies/transcodes audio, edits embedded tags, or writes to Google Sheets. Previews force `DRY_RUN=True`, `move_authorized=False`, and `executable=False` unconditionally regardless of `.env` flags.
 
 ---
+
+## What Changed in `v2.0.2`
+
+1. **Separated Provider Cooldowns, Hard Auth/Quota Blocks & Request Caps (`musicvault/providers/`)**:
+   - Separates temporary server cooldowns (`COOLDOWN_DEFERRED` / `RATE_LIMITED` / `SERVER_ERROR`), hard credential/quota/endpoint blocks (`AUTH_ERROR`, `QUOTA_EXCEEDED`, `UNSUPPORTED_ENDPOINT`), and per-run `max_requests` caps (`BUDGET_EXHAUSTED`).
+   - Parses RFC 9110 `Retry-After` (delta-seconds + HTTP-date), MusicBrainz `X-RateLimit-Reset` (Unix epoch seconds), IETF `RateLimit-Reset` (delta-seconds with epoch safety guard), and Discogs `0`-remaining windows **without shortening server waits** (including waits > `3600s`).
+   - If a server-required wait exceeds the per-run retry sleep budget (`15s`), defers that provider immediately without sleeping or sending extra requests, continues querying other eligible providers, and persists minimal operational cooldown state (`provider_operational_state`, zero API payloads) across CLI restarts.
+   - Enforces MusicBrainz `>= 1.1s` minimum pacing unconditionally and avoids naive substring quota false positives (`"plan"` in `"explanation"`).
+2. **Honest Research Checkpoints & Non-Destructive Candidate Merging (`musicvault/core/researcher.py`, `musicvault/db.py`)**:
+   - Records per-provider and per-orientation (`primary_query` + `alternate_query` for ambiguous `'A - B'` filenames) outcomes, HTTP call counts, cache hits, skipped calls, retry deadlines, and lookup completion.
+   - Never treats deferred, blocked, or unattempted providers as definitive `no_match`, retains incomplete work (`research_incomplete=1`) when any provider remains retryable, never consumes `research_attempts` on pure cooldown/budget deferrals, and distinguishes verified recording identity without genre from routing readiness.
+   - Replaces destructive candidate `DELETE` with transactional non-destructive candidate merging keyed by `(content_version, source_family, recording_edition_key)`, preserving stronger prior verification (`ISRC supported` / `Duration supported`) and timestamps against empty, transient, or weaker inferred responses.
+3. **Selective Dry-Run-First Research Recovery (`musicvault recover-research`)**:
+   - Inspects stored `provider_calls_json` audits to identify live, non-quarantined, current-content tracks stranded in `no_match`, `partial`, `success`, or exhausted `retryable_failure` due to demonstrable transient/cooldown/budget provider failures while reporting ambiguous historical records separately without resetting them.
+   - Defaults to read-only dry-run preview; `--apply` requires an explicit verified SQLite backup (`--create-backup` or `--backup-file`), preserves all candidates and hydration metadata, respects active provider cooldowns, and is strictly idempotent.
 
 ## What Changed in `v2.0.1`
 
@@ -94,7 +120,11 @@ musicvault scan --hydrate --limit 10 --max-mib 32
 musicvault hydrate --limit 10 --max-mib 32 [--use-sheet] [--allow-full-download] [--export-csv hydrated.csv]
 
 # Resumable online metadata research (--limit caps actual attempted tracks)
-musicvault research --limit 10 [--force-refresh] [--include-title-only] [--export-json research.json]
+musicvault research --limit 10 [--force-refresh] [--include-title-only] [--no-wikidata] [--export-json research.json] [--export-csv research.csv]
+
+# Selective dry-run-first research recovery (requires --apply + verified backup to mutate)
+musicvault recover-research [--export-json recovery_preview.json] [--export-csv recovery_preview.csv]
+musicvault recover-research --apply --create-backup   # or --backup-file /path/to/verified_backup.sqlite
 
 # Real read-only Google Sheets + Drive parent-genre organisation preview
 musicvault preview --limit 25 [--wide] [--verbose] [--export-csv preview.csv] [--export-json preview.json]
