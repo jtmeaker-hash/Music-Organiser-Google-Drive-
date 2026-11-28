@@ -369,6 +369,108 @@ class Database:
             """CREATE TABLE IF NOT EXISTS scheduler_state (
                 name TEXT PRIMARY KEY, value INTEGER NOT NULL
             )""",
+            """CREATE TABLE IF NOT EXISTS hdrr_artists (
+                artist_slug TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                norm_name TEXT NOT NULL,
+                genres_json TEXT NOT NULL DEFAULT '[]',
+                spotify_url TEXT NOT NULL DEFAULT '',
+                followers INTEGER NOT NULL DEFAULT 0,
+                tracked_releases INTEGER NOT NULL DEFAULT 0,
+                total_tracks INTEGER NOT NULL DEFAULT 0,
+                pages_cached INTEGER NOT NULL DEFAULT 0,
+                catalogue_complete INTEGER NOT NULL DEFAULT 0,
+                fetched_utc TEXT NOT NULL,
+                ttl_seconds INTEGER NOT NULL DEFAULT 604800
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_hdrr_artists_norm
+               ON hdrr_artists(norm_name)""",
+            """CREATE TABLE IF NOT EXISTS hdrr_tracks (
+                track_slug TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                norm_title TEXT NOT NULL,
+                base_title TEXT NOT NULL,
+                artists_json TEXT NOT NULL DEFAULT '[]',
+                artist_slugs_json TEXT NOT NULL DEFAULT '[]',
+                raw_genre_slug TEXT NOT NULL DEFAULT '',
+                raw_genre_label TEXT NOT NULL DEFAULT '',
+                release_date TEXT NOT NULL DEFAULT '',
+                release_year INTEGER,
+                popularity INTEGER,
+                isrc TEXT NOT NULL DEFAULT '',
+                spotify_url TEXT NOT NULL DEFAULT '',
+                detail_fetched INTEGER NOT NULL DEFAULT 0,
+                updated_utc TEXT NOT NULL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_hdrr_tracks_base
+               ON hdrr_tracks(base_title)""",
+            """CREATE TABLE IF NOT EXISTS hdrr_artist_tracks (
+                artist_slug TEXT NOT NULL,
+                track_slug TEXT NOT NULL,
+                PRIMARY KEY(artist_slug, track_slug)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_hdrr_artist_tracks_track
+               ON hdrr_artist_tracks(track_slug)""",
+            """CREATE TABLE IF NOT EXISTS hdrr_negative_lookups (
+                lookup_key TEXT PRIMARY KEY,
+                fetched_utc TEXT NOT NULL,
+                ttl_seconds INTEGER NOT NULL DEFAULT 259200
+            )""",
+            """CREATE TABLE IF NOT EXISTS artist_rules (
+                rule_id TEXT PRIMARY KEY,
+                artist_name TEXT NOT NULL,
+                norm_artist TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                approval_status TEXT NOT NULL DEFAULT 'approved',
+                verification_status TEXT NOT NULL DEFAULT 'user_verified',
+                preferred_json TEXT NOT NULL DEFAULT '[]',
+                discouraged_json TEXT NOT NULL DEFAULT '[]',
+                blocked_json TEXT NOT NULL DEFAULT '[]',
+                explicit_override_genre TEXT NOT NULL DEFAULT '',
+                explicit_override_subgenre TEXT NOT NULL DEFAULT '',
+                track_exceptions_json TEXT NOT NULL DEFAULT '[]',
+                year_min INTEGER,
+                year_max INTEGER,
+                collab_policy TEXT NOT NULL DEFAULT 'apply_discouraged_and_blocked',
+                remix_priority TEXT NOT NULL DEFAULT 'remixer_first',
+                confidence_boost INTEGER NOT NULL DEFAULT 0,
+                confidence_penalty INTEGER NOT NULL DEFAULT 1,
+                notes TEXT NOT NULL DEFAULT '',
+                source_origin TEXT NOT NULL DEFAULT 'config',
+                created_utc TEXT NOT NULL,
+                updated_utc TEXT NOT NULL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_artist_rules_norm
+               ON artist_rules(norm_artist, enabled)""",
+            """CREATE TABLE IF NOT EXISTS artist_rule_suggestions (
+                suggestion_id TEXT PRIMARY KEY,
+                artist_name TEXT NOT NULL,
+                norm_artist TEXT NOT NULL,
+                pattern_type TEXT NOT NULL,
+                suggested_rule_json TEXT NOT NULL,
+                supporting_tracks_json TEXT NOT NULL DEFAULT '[]',
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending_approval',
+                created_utc TEXT NOT NULL,
+                updated_utc TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS artist_rules_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT 'system',
+                before_json TEXT NOT NULL DEFAULT '{}',
+                after_json TEXT NOT NULL DEFAULT '{}',
+                notes TEXT NOT NULL DEFAULT '',
+                created_utc TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS candidate_provenance (
+                candidate_id INTEGER PRIMARY KEY,
+                raw_source_genre_json TEXT NOT NULL DEFAULT '[]',
+                release_year INTEGER,
+                genre_evidence_kind TEXT NOT NULL DEFAULT '',
+                source_metadata_json TEXT NOT NULL DEFAULT '{}'
+            )""",
         ):
             conn.execute(statement)
         ew_cols = {r["name"] for r in conn.execute("PRAGMA table_info(enrichment_work)").fetchall()}
@@ -417,6 +519,7 @@ class Database:
         if current_ver > SCHEMA_VERSION:
             raise DatabaseMigrationError("Database schema is newer than this MusicVault build.")
         if current_ver == SCHEMA_VERSION:
+            self._ensure_additive_v3_extensions()
             return
         if current_ver == 2:
             self._migrate_v2_to_v3()
@@ -432,6 +535,27 @@ class Database:
 
         # Existing legacy v1 (v2.0.0) database -> create verified online backup BEFORE touching DB!
         self._migrate_v1_to_v3()
+
+    def _ensure_additive_v3_extensions(self) -> None:
+        """Idempotently ensure additive v3 tables exist on initialized v3 databases without touching read-only DBs."""
+        try:
+            with self._get_connection() as conn:
+                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                needed = not {
+                    "hdrr_artists",
+                    "hdrr_tracks",
+                    "hdrr_artist_tracks",
+                    "hdrr_negative_lookups",
+                    "artist_rules",
+                    "artist_rule_suggestions",
+                    "artist_rules_audit",
+                    "candidate_provenance",
+                } <= tables
+                if needed:
+                    with conn:
+                        self._ensure_v3_tables(conn)
+        except sqlite3.OperationalError:
+            pass
 
     def _create_fresh_v2_schema(self) -> None:
         now = _utc_iso()
@@ -928,9 +1052,7 @@ class Database:
         old_ver = existing_row["version"] or ""
         cands = [
             dict(r)
-            for r in conn.execute(
-                "SELECT * FROM candidates WHERE file_id = ? AND COALESCE(is_stale, 0) = 0", (fid,)
-            ).fetchall()
+            for r in self._select_candidate_rows_conn(conn, fid, include_stale=False)
         ]
         f_decs = [
             dict(r)
@@ -1562,6 +1684,69 @@ class Database:
             source_family=row["source_family"] if "source_family" in keys else "",
             created_utc=row["created_utc"] if "created_utc" in keys else "",
             updated_utc=row["updated_utc"] if "updated_utc" in keys else "",
+            raw_source_genre=json.loads(row["raw_source_genre_json"] or "[]") if "raw_source_genre_json" in keys else [],
+            release_year=int(row["release_year"]) if ("release_year" in keys and row["release_year"] is not None) else None,
+            genre_evidence_kind=row["genre_evidence_kind"] if "genre_evidence_kind" in keys else "",
+            source_metadata=json.loads(row["source_metadata_json"] or "{}") if "source_metadata_json" in keys else {},
+        )
+
+    @staticmethod
+    def _select_candidate_rows_conn(
+        conn: sqlite3.Connection, file_id: str, include_stale: bool = False
+    ) -> List[sqlite3.Row]:
+        has_prov = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candidate_provenance'"
+        ).fetchone()
+        stale_clause = "" if include_stale else "AND COALESCE(c.is_stale, 0) = 0"
+        if has_prov:
+            return list(
+                conn.execute(
+                    f"""
+                    SELECT c.*, cp.raw_source_genre_json, cp.release_year, cp.genre_evidence_kind, cp.source_metadata_json
+                    FROM candidates c
+                    LEFT JOIN candidate_provenance cp ON cp.candidate_id = c.id
+                    WHERE c.file_id = ? {stale_clause}
+                    ORDER BY c.id ASC
+                    """,
+                    (file_id,),
+                ).fetchall()
+            )
+        return list(
+            conn.execute(
+                f"SELECT c.* FROM candidates c WHERE c.file_id = ? {stale_clause} ORDER BY c.id ASC",
+                (file_id,),
+            ).fetchall()
+        )
+
+    @staticmethod
+    def _upsert_candidate_provenance_conn(
+        conn: sqlite3.Connection,
+        cand_id: int,
+        raw_genres: List[str],
+        rel_year: Optional[int],
+        ev_kind: str,
+        smeta: Dict[str, Any],
+    ) -> None:
+        if not (raw_genres or rel_year is not None or ev_kind or smeta):
+            return
+        conn.execute(
+            """
+            INSERT INTO candidate_provenance(
+                candidate_id, raw_source_genre_json, release_year, genre_evidence_kind, source_metadata_json
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(candidate_id) DO UPDATE SET
+                raw_source_genre_json=excluded.raw_source_genre_json,
+                release_year=COALESCE(excluded.release_year, candidate_provenance.release_year),
+                genre_evidence_kind=CASE WHEN excluded.genre_evidence_kind!='' THEN excluded.genre_evidence_kind ELSE candidate_provenance.genre_evidence_kind END,
+                source_metadata_json=excluded.source_metadata_json
+            """,
+            (
+                int(cand_id),
+                json.dumps(list(dict.fromkeys(raw_genres or []))),
+                rel_year,
+                ev_kind or "",
+                json.dumps(smeta or {}, sort_keys=True),
+            ),
         )
 
     def _merge_candidates_conn(
@@ -1607,12 +1792,7 @@ class Database:
                 (ver_clean, file_id),
             )
 
-        existing_rows = list(
-            conn.execute(
-                "SELECT * FROM candidates WHERE file_id = ? AND COALESCE(is_stale, 0) = 0 ORDER BY id ASC",
-                (file_id,),
-            ).fetchall()
-        )
+        existing_rows = self._select_candidate_rows_conn(conn, file_id, include_stale=False)
 
         # Build index of active rows in memory so multiple incoming candidates deduplicate cleanly too
         active_entries: List[Dict[str, Any]] = []
@@ -1679,6 +1859,15 @@ class Database:
                         now_iso,
                     ),
                 )
+                new_cid = int(cur.lastrowid)
+                self._upsert_candidate_provenance_conn(
+                    conn,
+                    new_cid,
+                    list(inc.raw_source_genre or []),
+                    inc.release_year,
+                    inc.genre_evidence_kind or "",
+                    dict(inc.source_metadata or {}),
+                )
                 stored_c = Candidate(
                     provider=inc.provider,
                     title=inc.title,
@@ -1697,8 +1886,12 @@ class Database:
                     source_family=fam,
                     created_utc=inc.created_utc or now_iso,
                     updated_utc=now_iso,
+                    raw_source_genre=list(dict.fromkeys(inc.raw_source_genre or [])),
+                    release_year=inc.release_year,
+                    genre_evidence_kind=inc.genre_evidence_kind or "",
+                    source_metadata=dict(inc.source_metadata or {}),
                 )
-                active_entries.append({"row_id": int(cur.lastrowid), "cand": stored_c, "edition_key": inc_ed_key})
+                active_entries.append({"row_id": new_cid, "cand": stored_c, "edition_key": inc_ed_key})
                 continue
 
             # Merge onto matched existing candidate without downgrading verification or erasing fields
@@ -1768,6 +1961,10 @@ class Database:
             merged_url = inc.url or ex_c.url
             merged_verif = inc.verification if inc_rank >= ex_rank else ex_c.verification
             merged_mconf = inc.match_confidence or (ex_c.match_confidence if can_inherit_prior_fields else "")
+            merged_raw_src_g = list(dict.fromkeys((inc.raw_source_genre or []) + (ex_c.raw_source_genre or [])))
+            merged_rel_year = inc.release_year if inc.release_year is not None else ex_c.release_year
+            merged_ev_kind = inc.genre_evidence_kind or ex_c.genre_evidence_kind or ""
+            merged_smeta = {**(ex_c.source_metadata or {}), **(inc.source_metadata or {})}
 
             conn.execute(
                 """
@@ -1797,6 +1994,14 @@ class Database:
                     matched_entry["row_id"],
                 ),
             )
+            self._upsert_candidate_provenance_conn(
+                conn,
+                matched_entry["row_id"],
+                merged_raw_src_g,
+                merged_rel_year,
+                merged_ev_kind,
+                merged_smeta,
+            )
             ex_c.provider = merged_provider
             ex_c.title = merged_title
             ex_c.artists = merged_artists
@@ -1812,11 +2017,12 @@ class Database:
             ex_c.match_confidence = merged_mconf
             ex_c.source_family = fam
             ex_c.updated_utc = now_iso
+            ex_c.raw_source_genre = merged_raw_src_g
+            ex_c.release_year = merged_rel_year
+            ex_c.genre_evidence_kind = merged_ev_kind
+            ex_c.source_metadata = merged_smeta
 
-        final_rows = conn.execute(
-            "SELECT * FROM candidates WHERE file_id = ? AND COALESCE(is_stale, 0) = 0 ORDER BY id ASC",
-            (file_id,),
-        ).fetchall()
+        final_rows = self._select_candidate_rows_conn(conn, file_id, include_stale=False)
         return [self._row_to_candidate(r) for r in final_rows]
 
     def update_research_result(
@@ -2446,14 +2652,8 @@ class Database:
     def get_candidates(self, file_id: str, include_stale: bool = False) -> List[Candidate]:
         """Fetch stored active candidates for a track (excluding stale candidates by default)."""
         with self._get_connection() as conn:
-            if include_stale:
-                cur = conn.execute("SELECT * FROM candidates WHERE file_id = ? ORDER BY id ASC", (file_id,))
-            else:
-                cur = conn.execute(
-                    "SELECT * FROM candidates WHERE file_id = ? AND COALESCE(is_stale, 0) = 0 ORDER BY id ASC",
-                    (file_id,),
-                )
-            return [self._row_to_candidate(row) for row in cur.fetchall()]
+            rows = self._select_candidate_rows_conn(conn, file_id, include_stale=include_stale)
+            return [self._row_to_candidate(row) for row in rows]
 
     # --- Provider Operational Cooldown State & Cache ---
 

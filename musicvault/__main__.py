@@ -9,6 +9,7 @@ from typing import List, Optional
 
 from . import __version__
 from .cli.commands import (
+    run_artist_rules,
     run_backup,
     run_benchmark,
     run_hydrate,
@@ -16,6 +17,7 @@ from .cli.commands import (
     run_recover_research,
     run_research,
     run_scan,
+    run_sheets_sync,
     run_status,
 )
 from .cli.menu import main_menu
@@ -133,6 +135,33 @@ def build_parser() -> argparse.ArgumentParser:
     bm_p.add_argument("--wide", action="store_true", help="Force wide horizontal table output")
     bm_p.add_argument("--verbose", action="store_true", help="Show full Drive file IDs")
 
+    # artist-rules
+    ar_p = subparsers.add_parser(
+        "artist-rules",
+        help="Inspect configurable Artist_Rules, export Artist_Rules sheet CSV, or review learned rule suggestions",
+    )
+    ar_p.add_argument("--learn", action="store_true", help="Scan verified corrections to generate pending_approval rule suggestions")
+    ar_p.add_argument("--approve", type=str, default="", help="Explicitly approve a pending suggestion ID")
+    ar_p.add_argument("--reject", type=str, default="", help="Reject a suggestion ID while retaining it for manual review")
+    ar_p.add_argument("--reason", type=str, default="", help="Optional rationale for suggestion approval/rejection")
+    ar_p.add_argument("--sheet-snapshot", type=str, default="", help="Optional read-only Tracks JSON snapshot for offline learning")
+    ar_p.add_argument("--export-sheet-csv", type=str, default="", help="Export 18-column Artist_Rules Google Sheets tab CSV")
+    ar_p.add_argument("--export-json", type=str, default="", help="Export rules, suggestions, and audit log to UTF-8 JSON")
+
+    # sheets-sync (controlled Google Sheets preview, Artist_Rules sync, approval-gated Tracks write, rollback)
+    ss_p = subparsers.add_parser(
+        "sheets-sync",
+        help="Generate before/after Sheets write preview, sync approved Artist_Rules tab, or execute approved Tracks updates",
+    )
+    ss_p.add_argument("--export-json", type=str, default="", help="Export complete before-and-after write preview JSON")
+    ss_p.add_argument("--export-csv", type=str, default="", help="Export proposed Tracks field changes CSV")
+    ss_p.add_argument("--apply-artist-rules", action="store_true", help="Write approved Artist_Rules tab to Google Sheets (backed up)")
+    ss_p.add_argument("--apply-tracks", action="store_true", help="Execute live Tracks updates (requires --approved-preview and --confirm-sha256)")
+    ss_p.add_argument("--approved-preview", type=str, default="", help="Path to approved write-preview JSON file")
+    ss_p.add_argument("--confirm-sha256", type=str, default="", help="Explicit preview_sha256 confirmation required for --apply-tracks")
+    ss_p.add_argument("--rollback-manifest", type=str, default="", help="Restore pre-write Google Sheets cells from a saved rollback manifest ID")
+    ss_p.add_argument("--verbose", action="store_true", help="Show unmasked Drive IDs in console/exports")
+
     # setup
     subparsers.add_parser("setup", help="Run credential & Google OAuth setup wizard")
 
@@ -174,6 +203,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return 0
             if not version or args.command == "migrate":
                 db = Database(config.db_path)
+            elif version == SCHEMA_VERSION and args.command not in {"status", "backup"}:
+                db._ensure_additive_v3_extensions()
             if args.command == "migrate":
                 print(f"Local schema version {db.get_schema_version()}")
                 if db.last_backup_path:
@@ -307,6 +338,31 @@ def dispatch(args: argparse.Namespace, config: Config, db: Database) -> int:
                 checkpoint_path=cp_path,
                 expected_rows_path=exp_path,
                 wide=args.wide,
+                verbose=args.verbose,
+            )
+        elif args.command == "artist-rules":
+            run_artist_rules(
+                config,
+                db,
+                learn=args.learn,
+                approve_id=args.approve,
+                reject_id=args.reject,
+                reason=args.reason,
+                sheet_snapshot=Path(args.sheet_snapshot) if args.sheet_snapshot else None,
+                export_sheet_csv=Path(args.export_sheet_csv) if args.export_sheet_csv else None,
+                export_json=Path(args.export_json) if args.export_json else None,
+            )
+        elif args.command == "sheets-sync":
+            run_sheets_sync(
+                config,
+                db,
+                export_json=Path(args.export_json) if args.export_json else None,
+                export_csv=Path(args.export_csv) if args.export_csv else None,
+                apply_artist_rules=args.apply_artist_rules,
+                apply_tracks=args.apply_tracks,
+                approved_preview_path=Path(args.approved_preview) if args.approved_preview else None,
+                confirm_sha256=args.confirm_sha256,
+                rollback_manifest_id=args.rollback_manifest,
                 verbose=args.verbose,
             )
     except KeyboardInterrupt:

@@ -202,6 +202,7 @@ def evaluate_live_preview(
     save_medium: bool = True,
     provider_terms_cleared: bool = False,
     quarantined_count: int = 0,
+    artist_rules: Optional[List[Any]] = None,
 ) -> LivePreviewSummary:
     """
     Build real read-only organisation & spreadsheet preview from live source inventory.
@@ -237,7 +238,7 @@ def evaluate_live_preview(
             continue
         summary.evaluated_count += 1
         cands = candidates_by_id.get(t.file_id, [])
-        proposal = build_track_proposal(t.metadata, cands)
+        proposal = build_track_proposal(t.metadata, cands, artist_rules=artist_rules, file_id=t.file_id)
 
         # Build concise provenance/evidence summary
         ev_parts: List[str] = []
@@ -367,6 +368,7 @@ def evaluate_live_preview(
             old_row=old_row,
             save_medium=save_medium,
             provider_terms_cleared=provider_terms_cleared,
+            artist_rules=artist_rules,
         )
 
         # Collect recording-supported catalogue genres and check novel 2-provider proposals
@@ -378,7 +380,7 @@ def evaluate_live_preview(
             if "conflict" in v_low or "mismatch" in v_low or "inferred" in v_low or "title-only" in v_low:
                 continue
             fam = c.source_family or canonical_provider_family(c.provider)
-            if fam == "wikidata":
+            if fam in ("wikidata", "hdrr") or getattr(c, "genre_evidence_kind", "") == "artist_derived":
                 continue
             is_rec_verified = c.verification in ("ISRC supported", "Duration supported")
             for raw_tag in (c.genre or []):
@@ -398,9 +400,11 @@ def evaluate_live_preview(
         gs = states.get("genre", {}).get("state", "")
         ss = states.get("subgenre", {}).get("state", "")
         sem = inspect_sheet_row_semantics(old_row)
+        r_eval = proposal.get("artist_rule_eval") or {}
         if (
             gs in ("CONFLICT", "LOW_CONFLICT", "REJECTED", "REVIEW_HOLD")
             or ss in ("CONFLICT", "LOW_CONFLICT", "REJECTED")
+            or r_eval.get("genre_blocked_conflict")
             or any(
                 fl in sem["row_flags"]
                 for fl in (

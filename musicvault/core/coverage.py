@@ -10,6 +10,7 @@ from tempfile import NamedTemporaryFile
 from ..cli.formatting import _redact_json_tree, sanitize_csv_cell, short_file_id
 from ..providers.base import canonical_provider_family
 from ..services.sheets import _DRIVE_ID_TOKEN_RE, normalize_tracks_row, resolve_tracks_headers
+from .artist_rules import DEFAULT_PEYGAN_RULE, _classification_matches_list, load_artist_rules
 from .genre import (
     SUBGENRE_PARENT,
     canonical_genre,
@@ -42,7 +43,7 @@ FIELDS = ("artist", "title", "edition", "duration", "bpm", "key", "genre", "subg
 ATTRIBUTED = ("identity", "bpm", "key", "genre", "subgenre")
 MANUAL_STATES = {"USER_LOCKED", "HIGH_LOCKED", "ACCEPTED", "VERIFIED"}
 RECORDING_STATES = {"Duration supported", "ISRC supported"}
-OPEN_PROVENANCE = {"musicbrainz", "embedded", "manual"}
+OPEN_PROVENANCE = {"musicbrainz", "embedded", "manual", "hdrr"}
 
 
 def _family(candidate):
@@ -133,9 +134,9 @@ def _group_recording_values(verified_candidates, field):
     return {k: (v[0], v[1]) for k, v in grouped.items()}
 
 
-def decisions(track, candidates, manual):
+def decisions(track, candidates, manual, artist_rules=None):
     """Return a field view from a materialized track and permitted candidates."""
-    proposal = build_track_proposal(track.metadata, candidates)
+    proposal = build_track_proposal(track.metadata, candidates, artist_rules=artist_rules, file_id=track.file_id)
     verified = [c for c in candidates if c.verification in RECORDING_STATES and _family(c) != "wikidata"]
     meta = track.metadata
     local = {
@@ -235,6 +236,18 @@ def decisions(track, candidates, manual):
         if field == "bpm":
             entry_out["raw_measurements"] = proposal.get("bpm_raw_measurements", [])
             entry_out["octave_adjusted"] = bool(proposal.get("bpm_octave_adjusted", False))
+        elif field in ("genre", "subgenre"):
+            if proposal.get("hdrr_raw_genres"):
+                entry_out["hdrr_raw_source_genres"] = proposal["hdrr_raw_genres"]
+            r_ev = proposal.get("artist_rule_eval") or {}
+            if r_ev.get("matched_rules"):
+                entry_out["artist_rules_matched"] = r_ev["matched_rules"]
+            if r_ev.get("exception_applied"):
+                entry_out["artist_rule_exception"] = r_ev["exception_applied"]
+            if r_ev.get("conflict_reasons"):
+                entry_out["artist_rule_conflicts"] = r_ev["conflict_reasons"]
+            if field == "subgenre" and r_ev.get("investigation_cues"):
+                entry_out["investigation_cues"] = r_ev["investigation_cues"]
         results[field] = entry_out
     return results, proposal.get("tempo_hint", "")
 
@@ -246,12 +259,17 @@ def _signature(result, field):
     return (value["state"], value["value"]) if value["state"] in {"accepted", "verified"} else ()
 
 
-def attribution(track, candidates, manual, baseline):
+def attribution(track, candidates, manual, baseline, artist_rules=None):
     """Counterfactual attribution. This function has no access to provider clients."""
     result = {}
     families = {_family(item) for item in candidates}
     for family in families:
-        reduced, _ = decisions(track, [item for item in candidates if _family(item) != family], manual)
+        reduced, _ = decisions(
+            track,
+            [item for item in candidates if _family(item) != family],
+            manual,
+            artist_rules=artist_rules,
+        )
         accepted = [
             field
             for field in ATTRIBUTED
@@ -321,7 +339,7 @@ def _disabled_families(config):
     return set(_families(raw.split(","), allow_wikidata=True)) if raw else set()
 
 
-def _track_report(conn, db, row, config, sheet_info, folders, location_verified, disabled):
+def _track_report(conn, db, row, config, sheet_info, folders, location_verified, disabled, artist_rules=None):
     track = db._row_to_track(row)
     terms = config.provider_terms_cleared
     candidates = [
@@ -354,13 +372,17 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
         if old and lock in MANUAL_STATES and old[col].strip():
             manual.setdefault(field, (old[col].strip(), lock))
 
-    field_data, tempo_hint = decisions(track, candidates, manual)
+    field_data, tempo_hint = decisions(track, candidates, manual, artist_rules=artist_rules)
     parent_g = canonical_genre(field_data["genre"]["value"])
     double_check_flags = list(sem["row_flags"])
     if tempo_hint:
         double_check_flags.append(f"tempo_hint:{tempo_hint}")
     if field_data["bpm"].get("octave_adjusted"):
         double_check_flags.append("bpm_octave_adjusted_2x")
+    if field_data["subgenre"].get("artist_rule_conflicts") or field_data["genre"].get("artist_rule_conflicts"):
+        double_check_flags.append("artist_rule_conflict_detected")
+    if field_data["subgenre"].get("investigation_cues"):
+        double_check_flags.append("investigate:" + ",".join(field_data["subgenre"]["investigation_cues"]))
 
     try:
         audit = json.loads(track.provider_calls_json)
@@ -472,14 +494,47 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
                         (ex_cg and ex_cg != canonical_genre(detail["value"]))
                         or (is_umbrella_club_genre(old_val) and canonical_genre(detail["value"]) == "Hardstyle")
                     )
+                elif field == "subgenre":
+                    ex_cs = canonical_subgenre(old_val)
+                    contradicts = bool(ex_cs and canonical_subgenre(detail["value"]) and ex_cs != canonical_subgenre(detail["value"]))
                 elif field == "bpm" and is_valid_bpm(old_val):
                     contradicts = abs(int(round(float(old_val))) - int(round(float(detail["value"])))) >= 2
                 elif field == "key":
                     ex_k = normalize_key_to_camelot(old_val)
                     contradicts = bool(ex_k and ex_k != normalize_key_to_camelot(detail["value"]))
+
+            rule_conflict_existing = False
+            if (
+                not contradicts
+                and field in ("genre", "subgenre")
+                and field not in manual
+                and not detail.get("artist_rule_exception")
+            ):
+                active_r_list = list(artist_rules) if artist_rules is not None else [DEFAULT_PEYGAN_RULE]
+                matched_ids = set(detail.get("artist_rules_matched") or [])
+                if matched_ids:
+                    g_chk = old_val if field == "genre" else (old[COL["genre"]].strip() if old else "")
+                    s_chk = old_val if field == "subgenre" else ""
+                    for ar in active_r_list:
+                        if ar.rule_id not in matched_ids or not ar.is_active:
+                            continue
+                        if any(
+                            exc.get("match_type") == "file_id" and exc.get("match_value") == track.file_id
+                            for exc in (ar.track_exceptions or [])
+                        ):
+                            continue
+                        hit_blk = _classification_matches_list(g_chk if field == "genre" else "", s_chk, ar.blocked)
+                        hit_dsc = _classification_matches_list(g_chk if field == "genre" else "", s_chk, ar.discouraged)
+                        if hit_blk or hit_dsc:
+                            rule_conflict_existing = True
+                            break
+
             if contradicts:
                 detail["proposal_action"] = "preserved_existing_conflict_flagged"
                 double_check_flags.append(f"{field}_existing_vs_catalogue_discrepancy")
+            elif rule_conflict_existing:
+                detail["proposal_action"] = "preserved_existing_artist_rule_conflict"
+                double_check_flags.append(f"{field}_existing_vs_artist_rule_conflict")
             else:
                 detail["proposal_action"] = "existing_preserved"
         elif (
@@ -538,6 +593,7 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
         or conflict
         or any_field_review_hold
         or human_routing_hold
+        or any("_existing_vs_" in fl for fl in double_check_flags)
         or bool(tempo_hint)
         or exhausted_enrichment
         or (research_complete and track.research_status == "partial")
@@ -632,7 +688,7 @@ def _track_report(conn, db, row, config, sheet_info, folders, location_verified,
         "executable": False,
         "sheet_row": sheet_rows[0][0] if len(sheet_rows) == 1 else None,
     }
-    return detail, attribution(track, candidates, manual, field_data)
+    return detail, attribution(track, candidates, manual, field_data, artist_rules=artist_rules)
 
 
 def library_report(conn, db, config, args, sheets, drive):
@@ -643,6 +699,15 @@ def library_report(conn, db, config, args, sheets, drive):
         sheet_info = read_sheet(conn, sheets, config.sheet_id)
     except Exception as exc:
         sheet_info = {"schema_error": config.redact(exc)}
+    sheet_artist_rules = []
+    if hasattr(sheets, "load_artist_rules_tab"):
+        try:
+            sheet_artist_rules, ar_warnings = sheets.load_artist_rules_tab(config.sheet_id)
+            if ar_warnings:
+                sheet_info["artist_rules_warnings"] = ar_warnings
+        except Exception:
+            sheet_artist_rules = []
+    active_artist_rules = load_artist_rules(db=db, config=config, sheet_rules=sheet_artist_rules)
     try:
         folders = {}
         for name, ids in drive.get_children_folders(config.vault_folder_id).items():
@@ -718,7 +783,8 @@ def library_report(conn, db, config, args, sheets, drive):
             first = True
             for row in rows:
                 detail, providers = _track_report(
-                    conn, db, row, config, sheet_info, folders, location_verified, disabled
+                    conn, db, row, config, sheet_info, folders, location_verified, disabled,
+                    artist_rules=active_artist_rules,
                 )
                 if args.verbose:
                     detail["file_id"] = row["file_id"]

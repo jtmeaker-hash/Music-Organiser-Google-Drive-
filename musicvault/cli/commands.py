@@ -12,6 +12,22 @@ from typing import Any, Dict, List, Optional
 from .. import __version__
 from ..auth import GoogleAuthManager
 from ..config import Config
+from ..core.artist_rules import (
+    ARTIST_RULES_HEADERS,
+    approve_artist_rule_suggestion,
+    artist_rule_to_sheet_row,
+    ensure_default_artist_rules,
+    flag_existing_rows_against_approved_rules,
+    learn_artist_rule_suggestions,
+    load_artist_rules,
+    reject_artist_rule_suggestion,
+)
+from ..core.sheets_sync import (
+    build_tracks_write_preview,
+    execute_approved_tracks_writes,
+    rollback_sheets_manifest,
+    sync_artist_rules_to_sheet,
+)
 from ..core.hydrator import hydrate_live_inventory
 from ..core.inventory import scan_root
 from ..core.organizer import evaluate_live_preview
@@ -20,7 +36,7 @@ from ..db import Database, DatabaseMigrationError
 from ..fixtures.benchmarks import execute_isolated_benchmark
 from ..models import Track
 from ..services.drive import DriveService
-from ..services.sheets import SheetsService
+from ..services.sheets import ControlledSheetsService, SheetsService
 from ..termux import detect_environment, termux_wake_lock
 from .formatting import (
     export_safe_csv,
@@ -537,12 +553,19 @@ def run_recover_research(
     stranded by transient/cooldown/budget provider failures.
     Never runs automatically; requires --apply plus a verified SQLite backup to mutate.
     """
-    configured_provs = {"musicbrainz"}
-    if config.sonovault_api_key:
+    disabled_raw = {
+        x.strip().lower()
+        for x in (config.get("DISABLED_RESEARCH_PROVIDERS", "") or "").split(",")
+        if x.strip()
+    }
+    if not config.get_bool("HDRR_ENABLED", True):
+        disabled_raw.add("hdrr")
+    configured_provs = {"musicbrainz", "hdrr"} - disabled_raw
+    if config.sonovault_api_key and "sonovault" not in disabled_raw:
         configured_provs.add("sonovault")
-    if config.audiometa_api_key:
+    if config.audiometa_api_key and "audiometa" not in disabled_raw:
         configured_provs.add("audiometa")
-    if config.discogs_token:
+    if config.discogs_token and "discogs" not in disabled_raw:
         configured_provs.add("discogs")
 
     try:
@@ -719,6 +742,16 @@ def run_preview(
     except Exception as exc:
         print(f"[!] Warning: Could not inspect Vault destination folders ({config.redact(exc)}); folder checks marked provisional.")
 
+    sheet_artist_rules = []
+    if hasattr(sh_svc, "load_artist_rules_tab"):
+        try:
+            sheet_artist_rules, ar_warns = sh_svc.load_artist_rules_tab(config.sheet_id)
+            for w in ar_warns:
+                print(f"[!] Artist_Rules sheet warning: {w}")
+        except Exception:
+            sheet_artist_rules = []
+    active_artist_rules = load_artist_rules(db=db, config=config, sheet_rules=sheet_artist_rules)
+
     cands_by_id = {t.file_id: db.get_candidates(t.file_id) for t in selected_tracks}
     preview = evaluate_live_preview(
         live_tracks=selected_tracks,
@@ -730,6 +763,7 @@ def run_preview(
         save_medium=config.save_medium,
         provider_terms_cleared=config.provider_terms_cleared,
         quarantined_count=inv["quarantined_records"],
+        artist_rules=active_artist_rules,
     )
 
     print(f"\n=== LIVE READ-ONLY ORGANISATION PREVIEW (v{__version__}) ===")
@@ -885,3 +919,264 @@ def run_benchmark(
         if o.passed is False:
             print(f"  [FAIL] {o.track_name}: {o.failure_detail}")
     return res
+
+
+def run_artist_rules(
+    config: Config,
+    db: Database,
+    learn: bool = False,
+    approve_id: str = "",
+    reject_id: str = "",
+    reason: str = "",
+    sheet_snapshot: Optional[Path] = None,
+    export_sheet_csv: Optional[Path] = None,
+    export_json: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Inspect configurable `Artist_Rules`, export the `Artist_Rules` Google Sheets tab template/rows,
+    learn `pending_approval` suggestions from manual corrections, or explicitly approve/reject a suggestion.
+    """
+    import json as _json
+    from ..services.sheets import normalize_tracks_row, resolve_tracks_headers
+
+    db._ensure_additive_v3_extensions()
+    ensure_default_artist_rules(db)
+
+    approved_rule = None
+    if approve_id.strip():
+        approved_rule = approve_artist_rule_suggestion(db, approve_id.strip(), actor="cli_user")
+        if approved_rule:
+            print(f"[✓] Approved artist rule suggestion '{approve_id}' -> active rule '{approved_rule.rule_id}' ({approved_rule.artist_name})")
+        else:
+            print(f"[!] Suggestion '{approve_id}' not found.")
+
+    rejected_info = None
+    if reject_id.strip():
+        rejected_info = reject_artist_rule_suggestion(
+            db, reject_id.strip(), actor="cli_user", reason=reason.strip()
+        )
+        if rejected_info:
+            print(
+                f"[✓] Rejected suggestion '{reject_id}' ({rejected_info['artist_name']}); "
+                "retained in artist_rule_suggestions as 'rejected_manual_review' (enabled=False)."
+            )
+        else:
+            print(f"[!] Suggestion '{reject_id}' not found.")
+
+    learned = []
+    if learn:
+        canon_rows: List[List[str]] = []
+        if sheet_snapshot and sheet_snapshot.is_file():
+            snap_data = _json.loads(sheet_snapshot.read_text(encoding="utf-8"))
+            raw_t_rows = (
+                snap_data.get("tabs", {}).get("Tracks", {}).get("rows")
+                or snap_data.get("rows")
+                or []
+            )
+            if raw_t_rows:
+                idx = resolve_tracks_headers(raw_t_rows[0])
+                if idx.schema_valid:
+                    canon_rows = [normalize_tracks_row(r, idx) for r in raw_t_rows[1:] if any(str(x or "").strip() for x in r)]
+        elif config.sheet_id:
+            try:
+                creds = GoogleAuthManager(config).get_credentials()
+                if creds:
+                    sh = SheetsService(creds)
+                    s_idx = sh.load_verified_index(config.sheet_id)
+                    if s_idx.schema_valid:
+                        canon_rows = [row for _, row in s_idx.unique_rows_by_id.values()]
+            except Exception:
+                canon_rows = []
+        learned = learn_artist_rule_suggestions(db, sheet_rows=canon_rows or None)
+    rules = load_artist_rules(db=db, config=config, active_only=False)
+
+    with db._get_connection() as conn:
+        pending_sugs = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT suggestion_id, artist_name, pattern_type, evidence_count, status, updated_utc FROM artist_rule_suggestions ORDER BY updated_utc DESC"
+            ).fetchall()
+        ]
+        audit_entries = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT id, rule_id, action, actor, notes, created_utc FROM artist_rules_audit ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+        ]
+
+    print(f"\n=== ARTIST CLASSIFICATION RULES ({len(rules)} configured) ===")
+    for r in rules:
+        print(
+            f"  [{r.rule_id}] {r.artist_name} | enabled={r.enabled} | status={r.approval_status}/{r.verification_status} | "
+            f"preferred={r.preferred} | discouraged={r.discouraged} | blocked={r.blocked}"
+        )
+    if pending_sugs:
+        print(f"\nPending / Historical Rule Suggestions ({len(pending_sugs)}):")
+        for s in pending_sugs[:10]:
+            print(f"  [{s['suggestion_id']}] {s['artist_name']} ({s['status']}, evidence={s['evidence_count']})")
+
+    secrets = config.known_secrets()
+    if export_sheet_csv:
+        rows_dicts = [
+            dict(zip(ARTIST_RULES_HEADERS, artist_rule_to_sheet_row(r)))
+            for r in rules
+        ]
+        export_safe_csv(export_sheet_csv, ARTIST_RULES_HEADERS, rows_dicts, secrets)
+        print(f"[✓] Exported Artist_Rules Google Sheets tab CSV to {export_sheet_csv}")
+
+    payload = {
+        "rules": [
+            {
+                "rule_id": r.rule_id,
+                "artist_name": r.artist_name,
+                "enabled": r.enabled,
+                "approval_status": r.approval_status,
+                "verification_status": r.verification_status,
+                "preferred": r.preferred,
+                "discouraged": r.discouraged,
+                "blocked": r.blocked,
+                "collab_policy": r.collab_policy,
+                "remix_priority": r.remix_priority,
+            }
+            for r in rules
+        ],
+        "learned_now": learned,
+        "suggestions": pending_sugs,
+        "recent_audit": audit_entries,
+        "approved_rule_id": approved_rule.rule_id if approved_rule else "",
+        "rejected_suggestion": rejected_info,
+    }
+    if export_json:
+        export_safe_json(export_json, payload, secrets)
+        print(f"[✓] Exported Artist_Rules JSON report to {export_json}")
+    return payload
+
+
+def run_sheets_sync(
+    config: Config,
+    db: Database,
+    export_json: Optional[Path] = None,
+    export_csv: Optional[Path] = None,
+    apply_artist_rules: bool = False,
+    apply_tracks: bool = False,
+    approved_preview_path: Optional[Path] = None,
+    confirm_sha256: str = "",
+    rollback_manifest_id: str = "",
+    verbose: bool = False,
+    sheets_override: Optional[Any] = None,
+    controlled_sheets_override: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Controlled Google Sheets workflow:
+    - Default (no `--apply-*`): generates complete before-and-after write preview (ZERO cloud writes).
+    - `--apply-artist-rules`: syncs approved `Artist_Rules` tab with pre-write backup & rollback manifest.
+    - `--apply-tracks`: requires `--approved-preview` + matching `--confirm-sha256` + pre-flight drift check.
+    - `--rollback-manifest`: deterministically restores pre-write cell values from `rollback_manifests`.
+    - Physical Google Drive operations remain 100% forced dry-run.
+    """
+    import json as _json
+    from ..services.sheets import _col_letter, validate_and_index_tracks_sheet
+
+    db._ensure_additive_v3_extensions()
+    ensure_default_artist_rules(db)
+    secrets = config.known_secrets()
+
+    if sheets_override is not None and controlled_sheets_override is not None:
+        ro_sh = sheets_override
+        ctrl_sh = controlled_sheets_override
+    else:
+        creds = GoogleAuthManager(config).get_credentials()
+        if not creds:
+            raise RuntimeError("Google authentication is required for Google Sheets preview/sync.")
+        ro_sh = sheets_override or SheetsService(creds)
+        ctrl_sh = controlled_sheets_override or ControlledSheetsService(creds)
+
+    if rollback_manifest_id.strip():
+        res = rollback_sheets_manifest(config, db, ctrl_sh, rollback_manifest_id.strip())
+        print(f"[✓] Rolled back Google Sheets manifest '{rollback_manifest_id}': {res}")
+        return res
+
+    result_out: Dict[str, Any] = {}
+    if apply_artist_rules:
+        ar_res = sync_artist_rules_to_sheet(config, db, ctrl_sh)
+        result_out["artist_rules_sync"] = ar_res
+        print(
+            f"[✓] Synced '{ar_res['tab_name']}' tab ({ar_res['rules_written']} approved rule(s); "
+            f"manifest={ar_res['manifest_id']}, backup={ar_res['backup_file']})"
+        )
+
+    if apply_tracks:
+        if not approved_preview_path or not approved_preview_path.is_file():
+            raise RuntimeError("--apply-tracks requires an existing --approved-preview JSON file.")
+        if not confirm_sha256.strip():
+            raise RuntimeError("--apply-tracks requires --confirm-sha256 matching preview_sha256.")
+        preview_loaded = _json.loads(approved_preview_path.read_text(encoding="utf-8"))
+        tr_res = execute_approved_tracks_writes(
+            config, db, ctrl_sh, preview_loaded, confirm_sha256.strip()
+        )
+        result_out["tracks_write"] = tr_res
+        print(
+            f"[✓] Executed approved Tracks write: {tr_res['rows_updated']} row(s), "
+            f"{tr_res['cells_updated']} cell(s) updated (manifest={tr_res['manifest_id']})"
+        )
+        return result_out
+
+    # Generate complete read-only before-and-after write preview
+    header_row = ro_sh.fetch_header_row(config.sheet_id, "Tracks!1:1")
+    last_col = _col_letter(max(27, len(header_row)))
+    raw_data_rows = ro_sh.fetch_master_rows(config.sheet_id, f"Tracks!A2:{last_col}")
+    sheet_index = validate_and_index_tracks_sheet(header_row, raw_data_rows)
+    raw_by_num = {
+        idx + 2: [str(c) if c is not None else "" for c in r]
+        for idx, r in enumerate(raw_data_rows)
+    }
+    sheet_ar, _ = ro_sh.load_artist_rules_tab(config.sheet_id)
+    merged_rules = load_artist_rules(db=db, config=config, sheet_rules=sheet_ar, active_only=False)
+
+    preview = build_tracks_write_preview(
+        db=db,
+        config=config,
+        sheet_index=sheet_index,
+        artist_rules=merged_rules,
+        raw_rows_by_num=raw_by_num,
+    )
+    result_out["preview"] = preview
+    sm = preview["summary"]
+    print(f"\n=== CONTROLLED GOOGLE SHEETS WRITE PREVIEW (v{__version__}) ===")
+    print(f"  Preview SHA-256:            {preview['preview_sha256']}")
+    print(f"  Eligible Tracks row writes: {sm['eligible_row_updates']} row(s) ({sm.get('eligible_field_updates', 0)} core field(s), {sm['eligible_cell_writes']} total cell(s))")
+    print(f"  Protected locked fields:    {sm.get('locked_fields_protected', 0)} | Protected existing values: {sm.get('existing_values_protected', 0)}")
+    print(f"  Held by TERMS_HOLD:         {sm.get('terms_held_field_candidates_count', 0)} | Discrepancies held: {sm.get('discrepancy_flags_held', 0)}")
+    print("  Physical Drive Operations:  FORCED DRY-RUN (0 moves, 0 renames, 0 folder edits)\n")
+
+    if export_json:
+        export_safe_json(export_json, preview, secrets)
+        print(f"[✓] Exported complete before-and-after write preview JSON to {export_json}")
+    if export_csv:
+        flat_rows: List[Dict[str, Any]] = []
+        for r_up in preview["proposed_row_updates"]:
+            for fc in r_up["field_changes"]:
+                flat_rows.append({
+                    "row_num": r_up["row_num"],
+                    "file_id": r_up["file_id"] if verbose else short_file_id(r_up["file_id"], verbose=False),
+                    "track_name": r_up["track_name"],
+                    "field": fc["field"],
+                    "range": fc["range"],
+                    "before": fc["before"],
+                    "after": fc["after"],
+                    "confidence": fc["confidence"],
+                    "decision_state": fc["decision_state"],
+                    "provenance": ",".join(fc["provenance"]),
+                    "reason": fc["reason"],
+                })
+        if flat_rows:
+            export_safe_csv(export_csv, list(flat_rows[0].keys()), flat_rows, secrets)
+        else:
+            export_safe_csv(
+                export_csv,
+                ["row_num", "file_id", "track_name", "field", "range", "before", "after", "confidence", "decision_state", "provenance", "reason"],
+                [],
+                secrets,
+            )
+        print(f"[✓] Exported Tracks write-preview CSV to {export_csv}")
+    return result_out

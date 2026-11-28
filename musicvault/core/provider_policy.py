@@ -5,12 +5,14 @@ from datetime import datetime, timedelta
 
 from ..db import _utc_iso
 from ..providers.base import canonical_provider_family
+from .artist_rules import load_artist_rules
 from .genre import SUBGENRE_PARENT, canonical_subgenre
 from .rules import build_track_proposal, field_decision
 
 CAPABILITIES = {
     "musicbrainz": {"identity", "genre", "duration", "edition", "isrc", "label"},
     "discogs": {"identity", "genre", "subgenre", "label", "duration", "edition"},
+    "hdrr": {"identity", "genre", "subgenre", "edition", "isrc"},
     "audiometa": {"identity", "bpm", "key", "duration", "isrc"},
     "sonovault": {"identity", "bpm", "key", "genre", "subgenre", "label", "duration", "isrc"},
 }
@@ -19,8 +21,12 @@ AUDIT_NAMES = {
     "sonovault": "SonoVault",
     "audiometa": "AudioMeta",
     "discogs": "Discogs",
+    "hdrr": "HDRR",
 }
-DEFAULT_ORDER = ("musicbrainz", "discogs", "audiometa", "sonovault")
+DEFAULT_ORDER = ("musicbrainz", "discogs", "hdrr", "audiometa", "sonovault")
+NON_HARD_DANCE_PARENTS = frozenset({
+    "Country", "Rock", "Hip-Hop", "Pop", "R&B", "Reggae", "Jazz", "Classical", "Soul", "Funk", "Disco", "Ambient",
+})
 FIELDS = set().union(*CAPABILITIES.values())
 ESSENTIAL_FALLBACK_FIELDS = frozenset({"identity", "genre", "bpm", "key"})
 MAX_ENRICHMENT_ATTEMPTS = 3
@@ -76,12 +82,20 @@ class ProviderPolicy:
                 raise ValueError("Breaker counts and cooldowns are out of bounds.")
         if self.breaker.get("cooldown", 300) > self.breaker.get("max_cooldown", 3600):
             raise ValueError("Breaker cooldown exceeds its maximum.")
+        self.config = config
         self.db = None
         self.provider = ""
         self.providers = {}
+        self.artist_rules = None
+
+    def _get_artist_rules(self):
+        if self.artist_rules is None:
+            self.artist_rules = load_artist_rules(db=self.db, config=self.config)
+        return self.artist_rules
 
     def bind(self, db, providers, provider=""):
         self.db = db
+        self.artist_rules = load_artist_rules(db=db, config=self.config)
         self.provider = canonical_provider_family(provider.strip()) if provider else ""
         if self.provider and self.provider not in CAPABILITIES:
             raise ValueError("Unknown provider for selective resumption.")
@@ -155,7 +169,12 @@ class ProviderPolicy:
             }
 
     def needed_fields(self, track, candidates):
-        proposed = build_track_proposal(track.metadata, candidates)
+        proposed = build_track_proposal(
+            track.metadata,
+            candidates,
+            artist_rules=self._get_artist_rules(),
+            file_id=track.file_id,
+        )
         missing = {
             field
             for field in ("bpm", "key", "genre", "subgenre")
@@ -180,6 +199,8 @@ class ProviderPolicy:
         styles = {}
         for candidate in verified:
             family = canonical_provider_family(candidate.source_family or candidate.provider)
+            if family in {"wikidata", "hdrr"} or getattr(candidate, "genre_evidence_kind", "") == "artist_derived":
+                continue
             for raw_style in candidate.genre:
                 canon_sub = canonical_subgenre(raw_style)
                 if canon_sub and SUBGENRE_PARENT.get(canon_sub) == proposed["genre"] and proposed["genre"]:
@@ -201,7 +222,12 @@ class ProviderPolicy:
         - Fields already in cross-provider conflict cannot be promoted by fallback and are skipped.
         - Missing optional `subgenre` or `label` alone never trigger fallback calls.
         """
-        proposed = build_track_proposal(track.metadata, candidates)
+        proposed = build_track_proposal(
+            track.metadata,
+            candidates,
+            artist_rules=self._get_artist_rules(),
+            file_id=track.file_id,
+        )
         missing = set()
         verified = [
             c
@@ -277,11 +303,24 @@ class ProviderPolicy:
 
         return sorted(calls, key=priority)
 
-    def reason_to_skip(self, family, needed):
+    def reason_to_skip(self, family, needed, track=None, candidates=()):
         if self.provider and family != self.provider:
             return "outside_provider_selection"
         if not self.permits(family):
             return "disabled_by_policy"
+        if family == "hdrr" and candidates:
+            prop = (
+                build_track_proposal(
+                    track.metadata,
+                    list(candidates),
+                    artist_rules=self._get_artist_rules(),
+                    file_id=track.file_id,
+                )
+                if track is not None
+                else {}
+            )
+            if prop.get("genre") in NON_HARD_DANCE_PARENTS and field_decision(list(candidates), "genre", prop)[0] == "HIGH":
+                return "sufficient_evidence"
         if self.is_fallback_only(family):
             if not (CAPABILITIES[family] & set(needed) & ESSENTIAL_FALLBACK_FIELDS):
                 return "sufficient_evidence"
@@ -487,6 +526,8 @@ def provider_report(conn, config=None):
     enabled = set()
     if config is not None:
         enabled.update({"musicbrainz", "wikidata"} - disabled)
+        if config.get_bool("HDRR_ENABLED", True) and "hdrr" not in disabled:
+            enabled.add("hdrr")
         enabled.update(
             name
             for name, configured in (

@@ -11,8 +11,15 @@ from typing import Any, Dict, List, Optional, Tuple
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-from .read_only import read_only_request
+from .read_only import controlled_sheets_request, read_only_request
 
+from ..core.artist_rules import (
+    ARTIST_RULES_HEADERS,
+    ARTIST_RULES_TAB_NAME,
+    ArtistRule,
+    artist_rule_to_sheet_row,
+    parse_artist_rules_sheet,
+)
 from ..core.matcher import norm
 from ..core.rules import EXTRA_HEADERS
 
@@ -241,6 +248,33 @@ class SheetsService:
             json.dump(data, f, indent=2)
         return backup_path
 
+    def load_artist_rules_tab(
+        self, spreadsheet_id: str, tab_name: str = ARTIST_RULES_TAB_NAME
+    ) -> Tuple[List[ArtistRule], List[str]]:
+        """
+        Read-only fetch of the optional `Artist_Rules` tab from Google Sheets.
+        Returns `([], [])` cleanly if the `Artist_Rules` tab has not been created yet.
+        """
+        metadata = self.service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets(properties(title))",
+        ).execute(num_retries=3)
+        titles = {
+            s.get("properties", {}).get("title", "")
+            for s in metadata.get("sheets", [])
+        }
+        if tab_name not in titles:
+            return [], []
+        header_row = self.fetch_header_row(spreadsheet_id, f"'{tab_name}'!1:1")
+        last_col = _col_letter(max(len(ARTIST_RULES_HEADERS), len(header_row)))
+        data_rows = self.fetch_master_rows(spreadsheet_id, f"'{tab_name}'!A2:{last_col}")
+        return parse_artist_rules_sheet(header_row, data_rows)
+
+    @staticmethod
+    def build_artist_rules_tab_payload(rules: List[ArtistRule]) -> List[List[str]]:
+        """Build complete 2D sheet grid (`header + rows`) for staging/exporting the `Artist_Rules` tab."""
+        return [list(ARTIST_RULES_HEADERS)] + [artist_rule_to_sheet_row(r) for r in rules]
+
     def apply_batch_updates(
         self,
         spreadsheet_id: str,
@@ -248,3 +282,67 @@ class SheetsService:
         allow_live_writes: bool = False,
     ) -> int:
         raise RuntimeError("Live Google Sheets writes are disabled in MusicVault.")
+
+
+class ControlledSheetsService:
+    """
+    Explicitly opted-in Google Sheets v4 client for controlled writes to `Artist_Rules` and
+    preview-approved `Tracks` cells ONLY (`valueInputOption='RAW'`).
+    Physical Google Drive operations remain 100% blocked via `read_only_request` on `DriveService`.
+    """
+
+    def __init__(self, credentials: Credentials):
+        self.service = build("sheets", "v4", credentials=credentials, requestBuilder=controlled_sheets_request)
+
+    def get_spreadsheet_metadata(self, spreadsheet_id: str) -> Dict[str, Any]:
+        return self.service.spreadsheets().get(
+            spreadsheetId=spreadsheet_id,
+            fields="properties(title),sheets(properties(sheetId,title,index,gridProperties(rowCount,columnCount)))",
+        ).execute(num_retries=3)
+
+    def read_values(self, spreadsheet_id: str, range_name: str) -> List[List[Any]]:
+        resp = self.service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+        ).execute(num_retries=3)
+        return resp.get("values", [])
+
+    def ensure_tab_exists(self, spreadsheet_id: str, tab_name: str, rows: int = 100, cols: int = 18) -> None:
+        meta = self.get_spreadsheet_metadata(spreadsheet_id)
+        titles = {s.get("properties", {}).get("title", "") for s in meta.get("sheets", [])}
+        if tab_name in titles:
+            return
+        self.service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "addSheet": {
+                            "properties": {
+                                "title": tab_name,
+                                "gridProperties": {
+                                    "rowCount": max(20, int(rows)),
+                                    "columnCount": max(18, int(cols)),
+                                },
+                            }
+                        }
+                    }
+                ]
+            },
+        ).execute(num_retries=3)
+
+    def write_values_raw(self, spreadsheet_id: str, range_name: str, values: List[List[Any]]) -> Dict[str, Any]:
+        return self.service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueInputOption="RAW",
+            body={"values": values},
+        ).execute(num_retries=3)
+
+    def batch_write_values_raw(self, spreadsheet_id: str, data: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not data:
+            return {}
+        return self.service.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"valueInputOption": "RAW", "data": data},
+        ).execute(num_retries=3)
